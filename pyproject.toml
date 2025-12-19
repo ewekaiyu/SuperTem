@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supertem"
+version = "0.0.0"
+description = "A universal abstraction control interface for transmission electron microscopes (TEM)"
+authors = [
+    {name = "Yu Liang", email = "johnsonm508ro@163.com"},
+]
+readme = "readme.md"
+requires-python = ">=3.8"
+license = {text = "MIT License"}
+classifiers = [
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Interface Engine/Protocol Translator",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Development Status :: 4 - Beta",
+]
+
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/liangyu20/SuperTem"
+"Bug Tracker" = "https://github.com/liangyu20/SuperTem/issues"
+Repository = "https://github.com/liangyu20/SuperTem.git"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.2.2",
+    "pytest-cov>=4.0.0",
+]
+ml = [
+    "zarr>=2.13.6",
+    "dask>=2023.3.0",
+    "torch>=2.0.0,<=2.1.2",
+    "torchvision>=0.15.1",
+    "segmentation-models-pytorch>=0.3.2",
+    "plotly>=5.14.1",
+    "kaleido==0.2.0",
+    "transformers>=4.36.2",
+]
+ui = [
+    "napari>=0.4.17,<=0.5.3",
+    "pyqt5>=5.15.9",
+    "matplotlib_scalebar>=0.8.1",
+    "matplotlib>=3.7.0",
+]
+
+[tool.setuptools]
+packages = ["supertem"]
+
+[tool.setuptools.package-data]
+supertem = ["*.yaml", "*.yml"]
