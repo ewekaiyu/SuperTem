@@ -1,4 +1,5 @@
 from supertem.microscope import TemMicroscope
 
 class JeolMicroscope(TemMicroscope):
-    pass
+    def __init__(self):
+        pass
