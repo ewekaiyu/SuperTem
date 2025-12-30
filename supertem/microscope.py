@@ -39,6 +39,14 @@ class TemMicroscope(ABC):
     def get_status(self) -> Dict[str, Any]:
         """返回仪器当前状态摘要（vacuum, gun, faults, temperatures...）。"""
 
+    @abstractmethod
+    def get_mode(self) -> str:
+        """Get the current mode of the microscope."""
+
+    @abstractmethod
+    def set_mode(self, mode: str) -> None:
+        """Set the current mode of the microscope."""
+
     # -----------------------
     # 高压/枪（Gun）
     # -----------------------
@@ -82,12 +90,12 @@ class TemMicroscope(ABC):
         """读取 spot size 索引。"""
 
     @abstractmethod
-    def set_condenser_strength(self, value: float) -> None:
-        """设置 condenser 电流/强度（实现需说明单位/范围）。"""
+    def list_apertures(self) -> List[str]:
+        """Get the aperture list."""
 
     @abstractmethod
-    def set_objective_aperture(self, insert: bool) -> None:
-        """插入或撤回物镜光圈。"""
+    def set_aperture(self, kind: str) -> None:
+        """Insert selected aperture."""
 
     # -----------------------
     # 像差/调谐（Focus / Stigmator / Alignment）
@@ -101,16 +109,12 @@ class TemMicroscope(ABC):
         """读取当前 defocus（nm）。"""
 
     @abstractmethod
-    def auto_focus(self) -> Dict[str, Any]:
-        """执行自动对焦，返回结果摘要（成功/建议值等）。"""
-
-    @abstractmethod
     def set_stigmation(self, x: float, y: float) -> None:
         """设置像散校正（X/Y），单位与范围由实现决定。"""
 
     @abstractmethod
-    def auto_stigmation(self) -> Dict[str, Any]:
-        """自动像散校正，返回校正结果/建议。"""
+    def get_stigmation(self) -> None:
+        """Get the stigmation of the beam."""
 
     @abstractmethod
     def align_beam(self, mode: str = "center") -> Dict[str, Any]:
