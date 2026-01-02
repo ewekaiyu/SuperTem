@@ -159,7 +159,7 @@ class TemMicroscope(ABC):
         """List available detector identifiers (names or IDs)."""
 
     @abstractmethod
-    def select_detector(self, detector: str) -> None:
+    def select_detector(self, name: str) -> None:
         """Select active detector (vendor-defined)."""
 
     @abstractmethod
