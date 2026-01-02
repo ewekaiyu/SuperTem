@@ -11,6 +11,42 @@ from copy import deepcopy
 
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from pint import UnitRegistry
+
+# ---- Units (Pint) ----
+# Single project-wide UnitRegistry to avoid "mixed registry" issues.
+ureg = UnitRegistry()
+Q_ = ureg.Quantity
+
+# Quantity type import is version-dependent across Pint releases.
+try:  # Pint >= 0.20 often exposes Quantity at top-level
+    from pint import Quantity  # type: ignore
+except Exception:  # pragma: no cover
+    from pint.facets.plain.quantity import Quantity  # type: ignore
+
+
+def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
+    """Coerce `value` into a Pint Quantity using the project registry, in `unit`.
+
+    - If `value` is already a Quantity (even from another registry), it's re-created in `ureg`.
+    - If `value` is a number, it's interpreted as being in `unit`.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Quantity):
+        q = Q_(value.magnitude, str(value.units))
+    else:
+        q = Q_(value, unit)
+    return q.to(unit)
+
+
+def magnitude(value: Any, unit: str) -> Optional[float]:
+    """Return magnitude as a plain float in `unit`."""
+    q = ensure_quantity(value, unit)
+    if q is None:
+        return None
+    return float(q.magnitude)
+
 from supertem.config import METADATA_VERSION
 
 import numpy as np
@@ -145,13 +181,31 @@ class ImageSettings:
     x: Optional[int] = None
     y: Optional[int] = None
     binning: Optional[int] = None
-    exposure_ms: Optional[float] = None
-    dwell_us: Optional[float] = None
+    exposure_ms: Optional["Quantity"] = None
+    dwell_us: Optional["Quantity"] = None
     file_format: Optional[str] = "tiff"  # "tiff", "jpg", "bmp", ...
 
+    def __post_init__(self):
+        # Normalize timing units
+        if self.exposure_ms is not None:
+            self.exposure_ms = ensure_quantity(self.exposure_ms, "millisecond")
+        if self.dwell_us is not None:
+            self.dwell_us = ensure_quantity(self.dwell_us, "microsecond")
+
     def to_dict(self) -> dict:
-        return asdict(self)
-    
+        # Keep JSON-friendly magnitudes (ms / µs)
+        return {
+            "width": self.width,
+            "height": self.height,
+            "x": self.x,
+            "y": self.y,
+            "binning": self.binning,
+            "exposure_ms": magnitude(self.exposure_ms, "millisecond"),
+            "dwell_us": magnitude(self.dwell_us, "microsecond"),
+            "file_format": self.file_format,
+        }
+
+    @staticmethod
     def from_dict(settings: dict) -> "ImageSettings":
         return ImageSettings(
             width=settings["width"],
@@ -159,8 +213,8 @@ class ImageSettings:
             x=settings.get("x", None),
             y=settings.get("y", None),
             binning=settings.get("binning", None),
-            exposure_ms=settings.get("exposure_ms", None),
-            dwell_us=settings.get("dwell_us", None),
+            exposure_ms=ensure_quantity(settings.get("exposure_ms", None), "millisecond"),
+            dwell_us=ensure_quantity(settings.get("dwell_us", None), "microsecond"),
             file_format=settings.get("file_format", "tiff"),
         )
 
@@ -199,112 +253,103 @@ class StageSystemSettings:
 
 @dataclass
 class TemStagePosition:
-    """Data class for storing stage position data.
+    """Stage position (Quantity-based).
 
-    Attributes:
-        x (float): The X position of the stage in meters.
-        y (float): The Y position of the stage in meters.
-        z (float): The Z position of the stage in meters.
-        r (float): The Rotation of the stage in radians.
-        tilt_x (float): The X Tilt of the stage in radians.
-        tilt_y (float): The Y Tilt of the stage in radians.
-        coordinate_system (str): The coordinate system used for the stage position.
-
-    Methods:
-        to_dict(): Convert the stage position object to a dictionary.
-        from_dict(data: dict): Create a new stage position object from a dictionary.
-        to_autoscript_position(compustage: bool) -> StagePosition: Convert the stage position to a StagePosition object that is compatible with Autoscript.
-        from_autoscript_position(position: StagePosition) -> None: Create a new FibsemStagePosition object from a StagePosition object that is compatible with Autoscript.
-        to_tescan_position(stage_tilt: float = 0.0): Convert the stage position to a format that is compatible with Tescan.
-        from_tescan_position(): Create a new FibsemStagePosition object from a Tescan-compatible stage position.
+    Conventions used across this project:
+      - x, y, z: length (stored as **nanometer**)
+      - r, tilt_x, tilt_y: angles (stored as **degree**)
     """
 
-    name: str = None
-    x: float = None
-    y: float = None
-    z: float = None
-    r: float = None
-    tilt_x: float = None
-    tilt_y: float = None
-    coordinate_system: str = None
-    stage: List[float] = field(default_factory=list)
-    
+    name: Optional[str] = None
+    x: Optional["Quantity"] = None
+    y: Optional["Quantity"] = None
+    z: Optional["Quantity"] = None
+    r: Optional["Quantity"] = None
+    tilt_x: Optional["Quantity"] = None
+    tilt_y: Optional["Quantity"] = None
+    coordinate_system: Optional[str] = None
+    stage: List[Any] = field(default_factory=list)
+
     def __post_init__(self):
+        # Normalize individual axes
+        self.x = ensure_quantity(self.x, "nanometer")
+        self.y = ensure_quantity(self.y, "nanometer")
+        self.z = ensure_quantity(self.z, "nanometer")
+        self.r = ensure_quantity(self.r, "degree")
+        self.tilt_x = ensure_quantity(self.tilt_x, "degree")
+        self.tilt_y = ensure_quantity(self.tilt_y, "degree")
+
         if self.stage is None:
-            self.stage = []
+            self.stage = [self.x, self.y, self.z, self.r, self.tilt_x, self.tilt_y]
 
     def to_dict(self) -> dict:
-        position_dict = {}
-
-        position_dict["name"] = self.name if self.name is not None else None
-        position_dict["x"] = float(self.x) if self.x is not None else None
-        position_dict["y"] = float(self.y) if self.y is not None else None
-        position_dict["z"] = float(self.z) if self.z is not None else None
-        position_dict["r"] = float(self.r) if self.r is not None else None
-        position_dict["tilt_x"] = float(self.tilt_x) if self.tilt_x is not None else None
-        position_dict["tilt_y"] = float(self.tilt_y) if self.tilt_y is not None else None
-        position_dict["coordinate_system"] = self.coordinate_system
-
-        return position_dict
+        return {
+            "name": self.name if self.name is not None else None,
+            "x": magnitude(self.x, "nanometer"),
+            "y": magnitude(self.y, "nanometer"),
+            "z": magnitude(self.z, "nanometer"),
+            "r": magnitude(self.r, "degree"),
+            "tilt_x": magnitude(self.tilt_x, "degree"),
+            "tilt_y": magnitude(self.tilt_y, "degree"),
+            "coordinate_system": self.coordinate_system,
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "TemStagePosition":
-        items = ["x", "y", "z", "r", "t", "tilt_y"]
-
-        for item in items:
-            value = data[item]
-
-            assert isinstance(value, float) or isinstance(value, int) or value is None
-
         return cls(
             name=data.get("name", None),
-            x=data["x"],
-            y=data["y"],
-            z=data["z"],
-            r=data["r"],
-            t=data["t"],
-            tilt_y=data["tilt_y"],
-            coordinate_system=data["coordinate_system"],
+            x=ensure_quantity(data.get("x", None), "nanometer"),
+            y=ensure_quantity(data.get("y", None), "nanometer"),
+            z=ensure_quantity(data.get("z", None), "nanometer"),
+            r=ensure_quantity(data.get("r", None), "degree"),
+            tilt_x=ensure_quantity(data.get("tilt_x", None), "degree"),
+            tilt_y=ensure_quantity(data.get("tilt_y", None), "degree"),
+            coordinate_system=data.get("coordinate_system", None),
         )
-    if JEOL:
-        def to_jeol_position(self):
-            """Converts to jeol format."""
-            pass
-
-        @classmethod
-        def from_jeol_position(self):
-            """Converts from jeol format."""
-            pass
 
     def __add__(self, other: "TemStagePosition") -> "TemStagePosition":
+        if not isinstance(other, TemStagePosition):
+            return NotImplemented
+
+        def add_axis(a, b, unit: str):
+            if a is None and b is None:
+                return None
+            if a is None:
+                return ensure_quantity(b, unit)
+            if b is None:
+                return ensure_quantity(a, unit)
+            return ensure_quantity(a, unit) + ensure_quantity(b, unit)
+
         return TemStagePosition(
-            x=self.x + other.x if other.x is not None else self.x,
-            y=self.y + other.y if other.y is not None else self.y,
-            z=self.z + other.z if other.z is not None else self.z,
-            r=self.r + other.r if other.r is not None else self.r,
-            t=self.t + other.t if other.t is not None else self.t,
-            ##tilt_y=self.tilt_y + other.tilt_y if other.tilt_y is not None else self.tilt_y, five axis
+            name=self.name,
+            x=add_axis(self.x, other.x, "nanometer"),
+            y=add_axis(self.y, other.y, "nanometer"),
+            z=add_axis(self.z, other.z, "nanometer"),
+            r=add_axis(self.r, other.r, "degree"),
+            tilt_x=add_axis(self.tilt_x, other.tilt_x, "degree"),
+            tilt_y=add_axis(self.tilt_y, other.tilt_y, "degree"),
             coordinate_system=self.coordinate_system,
         )
 
     def __sub__(self, other: "TemStagePosition") -> "TemStagePosition":
+        if not isinstance(other, TemStagePosition):
+            return NotImplemented
+
+        def sub_axis(a, b, unit: str):
+            if a is None:
+                return None
+            if b is None:
+                return ensure_quantity(a, unit)
+            return ensure_quantity(a, unit) - ensure_quantity(b, unit)
+
         return TemStagePosition(
-            x=self.x - other.x if other.x is not None else self.x,
-            y=self.y - other.y if other.y is not None else self.y,
-            z=self.z - other.z if other.z is not None else self.z,
-            r=self.r - other.r if other.r is not None else self.r,
-            t=self.t - other.t if other.t is not None else self.t,
-            ##tilt_y=self.tilt_y - other.tilt_y,if other.x is not None else self.x,
-            coordinate_system=self.coordinate_system,
-        )
-    def __mul__(self, scaler: "float") -> "TemStagePosition":
-        return TemStagePosition(
-            x=self.x * scaler if scaler is not None else self.x,
-            y=self.y * scaler if scaler is not None else self.y,
-            z=self.z * scaler if scaler is not None else self.z,
-            r=self.r * scaler if scaler is not None else self.r,
-            t=self.t * scaler if scaler is not None else self.t,
-            ##tilt_y=self.tilt_y - other.tilt_y,if other.x is not None else self.x,
+            name=self.name,
+            x=sub_axis(self.x, other.x, "nanometer"),
+            y=sub_axis(self.y, other.y, "nanometer"),
+            z=sub_axis(self.z, other.z, "nanometer"),
+            r=sub_axis(self.r, other.r, "degree"),
+            tilt_x=sub_axis(self.tilt_x, other.tilt_x, "degree"),
+            tilt_y=sub_axis(self.tilt_y, other.tilt_y, "degree"),
             coordinate_system=self.coordinate_system,
         )
 

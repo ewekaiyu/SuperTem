@@ -7,6 +7,10 @@ from io import BytesIO
 from supertem.microscope import TemMicroscope
 from supertem.structures.base import (
     ImageSettings,
+    Quantity,
+    Q_,
+    ensure_quantity,
+    magnitude,
     TemImage,
     TemImageMetadataRefined,
     TemStagePosition,
@@ -66,7 +70,7 @@ class JeolMicroscope(TemMicroscope):
         # Cached "software state" for features TEM3 doesn't report back reliably
         self._selected_aperture: Optional[str] = None
         self._selected_detector: Optional[Any] = None
-        self._defocus_cache: float = 0.0  # device units unless you calibrate nm mapping
+        self._defocus_cache: "Quantity" = Q_(0, "nanometer")  # cached defocus (nm by default)
         self._stigmation_cache: Tuple[float, float] = (0.0, 0.0)
         self._image_settings: ImageSettings = ImageSettings()  # for camera integration later
         self._log: List[str] = []
@@ -122,8 +126,8 @@ class JeolMicroscope(TemMicroscope):
             "function_mode": {"index": func[0], "name": func[1]} if isinstance(func, list) else func,
             "magnification_or_cam_length": mag,
             "beam_blank": self.get_beam_blank(),
-            "ht_kv": self.get_acceleration_voltage(),
-            "emission_current": self.get_emission_current(),
+            "ht_kv": magnitude(self.get_acceleration_voltage(), "kilovolt"),
+            "emission_current": magnitude(self.get_emission_current(), "microampere"),
             "vacuum": {
                 "column_ready": self.vac.GetColumnReady(),
                 "camera_ready": self.vac.GetCameraReady(),
@@ -131,7 +135,7 @@ class JeolMicroscope(TemMicroscope):
                 "valves": self.vac.GetValveStatus(),
             },
             "stage": {
-                "position": stage_pos.__dict__,
+                "position": stage_pos.to_dict(),
                 "status": self.get_stage_status(),
                 "holder": self.stage.GetHolderStts(),
             },
@@ -184,16 +188,17 @@ class JeolMicroscope(TemMicroscope):
     # Beam / HT
     # -----------------------
 
-    def set_acceleration_voltage(self, kv: float) -> None:
-        self.ht.SetHtValue(float(kv) * 1000.0)
-        self._log_event(f"Set acceleration voltage -> {kv} kV")
+    def set_acceleration_voltage(self, voltage: "Quantity") -> None:
+        v = ensure_quantity(voltage, "volt")
+        self.ht.SetHtValue(float(v.magnitude))
+        self._log_event(f"Set acceleration voltage -> {magnitude(voltage, 'kilovolt')} kV")
 
-    def get_acceleration_voltage(self) -> float:
-        return float(self.ht.GetHtValue()) / 1000.0
+    def get_acceleration_voltage(self) -> "Quantity":
+        return Q_(float(self.ht.GetHtValue()), "volt").to("kilovolt")
 
-    def get_emission_current(self) -> Optional[float]:
+    def get_emission_current(self) -> "Quantity":
         # PyJEM Gun emission current value is typically in µA, but treat as vendor-defined.
-        return float(self.gun.GetEmissionCurrentValue())
+        return Q_(float(self.gun.GetEmissionCurrentValue()), "microampere")
 
     def set_beam_blank(self, blank: bool) -> None:
         self.deflector.SetBeamBlank(1 if blank else 0)
@@ -250,23 +255,28 @@ class JeolMicroscope(TemMicroscope):
     # -----------------------
     # Focus / Stig (device units)
     # -----------------------
-    def set_defocus(self, defocus_nm: float) -> None:
+    def set_defocus(self, defocus: "Quantity") -> None:
         #need fix: still don't know current defocus, can't directly assign defocus value
         """
         JEOL PyJEM does not provide a universal defocus-in-nm API in TEM3.
 
-        Here we interpret `defocus_nm` as **OBJ focus knob units** (integer steps) by default.
+        Here we cache `defocus` locally as a Quantity.
+        If you calibrate a nm<->steps mapping for your instrument, apply it before calling.
         If you calibrate a nm<->steps mapping for your instrument, apply it before calling.
         """
-        self._defocus_cache = float(defocus_nm)
+        try:
+            self._defocus_cache = ensure_quantity(defocus, "nanometer")
+        except Exception:
+            # If caller passes a non-length Quantity (e.g. dimensionless steps), keep magnitude as-is.
+            self._defocus_cache = Q_(float(getattr(defocus, "magnitude", defocus)), "dimensionless")
         return
         try:
-            self.eos.SetObjFocus(int(round(defocus_nm)))
+            self.eos.SetObjFocus(int(round(float(getattr(self._defocus_cache, "magnitude", 0.0)))))
         except Exception:
             pass
 
-    def get_defocus(self) -> float:
-        return float(self._defocus_cache)
+    def get_defocus(self) -> "Quantity":
+        return self._defocus_cache
 
     def set_stigmation(self, x: float, y: float) -> None:
         self._stigmation_cache = (float(x), float(y))
@@ -366,18 +376,18 @@ class JeolMicroscope(TemMicroscope):
             date=datetime.now().date().isoformat(),
             time=datetime.now().time().isoformat(timespec="seconds"),
             magnification=self.get_magnification(),
-            accelerating_voltage=self.get_acceleration_voltage(),
+            accelerating_voltage=magnitude(self.get_acceleration_voltage(), "kilovolt"),
             emission_current=self.get_emission_current(),
-            dwell_time=settings.dwell_us,
-            stage_x=stage.x,
-            stage_y=stage.y,
-            stage_z=stage.z,
+            dwell_time=magnitude(settings.dwell_us, "microsecond"),
+            stage_x=magnitude(stage.x, "nanometer"),
+            stage_y=magnitude(stage.y, "nanometer"),
+            stage_z=magnitude(stage.z, "nanometer"),
             extra={
                 "mode": self.get_mode(),
                 "detector": self._selected_detector.detectorname,
                 "imaging_area": (settings.width, settings.height, settings.x, settings.y),
                 "binning": settings.binning,
-                "exposure_ms": settings.exposure_ms,
+                "exposure_ms": magnitude(settings.exposure_ms, "millisecond"),
             },
         )
 
@@ -446,53 +456,61 @@ class JeolMicroscope(TemMicroscope):
     def get_stage_position(self) -> TemStagePosition:
         pos = self.stage.GetPos()  # [x, y, z, tx, ty] in nm / degrees
         return TemStagePosition(
-            x=float(pos[0]),
-            y=float(pos[1]),
-            z=float(pos[2]),
-            tilt_x=float(pos[3]),
-            tilt_y=float(pos[4]),
+            x=Q_(float(pos[0]), "nanometer"),
+            y=Q_(float(pos[1]), "nanometer"),
+            z=Q_(float(pos[2]), "nanometer"),
+            tilt_x=Q_(float(pos[3]), "degree"),
+            tilt_y=Q_(float(pos[4]), "degree"),
             coordinate_system="stage",
         )
 
-    def move_stage_absolute(self, pos: TemStagePosition, wait: bool = True, tolerance_nm: float = 10.0) -> None:
+    def move_stage_absolute(self, pos: TemStagePosition, wait: bool = True, tolerance: "Quantity" = None) -> None:
+        if tolerance is None:
+            tolerance = Q_(10, "nanometer")
         # Only set axes that are not None
         if pos.x is not None:
-            self.stage.SetX(float(pos.x))
+            self.stage.SetX(float(magnitude(pos.x, "nanometer")))
         if pos.y is not None:
-            self.stage.SetY(float(pos.y))
+            self.stage.SetY(float(magnitude(pos.y, "nanometer")))
         if pos.z is not None:
-            self.stage.SetZ(float(pos.z))
+            self.stage.SetZ(float(magnitude(pos.z, "nanometer")))
         if pos.tilt_x is not None:
-            self.stage.SetTiltXAngle(float(pos.tilt_x))
+            self.stage.SetTiltXAngle(float(magnitude(pos.tilt_x, "degree")))
         if pos.tilt_y is not None:
-            self.stage.SetTiltYAngle(float(pos.tilt_y))
+            self.stage.SetTiltYAngle(float(magnitude(pos.tilt_y, "degree")))
 
         if wait:
-            self._wait_stage(pos, tolerance_nm=tolerance_nm)
+            self._wait_stage(pos, tolerance=tolerance)
 
-    def move_stage_relative(self, dx: float, dy: float, dz: float, wait: bool = True,
-                            tolerance_nm: float = 10.0) -> None:
-        if dx:
-            self.stage.SetXRel(float(dx))
-        if dy:
-            self.stage.SetYRel(float(dy))
-        if dz:
-            self.stage.SetZRel(float(dz))
+    def move_stage_relative(self, dx: "Quantity", dy: "Quantity", dz: "Quantity", wait: bool = True,
+                            tolerance: "Quantity" = None) -> None:
+        dx_nm = ensure_quantity(dx, "nanometer") if dx is not None else None
+        if dx_nm is not None and dx_nm.magnitude != 0:
+            self.stage.SetXRel(float(dx_nm.magnitude))
+        dy_nm = ensure_quantity(dy, "nanometer") if dy is not None else None
+        if dy_nm is not None and dy_nm.magnitude != 0:
+            self.stage.SetYRel(float(dy_nm.magnitude))
+        dz_nm = ensure_quantity(dz, "nanometer") if dz is not None else None
+        if dz_nm is not None and dz_nm.magnitude != 0:
+            self.stage.SetZRel(float(dz_nm.magnitude))
         if wait:
             # Relative: just poll until rest; or approximate by checking delta near 0 from target.
             time.sleep(0.05)
 
-    def _wait_stage(self, target: TemStagePosition, tolerance_nm: float, timeout_s: float = 30.0) -> None:
+    def _wait_stage(self, target: TemStagePosition, tolerance: "Quantity" = None, timeout_s: float = 30.0) -> None:
         t0 = time.time()
+        if tolerance is None:
+            tolerance = Q_(10, "nanometer")
+        tolerance = ensure_quantity(tolerance, "nanometer")
         while time.time() - t0 < timeout_s:
             cur = self.get_stage_position()
             ok = True
             if target.x is not None:
-                ok &= abs(cur.x - target.x) <= tolerance_nm
+                ok &= abs(magnitude(cur.x, "nanometer") - magnitude(target.x, "nanometer")) <= magnitude(tolerance, "nanometer")
             if target.y is not None:
-                ok &= abs(cur.y - target.y) <= tolerance_nm
+                ok &= abs(magnitude(cur.y, "nanometer") - magnitude(target.y, "nanometer")) <= magnitude(tolerance, "nanometer")
             if target.z is not None:
-                ok &= abs(cur.z - target.z) <= tolerance_nm
+                ok &= abs(magnitude(cur.z, "nanometer") - magnitude(target.z, "nanometer")) <= magnitude(tolerance, "nanometer")
             if ok:
                 return
             time.sleep(0.05)

@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 
-from supertem.structures.base import SystemSettings, ImageSettings, TemStagePosition, TemImage
+from supertem.structures.base import SystemSettings, ImageSettings, TemStagePosition, TemImage, Quantity, Q_, ensure_quantity, magnitude
 
 
 
@@ -63,15 +63,15 @@ class TemMicroscope(ABC):
     # -----------------------
 
     @abstractmethod
-    def set_acceleration_voltage(self, kv: float) -> None:
-        """Set accelerating voltage in kV."""
+    def set_acceleration_voltage(self, voltage: "Quantity") -> None:
+        """Set accelerating voltage (Quantity)."""
 
     @abstractmethod
-    def get_acceleration_voltage(self) -> float:
-        """Get accelerating voltage in kV."""
+    def get_acceleration_voltage(self) -> "Quantity":
+        """Get accelerating voltage as a Quantity."""
 
     @abstractmethod
-    def get_emission_current(self) -> float:
+    def get_emission_current(self) -> "Quantity":
         """Get emission current (units are vendor-defined, often µA or nA)."""
 
     @abstractmethod
@@ -103,7 +103,7 @@ class TemMicroscope(ABC):
         """Get spot size index."""
 
     @abstractmethod
-    def set_defocus(self, defocus_nm: float) -> None:
+    def set_defocus(self, defocus: "Quantity") -> None:
         """
         Set defocus.
 
@@ -113,7 +113,7 @@ class TemMicroscope(ABC):
         """
 
     @abstractmethod
-    def get_defocus(self) -> float:
+    def get_defocus(self) -> "Quantity":
         """Get current defocus in nm (or device units; see implementation)."""
 
     @abstractmethod
@@ -200,13 +200,13 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def move_stage_absolute(
-        self, pos: TemStagePosition, wait: bool = True, tolerance_nm: float = 10.0
+        self, pos: TemStagePosition, wait: bool = True, tolerance: "Quantity" = None
     ) -> None:
         """Move stage to an absolute position."""
 
     @abstractmethod
     def move_stage_relative(
-        self, dx: float, dy: float, dz: float, wait: bool = True, tolerance_nm: float = 10.0
+        self, dx: "Quantity", dy: "Quantity", dz: "Quantity", wait: bool = True, tolerance: "Quantity" = None
     ) -> None:
         """Move stage relatively by dx/dy/dz (in the same units used in TemStagePosition)."""
 
@@ -253,30 +253,67 @@ class TemMicroscope(ABC):
     # Convenience: safe stage movement (default implementation)
     # -----------------------
 
-    def safe_move_stage(self, pos: TemStagePosition, max_step_nm: float = 50000.0) -> None:
+    def safe_move_stage(self, pos: TemStagePosition, max_step: "Quantity" = None, tolerance: "Quantity" = None) -> None:
         """
         Move in smaller increments to reduce the chance of hitting limits/collisions.
 
-        This default implementation assumes `TemStagePosition.x/y/z` are in **nm** and
-        uses `move_stage_relative` to step in equal increments.
+        `pos` uses Quantity-based axes (see TemStagePosition in base.py).
+        By default we step in 50 µm chunks (in nm units internally).
         """
+        if max_step is None:
+            max_step = Q_(50000, "nanometer")  # 50 µm
+        if tolerance is None:
+            tolerance = Q_(10, "nanometer")
+
+        max_step = ensure_quantity(max_step, "nanometer")
+        tolerance = ensure_quantity(tolerance, "nanometer")
+
         cur = self.get_stage_position()
-        if cur.x is None or cur.y is None or cur.z is None:
-            # Can't do anything sensible without a current position.
-            self.move_stage_absolute(pos, wait=True)
+
+        # If we can't read current position, fall back to direct absolute move.
+        if cur is None:
+            self.move_stage_absolute(pos, wait=True, tolerance=tolerance)
             return
 
-        dx = (pos.x - cur.x) if pos.x is not None else 0.0
-        dy = (pos.y - cur.y) if pos.y is not None else 0.0
-        dz = (pos.z - cur.z) if pos.z is not None else 0.0
+        def delta_axis(target_q, current_q):
+            if target_q is None or current_q is None:
+                return None
+            return ensure_quantity(target_q, "nanometer") - ensure_quantity(current_q, "nanometer")
 
-        max_delta = max(abs(dx), abs(dy), abs(dz), 0.0)
-        if max_delta <= max_step_nm:
-            self.move_stage_absolute(pos, wait=True)
+        dx = delta_axis(pos.x, cur.x)
+        dy = delta_axis(pos.y, cur.y)
+        dz = delta_axis(pos.z, cur.z)
+
+        # If no translational axes are specified, just do the absolute move (tilt handled by vendor impl).
+        if dx is None and dy is None and dz is None:
+            self.move_stage_absolute(pos, wait=True, tolerance=tolerance)
             return
 
-        steps = int(max_delta / max_step_nm) + 1
-        step_dx, step_dy, step_dz = dx / steps, dy / steps, dz / steps
+        # Determine number of steps based on the largest requested move.
+        max_abs_nm = 0.0
+        for d in (dx, dy, dz):
+            if d is not None:
+                max_abs_nm = max(max_abs_nm, abs(magnitude(d, "nanometer")))
+
+        if max_abs_nm <= magnitude(max_step, "nanometer"):
+            self.move_stage_absolute(pos, wait=True, tolerance=tolerance)
+            return
+
+        import math
+        steps = int(math.ceil(max_abs_nm / magnitude(max_step, "nanometer")))
+
+        step_dx = (dx / steps) if dx is not None else None
+        step_dy = (dy / steps) if dy is not None else None
+        step_dz = (dz / steps) if dz is not None else None
 
         for _ in range(steps):
-            self.move_stage_relative(step_dx, step_dy, step_dz, wait=True)
+            self.move_stage_relative(
+                step_dx if step_dx is not None else Q_(0, "nanometer"),
+                step_dy if step_dy is not None else Q_(0, "nanometer"),
+                step_dz if step_dz is not None else Q_(0, "nanometer"),
+                wait=True,
+                tolerance=tolerance,
+            )
+
+        # Final snap to the requested target (also catches tilt axes)
+        self.move_stage_absolute(pos, wait=True, tolerance=tolerance)
