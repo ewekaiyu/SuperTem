@@ -9,260 +9,274 @@ from supertem.structures.base import SystemSettings, ImageSettings, TemStagePosi
 
 class TemMicroscope(ABC):
     """
-    抽象基类：尽可能覆盖 TEM 的“原子”操作（最小粒度的控制指令）。
-    各厂商实现应继承并实现这些方法；保持通用性与可扩展性。
+    Abstract base class: define the smallest useful "atomic" TEM operations.
+
+    Vendor implementations (JEOL / ThermoFisher / Hitachi / ...) should inherit this class and
+    implement these methods using their own control libraries (PyJEM, AutoScript, etc.).
     """
 
     # -----------------------
-    # 连接 / 会话
+    # Connection / Status
     # -----------------------
+
     @abstractmethod
-    def connect_to_microscope(self, ip_address: str, port: int, timeout_s: float = 10.0) -> None:
-        """建立与仪器的连接（TCP/REST/SDK/...），抛出异常代表失败。"""
+    def connect_to_microscope(self, ip_address: str, port: int, timeout_s: float = 5.0) -> None:
+        """Connect to the microscope control interface."""
 
     @abstractmethod
     def disconnect(self) -> None:
-        """断开连接，释放资源。"""
+        """Disconnect / release resources."""
 
     @abstractmethod
     def is_connected(self) -> bool:
-        """返回当前连接状态。"""
+        """Return whether the microscope is connected."""
 
-    # -----------------------
-    # 仪器信息与状态
-    # -----------------------
     @abstractmethod
     def get_instrument_info(self) -> Dict[str, Any]:
-        """返回厂商、型号、固件版本等信息。"""
+        """Return instrument identification, version, model, etc."""
 
     @abstractmethod
     def get_status(self) -> Dict[str, Any]:
-        """返回仪器当前状态摘要（vacuum, gun, faults, temperatures...）。"""
+        """Return a snapshot of the microscope status (stage, vacuum, beam, etc.)."""
+
+    # -----------------------
+    # Imaging mode / function mode
+    # -----------------------
 
     @abstractmethod
     def get_mode(self) -> str:
-        """Get the current mode of the microscope."""
+        """
+        Return current observation mode as a string.
+
+        Recommended convention:
+          - "TEM:<FUNCTION>"  e.g. "TEM:MAG", "TEM:DIFF"
+          - "STEM:<FUNCTION>" e.g. "STEM:SM-MAG"
+        Implementations can return just "TEM" / "STEM" if function mode is not available.
+        """
 
     @abstractmethod
     def set_mode(self, mode: str) -> None:
-        """Set the current mode of the microscope."""
+        """Set observation mode. Accepts "TEM", "STEM", or "TEM:DIFF", etc (implementation-defined)."""
 
     # -----------------------
-    # 高压/枪（Gun）
+    # Beam / HT / Emission
     # -----------------------
+
     @abstractmethod
     def set_acceleration_voltage(self, kv: float) -> None:
-        """设置加速电压（kV）。"""
+        """Set accelerating voltage in kV."""
 
     @abstractmethod
     def get_acceleration_voltage(self) -> float:
-        """获取当前加速电压（kV）。"""
+        """Get accelerating voltage in kV."""
 
     @abstractmethod
-    def get_emission_current(self) -> Optional[float]:
-        """查询发射电流（若可用），单位 nA / µA 由实现说明。"""
+    def get_emission_current(self) -> float:
+        """Get emission current (units are vendor-defined, often µA or nA)."""
 
     @abstractmethod
     def set_beam_blank(self, blank: bool) -> None:
-        """设置束空（blank on/off）。"""
+        """Enable/disable beam blanking."""
 
     @abstractmethod
     def get_beam_blank(self) -> bool:
-        """返回当前束空状态。"""
+        """Return current beam blank status."""
 
     # -----------------------
-    # 透镜 / 光学（Lens/Condenser/Objectives）
+    # Optics / Imaging (Mag / Spot / Focus / Stig)
     # -----------------------
+
     @abstractmethod
     def set_magnification(self, mag: float) -> None:
-        """设置放大倍数（或直接设置 mag index），由实现决定精确语义。"""
+        """Set magnification (TEM) or camera length / equivalent selector (STEM), depending on vendor."""
 
     @abstractmethod
     def get_magnification(self) -> float:
-        """读取当前放大倍数。"""
+        """Get magnification (TEM) or camera length (STEM), depending on vendor."""
 
     @abstractmethod
     def set_spot_size(self, index: int) -> None:
-        """设置 spot size / condenser aperture 索引。"""
+        """Set spot size index (or equivalent condenser control)."""
 
     @abstractmethod
     def get_spot_size(self) -> int:
-        """读取 spot size 索引。"""
+        """Get spot size index."""
 
-    @abstractmethod
-    def list_apertures(self) -> List[str]:
-        """Get the aperture list."""
-
-    @abstractmethod
-    def set_aperture(self, kind: str) -> None:
-        """Insert selected aperture."""
-
-    # -----------------------
-    # 像差/调谐（Focus / Stigmator / Alignment）
-    # -----------------------
     @abstractmethod
     def set_defocus(self, defocus_nm: float) -> None:
-        """设置 defocus，以 nm 为单位（实现须说明单位）。"""
+        """
+        Set defocus.
+
+        Preferably in **nm**, but some vendor APIs expose only "knob units".
+        In that case, the concrete implementation should interpret defocus_nm as
+        device units (and clearly document it).
+        """
 
     @abstractmethod
     def get_defocus(self) -> float:
-        """读取当前 defocus（nm）。"""
+        """Get current defocus in nm (or device units; see implementation)."""
 
     @abstractmethod
     def set_stigmation(self, x: float, y: float) -> None:
-        """设置像散校正（X/Y），单位与范围由实现决定。"""
+        """
+        Set stigmation (x, y).
+        Units may be vendor-defined; implementers should document.
+        """
 
     @abstractmethod
-    def get_stigmation(self) -> None:
-        """Get the stigmation of the beam."""
+    def get_stigmation(self) -> Tuple[float, float]:
+        """Get current stigmation (x, y)."""
 
     @abstractmethod
-    def align_beam(self, mode: str = "center") -> Dict[str, Any]:
-        """做 beam alignment；mode 例如 'center','pivot' 等。"""
+    def align_beam(self) -> None:
+        """Run a basic beam alignment routine if supported (optional / vendor-defined)."""
 
     # -----------------------
-    # 探测器 / 相机
+    # Apertures
     # -----------------------
+    @abstractmethod
+    def list_apertures(self) -> List[str]:
+        """Return supported aperture 'kinds' or names for this microscope."""
+
+    @abstractmethod
+    def set_aperture(self, kind: str) -> None:
+        """Select which aperture is the active target (vendor-defined)."""
+
+    @abstractmethod
+    def insert_aperture(self, size: Optional[int]) -> None:
+        """Insert the currently selected aperture (if supported)."""
+
+    @abstractmethod
+    def retract_aperture(self) -> None:
+        """Retract the currently selected aperture (if supported)."""
+
+    # -----------------------
+    # Detectors
+    # -----------------------
+
     @abstractmethod
     def list_detectors(self) -> List[str]:
-        """列出可用探测器/相机名。"""
+        """List available detector identifiers (names or IDs)."""
 
     @abstractmethod
-    def select_detector(self, name: str) -> None:
-        """选择当前探测器。"""
+    def select_detector(self, detector: str) -> None:
+        """Select active detector (vendor-defined)."""
 
     @abstractmethod
-    def get_detector_settings(self, detector: Optional[str] = None) -> Dict[str, Any]:
-        """读取探测器的完整设置字典（用于发现可设置项）。"""
+    def get_detector_settings(self) -> Dict[str, Any]:
+        """Return current detector settings (brightness/contrast/position/etc)."""
 
     @abstractmethod
-    def set_detector_settings(self, body: Dict[str, Any], detector: Optional[str] = None) -> Dict[str, Any]:
-        """以原子字段设置探测器参数（wildcard），返回设备回显。"""
+    def set_detector_settings(self, settings: Dict[str, Any]) -> None:
+        """Apply detector settings (brightness/contrast/position/etc)."""
+
+    # -----------------------
+    # Image acquisition / Live
+    # -----------------------
 
     @abstractmethod
-    def acquire_image(self, settings: ImageSettings, detector: Optional[str] = None) -> TemImage:
-        """按给定图像设置采集单帧，返回TemImage对象。"""
+    def acquire_image(self, settings: Optional[ImageSettings] = None) -> TemImage:
+        """Acquire a still image with optional ImageSettings."""
 
     @abstractmethod
     def start_live(self, settings: Optional[ImageSettings] = None) -> None:
-        """开始实时流（live view）。"""
+        """Start live imaging / continuous acquisition if supported."""
 
     @abstractmethod
     def stop_live(self) -> None:
-        """停止实时流。"""
+        """Stop live imaging."""
 
     @abstractmethod
     def get_live_frame(self) -> bytes:
-        """获取当前 live 帧的原始二进制数据（最低延迟）。"""
-
-    @abstractmethod
-    def get_raw_image_data(self, detector: Optional[str] = None) -> bytes:
-        """获取相机的原始 raw 数据缓冲（如果可用）。"""
+        """Return one live frame (implementation-defined encoding, e.g. TIFF/PNG/raw bytes)."""
 
     # -----------------------
-    # 成像设置（解耦探测器）—— 原子级图像控制
+    # Stage control
     # -----------------------
-    @abstractmethod
-    def set_imaging_area(self, width: int, height: int, x: int = 0, y: int = 0) -> None:
-        """设置视场 / ROI（像素）。"""
 
-    @abstractmethod
-    def set_binning(self, binning: int) -> None:
-        """设置 binning（像素合并）。"""
-
-    @abstractmethod
-    def set_exposure_time(self, ms: float) -> None:
-        """设置曝光时间（毫秒）。"""
-
-    @abstractmethod
-    def set_dwell_time(self, us: float) -> None:
-        """设置扫描 dwell time（微秒），常用于扫描探测器/扫描模式。"""
-
-    # -----------------------
-    # 样台（Stage）原子操作
-    # -----------------------
     @abstractmethod
     def get_stage_position(self) -> TemStagePosition:
-        """读取样台位置（单位由实现说明，建议 nm / deg）。"""
+        """Return current stage position."""
 
     @abstractmethod
-    def move_stage_absolute(self, pos: TemStagePosition, wait: bool = True, tolerance_nm: float = 10.0) -> None:
-        """绝对移动样台到 pos（若不支持某分量可忽略）。"""
+    def move_stage_absolute(
+        self, pos: TemStagePosition, wait: bool = True, tolerance_nm: float = 10.0
+    ) -> None:
+        """Move stage to an absolute position."""
 
     @abstractmethod
-    def move_stage_relative(self, dx: float, dy: float, dz: float = 0.0, dtx: float = 0.0, dty: float = 0.0,
-                            wait: bool = True, tolerance_nm: float = 10.0) -> None:
-        """相对移动样台。"""
+    def move_stage_relative(
+        self, dx: float, dy: float, dz: float, wait: bool = True, tolerance_nm: float = 10.0
+    ) -> None:
+        """Move stage relatively by dx/dy/dz (in the same units used in TemStagePosition)."""
 
     @abstractmethod
     def set_stage_drive_mode(self, mode: str) -> None:
-        """设置驱动模式，例如 'motor' 或 'piezo'。"""
+        """Set stage drive mode, e.g. 'motor' or 'piezo' (vendor-defined)."""
 
     @abstractmethod
     def stop_stage(self) -> None:
-        """停止样台运动。"""
+        """Stop stage motion."""
 
     @abstractmethod
     def get_stage_status(self) -> Dict[str, Any]:
-        """返回样台状态（每轴状态/错误/limits 等）。"""
+        """Return stage status (axis status, errors, limits, etc)."""
 
     @abstractmethod
     def insert_holder(self) -> None:
-        """插入样座或探测器（如有）。"""
+        """Insert sample holder (if supported)."""
 
     @abstractmethod
     def retract_holder(self) -> None:
-        """撤回样座或探测器（如有）。"""
+        """Retract sample holder (if supported)."""
 
     # -----------------------
-    # 自动化 / 对齐 / 校准（复合操作可由原子操作组合）
+    # Automation hooks / Diagnostics
     # -----------------------
     @abstractmethod
     def run_autofunction(self, name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        运行厂商/用户定义的自动化函数（如 'autofocus','autostig','autocontrast' 等）。
-        返回运行结果/诊断信息。
-        """
+        """Run a vendor/user-defined auto-function (autofocus, autostig, etc)."""
 
-    # -----------------------
-    # 诊断 / 能力发现
-    # -----------------------
     @abstractmethod
     def discover_capabilities(self) -> Dict[str, Any]:
-        """
-        查询并返回设备支持的功能列表与可配置字段（用于动态 UI / 校验）。
-        建议返回字段：detectors, stage_axes, imaging_keys, limits, units。
-        """
+        """Discover/declare supported capabilities for this implementation."""
 
     @abstractmethod
     def get_log(self, n: int = 100) -> List[str]:
-        """读取仪器最近日志或通知条目（若可用）。"""
+        """Return last n log lines (if supported)."""
 
-    # -----------------------
-    # 低层/原始命令接口（保留）
-    # -----------------------
     @abstractmethod
     def send_raw_command(self, command: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        """发送厂商原生命令/REST path，直接返回原始响应（仅用于高级/调试）。"""
+        """Escape hatch: send a raw vendor command (implementation-defined)."""
 
     # -----------------------
-    # 辅助：安全检查/回退（可选实现）
+    # Convenience: safe stage movement (default implementation)
     # -----------------------
+
     def safe_move_stage(self, pos: TemStagePosition, max_step_nm: float = 50000.0) -> None:
         """
-        可由子类复写；默认实现使用 move_stage_relative 分步到达以避免大位移。
-        这里只给出默认策略（子类可覆盖更精细策略）。
+        Move in smaller increments to reduce the chance of hitting limits/collisions.
+
+        This default implementation assumes `TemStagePosition.x/y/z` are in **nm** and
+        uses `move_stage_relative` to step in equal increments.
         """
-        # 默认实现基于子类实现的原子方法，不作抽象要求
         cur = self.get_stage_position()
-        dx = pos.x - cur.x
-        dy = pos.y - cur.y
-        dz = pos.z - cur.z
-        # 简短分步逻辑（具体数值与单位需子类保证一致）
-        steps = int(max(abs(dx), abs(dy), abs(dz)) / max_step_nm) + 1
-        for i in range(1, steps + 1):
-            frac = i / steps
-            self.move_stage_relative(dx * frac - dx * (frac - 1 / steps),
-                                     dy * frac - dy * (frac - 1 / steps),
-                                     dz * frac - dz * (frac - 1 / steps),
-                                     wait=True)
+        if cur.x is None or cur.y is None or cur.z is None:
+            # Can't do anything sensible without a current position.
+            self.move_stage_absolute(pos, wait=True)
+            return
+
+        dx = (pos.x - cur.x) if pos.x is not None else 0.0
+        dy = (pos.y - cur.y) if pos.y is not None else 0.0
+        dz = (pos.z - cur.z) if pos.z is not None else 0.0
+
+        max_delta = max(abs(dx), abs(dy), abs(dz), 0.0)
+        if max_delta <= max_step_nm:
+            self.move_stage_absolute(pos, wait=True)
+            return
+
+        steps = int(max_delta / max_step_nm) + 1
+        step_dx, step_dy, step_dz = dx / steps, dy / steps, dz / steps
+
+        for _ in range(steps):
+            self.move_stage_relative(step_dx, step_dy, step_dz, wait=True)
