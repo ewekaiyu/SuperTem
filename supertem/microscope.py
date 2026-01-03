@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from pint import Quantity
 
-from supertem.structures.base import SystemSettings, ImageSettings, TemStagePosition, TemImage, Q_, ensure_quantity, magnitude
+from supertem.structures.base import SystemSettings, ImageSettings, TemStagePosition, TemImage, Q_, ensure_quantity, magnitude, TemDetectorSettings
 
 
 class TemMicroscope(ABC):
@@ -171,11 +171,11 @@ class TemMicroscope(ABC):
         """Select active detector (vendor-defined)."""
 
     @abstractmethod
-    def get_detector_settings(self) -> Dict[str, Any]:
+    def get_detector_settings(self) -> TemDetectorSettings:
         """Return current detector settings (brightness/contrast/position/etc)."""
 
     @abstractmethod
-    def set_detector_settings(self, settings: Dict[str, Any]) -> None:
+    def set_detector_settings(self, settings: Optional[TemDetectorSettings]) -> None:
         """Apply detector settings (brightness/contrast/position/etc)."""
 
     # -----------------------

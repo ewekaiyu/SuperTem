@@ -14,13 +14,10 @@ from supertem.structures.base import (
     TemImage,
     TemImageMetadataRefined,
     TemStagePosition,
+    TemDetectorSettings
 )
 from supertem.vendor.JEOL.jeol_eos_tables import get_list, list_unit
-
-
-
-
-
+from supertem.vendor.JEOL.jeol_settings import from_jeol_detector_setting, to_jeol_detector_setting
 
 try:
     from PyJEM import TEM3  # type: ignore
@@ -432,19 +429,27 @@ class JeolMicroscope(TemMicroscope):
         self._log_event(f"Selected detector -> {name}")
 
 
-    def get_detector_settings(self) -> Dict[str, Any]:
+    def get_detector_settings(self) -> TemDetectorSettings:
         if self._selected_detector is None:
             raise RuntimeError("Detector is not selected (call select_detector first)")
-        return dict(self._selected_detector.get_detectorsetting())
+        return from_jeol_detector_setting(payload=self._selected_detector.get_detectorsetting(), detector_id=self._selected_detector.detector)
 
-    def set_detector_settings(self, settings: Dict[str, Any]) -> None:
+    def set_detector_settings(self, settings: Optional[TemDetectorSettings]) -> None:
         if self._selected_detector is None:
             raise RuntimeError("Detector is not selected (call select_detector first)")
-        try:
-            self._selected_detector.set_detectorsetting(settings)
-            self._log_event(f"{self._selected_detector.detectorname} settings updated -> {settings}")
-        except Exception:
-            raise ValueError("Settings is not valid")
+        setting = to_jeol_detector_setting(s=settings)
+        success = {}
+        fail = {}
+        for k, v in setting.items():
+            try:
+                self._selected_detector.set_detectorsetting(dict(k=v))
+                success[k] = v
+            except Exception:
+                fail[k] = v
+        print(f"Settings that updated successfully: {success}"
+              f", Settings that failed to update: {fail}")
+        if len(success) != 0:
+            self._log_event(f"{self._selected_detector.detector} settings updated -> {success}")
 
     @staticmethod
     def _decode_image_bytes(data: bytes, ext: str) -> np.ndarray:

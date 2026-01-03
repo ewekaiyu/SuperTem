@@ -467,55 +467,58 @@ class BeamSettings:
         )
 
         return beam_settings
-    
+
+
+@dataclass
+class DetectorROI:
+    x: int = 0
+    y: int = 0
+    width: int = 0
+    height: int = 0
+
+@dataclass
+class DetectorCapabilities:
+    extra: Dict[str, Any] = field(default_factory=dict)
+
 @dataclass
 class TemDetectorSettings:
-    type: str = None
-    mode: str = None
-    brightness: float = 0.5
-    contrast: float = 0.5
+    detector_id: Optional[str] = None
 
-    def __post_init__(self):
-        assert (
-            isinstance(self.type, str) or self.type is None
-        ), f"type must be input as str, currently is {type(self.type)}"
-        assert (
-            isinstance(self.mode, str) or self.mode is None
-        ), f"mode must be input as str, currently is {type(self.mode)}"
-        assert (
-            isinstance(self.brightness, (float, int)) or self.brightness is None
-        ), f"brightness must be int or float value, currently is {type(self.brightness)}"
-        assert (
-            isinstance(self.contrast, (float, int)) or self.contrast is None
-        ), f"contrast must be int or float value, currently is {type(self.contrast)}"
+    exposure_ms: Optional[float] = None
+    binning_index: Optional[int] = None
+    binning_xy: Optional[Tuple[int, int]] = None
+    roi: Optional[DetectorROI] = None
 
-    if JEOL:
+    frame_integration: Optional[int] = None
+    gain_index: Optional[int] = None
+    offset_index: Optional[int] = None
+    digital_rotation_deg: Optional[float] = None
 
-        def to_jeol(self):
-            """Converts to jeol format."""
-            jeol_brightness = self.brightness * 100
-            jeol_contrast = self.contrast * 100
-            return jeol_brightness, jeol_contrast
+    # display-only (if you really use it)
+    brightness: Optional[float] = None
+    contrast: Optional[float] = None
 
-    def to_dict(self) -> dict:
-        """Converts to a dictionary."""
-        return {
-            "type": self.type,
-            "mode": self.mode,
-            "brightness": self.brightness,
-            "contrast": self.contrast,
-        }
+    capabilities: Optional[DetectorCapabilities] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
 
-    @staticmethod
-    def from_dict(settings: dict) -> "TemDetectorSettings":
-        """Converts from a dictionary."""
-        return TemDetectorSettings(
-            type=settings.get("type", "Unknown"),
-            mode=settings.get("mode", "Unknown"),
-            brightness=settings.get("brightness", 0.0),
-            contrast=settings.get("contrast", 0.0),
-        )
-    
+    @classmethod
+    def from_kwargs(cls, **kwargs):
+        field_names = {f.name for f in fields(cls)}
+
+        init_kwargs = {k: v for k, v in kwargs.items() if k in field_names}
+        extra_kwargs = {k: v for k, v in kwargs.items() if k not in field_names}
+
+        # If caller already provided extra=..., merge it
+        user_extra = init_kwargs.pop("extra", None)
+        obj = cls(**init_kwargs)
+
+        if isinstance(user_extra, dict):
+            obj.extra.update(user_extra)
+        obj.extra.update(extra_kwargs)
+
+        return obj
+
+
 @dataclass
 class BeamSystemSettings:
     enabled: bool
