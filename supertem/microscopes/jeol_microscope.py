@@ -15,7 +15,7 @@ from supertem.structures.base import (
     TemImageMetadataRefined,
     TemStagePosition,
 )
-from supertem.vendor.JEOL.jeol_eos_tables import mode_to_key, get_list, list_unit
+from supertem.vendor.JEOL.jeol_eos_tables import get_list, list_unit
 
 
 
