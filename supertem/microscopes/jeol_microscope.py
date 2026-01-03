@@ -15,6 +15,12 @@ from supertem.structures.base import (
     TemImageMetadataRefined,
     TemStagePosition,
 )
+from supertem.vendor.JEOL.jeol_eos_tables import mode_to_key, get_list, list_unit
+
+
+
+
+
 
 try:
     from PyJEM import TEM3  # type: ignore
@@ -89,10 +95,6 @@ class JeolMicroscope(TemMicroscope):
         self._stigmation_cache: Tuple[float, float] = (0.0, 0.0)
         self._image_settings: ImageSettings = ImageSettings()  # for camera integration later
         self._log: List[str] = []
-
-
-        self.magnification_list = [6000, 8000, 10000, 20000, 30000, 40000, 50000, 80000, 100000, 120000, 150000]
-        self.camera_length_list = []
         self.aperture_dict = dict(CL1 = 0, CL2 = 1, OL_Upper = 2, Ol_Lower = 3, SA = 4, ENT = 5, HX = 6, BF = 7, AUX1 = 8, AUX2 = 9, AUX3 = 10, AUX4 = 11)
 
     def _log_event(self, msg: str) -> None:
@@ -118,7 +120,7 @@ class JeolMicroscope(TemMicroscope):
             return bool(TEM3.is_connect())
         except Exception:
             try:
-                return bool(TEM3.connect())
+                return bool(TEM3.get_connect_status())
             except Exception:
                 return False
 
@@ -175,8 +177,11 @@ class JeolMicroscope(TemMicroscope):
             return f"{prefix}:{str(function).upper()}"
         return prefix
 
-    def set_mode(self, mode: str):
-        # Mode should be "TEM/STEM:function", for example "TEM:MAG" or "STEM:SM-MAG".
+    def set_mode(self, mode: str) -> None:
+        """Set observation + EOS function mode.
+
+        Format: "TEM:function" or "STEM:function", e.g. "TEM:MAG", "TEM:DIFF", "STEM:SM-MAG".
+        """
         if not isinstance(mode, str) or not mode.strip():
             raise ValueError("mode must be a non-empty string")
 
@@ -185,7 +190,7 @@ class JeolMicroscope(TemMicroscope):
         obs = parts[0].strip().upper()
         func = parts[1].strip() if len(parts) == 2 else ""
 
-        if obs in {"TEM"}:
+        if obs == "TEM":
             self.eos.SelectTemStem(0)
             if func:
                 idx = self._TEM_FUNCTION_MAP.get(func.replace(" ", "").lower())
@@ -193,7 +198,7 @@ class JeolMicroscope(TemMicroscope):
                     raise ValueError(f"Unknown TEM function mode: {func}")
                 self.eos.SelectFunctionMode(idx)
 
-        elif obs in {"STEM"}:
+        elif obs == "STEM":
             self.eos.SelectTemStem(1)
             if func:
                 key = func.replace(" ", "").lower()
@@ -203,22 +208,23 @@ class JeolMicroscope(TemMicroscope):
                 self.eos.SelectFunctionMode(idx)
 
         else:
-            raise ValueError(f"Unknown observation mode: {mode}")
+            raise ValueError(f"Unknown observation mode: {obs}")
+
         self._log_event(f"Set mode -> {self.get_mode()}")
 
     # -----------------------
     # Beam / HT
     # -----------------------
 
-    def set_acceleration_voltage(self, voltage: "Quantity") -> None:
+    def set_acceleration_voltage(self, voltage: Optional[Quantity]) -> None:
         v = ensure_quantity(voltage, "volt")
         self.ht.SetHtValue(float(v.magnitude))
         self._log_event(f"Set acceleration voltage -> {v.to('kilovolt')}")
 
-    def get_acceleration_voltage(self) -> "Quantity":
+    def get_acceleration_voltage(self) -> Optional[Quantity]:
         return Q_(float(self.ht.GetHtValue()), "volt").to("kilovolt")
 
-    def get_emission_current(self) -> "Quantity":
+    def get_emission_current(self) -> Optional[Quantity]:
         # PyJEM Gun emission current value is typically in µA, but treat as vendor-defined.
         return Q_(float(self.gun.GetEmissionCurrentValue()), "microampere")
 
@@ -234,38 +240,88 @@ class JeolMicroscope(TemMicroscope):
     # -----------------------
 
     def set_magnification(self, mag: float) -> None:
-        """
-        TEM: select the closest lower/equal magnification from `self.magnification_list`
-             and set EOS selector index.
-        STEM: uses `self.camera_length_list` and EOS stem camera selector if provided.
-        """
-        temstem = self.eos.GetTemStemMode()
-        if temstem == 0:
-            # Choose closest <= target; fallback to smallest if target is below range.
-            candidates = [m for m in self.magnification_list if m <= mag]
-            chosen = candidates[-1] if candidates else self.magnification_list[0]
-            idx = self.magnification_list.index(chosen)
-            self.eos.SetSelector(idx)
+        """Set magnification (unitless, in X) using the current EOS mode's MagList."""
+        mag_list = get_list(self.get_mode(), "MagList")
+        unit = list_unit(mag_list).strip().upper()
 
-        else:
-            # STEM camera length selector
-            candidates = [cl for cl in self.camera_length_list if cl <= mag]
-            chosen = candidates[-1] if candidates else self.camera_length_list[0]
-            idx = self.camera_length_list.index(chosen)
-            self.eos.SetStemCamSelector(idx)
+        if unit != "X":
+            raise ValueError(
+                f"Current mode '{self.get_mode()}' does not use magnification selectors (MagList unit='{unit}')."
+            )
 
-        self._log_event(f"Set magnification request {mag} -> now {self.get_magnification()}")
+        target = float(mag)
+        values = [v for v, _, _ in mag_list]
+        idx = max((i for i, v in enumerate(values) if v <= target), default=0)
+
+        self.eos.SetSelector(idx)
+        self._log_event(f"Set magnification -> {self.get_magnification()} X")
 
     def get_magnification(self) -> float:
+        """Get magnification (unitless, in X).
+
+        In TEM DIFF (and some special function modes), JEOL reports a *length* here instead.
+        We guard against that by checking the returned unit string.
+        """
+        val = self.eos.GetMagValue()  # [value, unit, label]
+        if isinstance(val, list) and len(val) >= 2:
+            v = float(val[0])
+            unit = str(val[1]).strip().upper()
+            if unit == "X":
+                return v
+            raise ValueError(
+                f"EOS reports unit '{unit}' for GetMagValue() in mode '{self.get_mode()}'. "
+                f"That's not magnification; use get_camera_length() instead."
+            )
+        return float(val)
+
+    def set_camera_length(self, camera_length: Quantity) -> None:
+        """Set camera length for the current mode.
+
+        - TEM:DIFF uses EOS selector (MagList contains lengths, e.g. cm/mm).
+        - STEM:* uses EOS stem camera selector (StemCamList contains lengths).
+        """
+        camera_length = ensure_quantity(camera_length, "cm")
         temstem = self.eos.GetTemStemMode()
+        key = self.get_mode()
+
         if temstem == 0:
-            val = self.eos.GetMagValue()
+            lst = get_list(key, "MagList")  # in DIFF this is length
+            unit = list_unit(lst).strip()
+            if unit.lower() not in {"m", "cm", "mm", "um", "nm"}:
+                raise ValueError(f"Mode '{self.get_mode()}' does not expose camera length via MagList (unit='{unit}').")
+            target = magnitude(camera_length, unit)
+            values = [v for v, _, _ in lst]
+            idx = max((i for i, v in enumerate(values) if v <= target), default=0)
+            self.eos.SetSelector(idx)
+        else:
+            lst = get_list(key, "StemCamList")
+            unit = list_unit(lst).strip()
+            if unit.lower() not in {"m", "cm", "mm", "um", "nm"}:
+                raise ValueError(
+                    f"Mode '{self.get_mode()}' does not expose STEM camera length via StemCamList (unit='{unit}')."
+                )
+            target = magnitude(camera_length, unit)
+            values = [v for v, _, _ in lst]
+            idx = max((i for i, v in enumerate(values) if v <= target), default=0)
+            self.eos.SetStemCamSelector(idx)
+
+        self._log_event(f"Set camera length -> {self.get_camera_length()}")
+
+    def get_camera_length(self) -> Optional[Quantity]:
+        """Get camera length as a Quantity (or None if not applicable in the current mode)."""
+        temstem = self.eos.GetTemStemMode()
+
+        if temstem == 0:
+            val = self.eos.GetMagValue()  # in DIFF this is length
         else:
             val = self.eos.GetStemCamValue()
-        # TEM3 returns [value, unit, string]
-        if isinstance(val, list) and len(val) > 0:
-            return float(val[0])
-        return float(val)
+
+        if isinstance(val, list) and len(val) >= 2:
+            v = float(val[0])
+            unit = str(val[1]).strip()
+            if unit.lower() in {"m", "cm", "mm", "um", "nm"}:
+                return Q_(v, unit)
+        return None
 
     def set_spot_size(self, index: int) -> None:
         self.eos.SelectSpotSize(int(index))
@@ -277,7 +333,7 @@ class JeolMicroscope(TemMicroscope):
     # -----------------------
     # Focus / Stig (device units)
     # -----------------------
-    def set_defocus(self, defocus: "Quantity") -> None:
+    def set_defocus(self, defocus: Optional[Quantity]) -> None:
         #need fix: still don't know current defocus, can't directly assign defocus value
         """
         JEOL PyJEM does not provide a universal defocus-in-nm API in TEM3.
@@ -297,7 +353,7 @@ class JeolMicroscope(TemMicroscope):
         except Exception:
             pass
 
-    def get_defocus(self) -> "Quantity":
+    def get_defocus(self) -> Optional[Quantity]:
         return self._defocus_cache
 
     def set_stigmation(self, x: float, y: float) -> None:
@@ -402,6 +458,8 @@ class JeolMicroscope(TemMicroscope):
         if self._selected_detector is None:
             raise RuntimeError("Detector is not selected (call select_detector first)")
         ext = (settings.file_format or "tif").lower().strip(".")
+        if ext == 'tiff':
+            ext = 'tif'
         raw = self._selected_detector.snapshot(ext, save=False, filename=None, show=False)
         arr = self._decode_image_bytes(raw, ext)
 
@@ -505,7 +563,7 @@ class JeolMicroscope(TemMicroscope):
             coordinate_system="stage",
         )
 
-    def move_stage_absolute(self, pos: TemStagePosition, wait: bool = True, tolerance: "Quantity" = None) -> None:
+    def move_stage_absolute(self, pos: TemStagePosition, wait: bool = True, tolerance: Optional[Quantity] = None) -> None:
         if tolerance is None:
             tolerance = Q_(10, "nanometer")
         # Only set axes that are not None
@@ -525,8 +583,8 @@ class JeolMicroscope(TemMicroscope):
         current_pos = self.get_stage_position()
         self._log_event(f"Current stage position: x = {current_pos.x}, y = {current_pos.y}, z = {current_pos.z}, tilt x = {current_pos.tilt_x}, tilt y = {current_pos.tilt_y}:")
 
-    def move_stage_relative(self, dx: "Quantity" = None, dy: "Quantity" = None, dz: "Quantity" = None,
-                            wait: bool = True, tolerance: "Quantity" = None) -> None:
+    def move_stage_relative(self, dx: Optional[Quantity] = None, dy: Optional[Quantity] = None, dz: Optional[Quantity] = None,
+                            wait: bool = True, tolerance: Optional[Quantity] = None) -> None:
         if tolerance is None:
             tolerance = Q_(10, "nanometer")
         dx_nm = ensure_quantity(dx, "nanometer") if dx is not None else None
@@ -545,7 +603,7 @@ class JeolMicroscope(TemMicroscope):
         self._log_event(
             f"Current stage position: x = {current_pos.x}, y = {current_pos.y}, z = {current_pos.z}, tilt x = {current_pos.tilt_x}, tilt y = {current_pos.tilt_y}:")
 
-    def _wait_stage(self, target: TemStagePosition, tolerance: "Quantity" = None, timeout_s: float = 30.0) -> None:
+    def _wait_stage(self, target: TemStagePosition, tolerance: Optional[Quantity] = None, timeout_s: float = 30.0) -> None:
         t0 = time.time()
         if tolerance is None:
             tolerance = Q_(10, "nanometer")

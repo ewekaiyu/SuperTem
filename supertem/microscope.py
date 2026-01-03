@@ -62,15 +62,15 @@ class TemMicroscope(ABC):
     # -----------------------
 
     @abstractmethod
-    def set_acceleration_voltage(self, voltage: "Quantity") -> None:
+    def set_acceleration_voltage(self, voltage: Optional[Quantity]) -> None:
         """Set accelerating voltage (Quantity)."""
 
     @abstractmethod
-    def get_acceleration_voltage(self) -> "Quantity":
+    def get_acceleration_voltage(self) -> Optional[Quantity]:
         """Get accelerating voltage as a Quantity."""
 
     @abstractmethod
-    def get_emission_current(self) -> "Quantity":
+    def get_emission_current(self) -> Optional[Quantity]:
         """Get emission current (units are vendor-defined, often µA or nA)."""
 
     @abstractmethod
@@ -87,11 +87,20 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def set_magnification(self, mag: float) -> None:
-        """Set magnification (TEM) or camera length / equivalent selector (STEM), depending on vendor."""
+        """Set magnification (unitless, in X)."""
 
     @abstractmethod
     def get_magnification(self) -> float:
-        """Get magnification (TEM) or camera length (STEM), depending on vendor."""
+        """Get magnification (unitless, in X)."""
+
+
+    @abstractmethod
+    def set_camera_length(self, camera_length: Optional[Quantity]) -> None:
+        """Set camera length (a length Quantity, e.g. cm or m)."""
+
+    @abstractmethod
+    def get_camera_length(self) -> Optional[Quantity]:
+        """Get camera length as a Quantity (or None if not applicable)."""
 
     @abstractmethod
     def set_spot_size(self, index: int) -> None:
@@ -102,7 +111,7 @@ class TemMicroscope(ABC):
         """Get spot size index."""
 
     @abstractmethod
-    def set_defocus(self, defocus: "Quantity") -> None:
+    def set_defocus(self, defocus: Optional[Quantity]) -> None:
         """
         Set defocus.
 
@@ -112,7 +121,7 @@ class TemMicroscope(ABC):
         """
 
     @abstractmethod
-    def get_defocus(self) -> "Quantity":
+    def get_defocus(self) -> Optional[Quantity]:
         """Get current defocus in nm (or device units; see implementation)."""
 
     @abstractmethod
@@ -199,13 +208,13 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def move_stage_absolute(
-        self, pos: TemStagePosition, wait: bool = True, tolerance: "Quantity" = None
+        self, pos: TemStagePosition, wait: bool = True, tolerance: Optional[Quantity] = None
     ) -> None:
         """Move stage to an absolute position."""
 
     @abstractmethod
     def move_stage_relative(
-        self, dx: "Quantity" = None, dy: "Quantity" = None, dz: "Quantity" = None, wait: bool = True, tolerance: "Quantity" = None
+        self, dx: Optional[Quantity] = None, dy: Optional[Quantity] = None, dz: Optional[Quantity] = None, wait: bool = True, tolerance: Optional[Quantity] = None
     ) -> None:
         """Move stage relatively by dx/dy/dz (in the same units used in TemStagePosition)."""
 
@@ -252,7 +261,7 @@ class TemMicroscope(ABC):
     # Convenience: safe stage movement (default implementation)
     # -----------------------
 
-    def safe_move_stage(self, pos: TemStagePosition, max_step: "Quantity" = None, tolerance: "Quantity" = None) -> None:
+    def safe_move_stage(self, pos: TemStagePosition, max_step: Optional[Quantity] = None, tolerance: Optional[Quantity] = None) -> None:
         """
         Move in smaller increments to reduce the chance of hitting limits/collisions.
 
