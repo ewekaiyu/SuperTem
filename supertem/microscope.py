@@ -1,10 +1,9 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
+from pint import Quantity
 
-from supertem.structures.base import SystemSettings, ImageSettings, TemStagePosition, TemImage, Quantity, Q_, ensure_quantity, magnitude
-
-
+from supertem.structures.base import SystemSettings, ImageSettings, TemStagePosition, TemImage, Q_, ensure_quantity, magnitude
 
 
 class TemMicroscope(ABC):
@@ -139,15 +138,15 @@ class TemMicroscope(ABC):
         """Return supported aperture 'kinds' or names for this microscope."""
 
     @abstractmethod
-    def set_aperture(self, kind: str) -> None:
+    def get_aperture_status(self) -> Dict[str, Any]:
         """Select which aperture is the active target (vendor-defined)."""
 
     @abstractmethod
-    def insert_aperture(self, size: Optional[int]) -> None:
+    def insert_aperture(self, kind: str, size: Optional[int]) -> None:
         """Insert the currently selected aperture (if supported)."""
 
     @abstractmethod
-    def retract_aperture(self) -> None:
+    def retract_aperture(self, kind: str) -> None:
         """Retract the currently selected aperture (if supported)."""
 
     # -----------------------
@@ -206,7 +205,7 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def move_stage_relative(
-        self, dx: "Quantity", dy: "Quantity", dz: "Quantity", wait: bool = True, tolerance: "Quantity" = None
+        self, dx: "Quantity" = None, dy: "Quantity" = None, dz: "Quantity" = None, wait: bool = True, tolerance: "Quantity" = None
     ) -> None:
         """Move stage relatively by dx/dy/dz (in the same units used in TemStagePosition)."""
 
@@ -307,13 +306,10 @@ class TemMicroscope(ABC):
         step_dz = (dz / steps) if dz is not None else None
 
         for _ in range(steps):
-            self.move_stage_relative(
-                step_dx if step_dx is not None else Q_(0, "nanometer"),
-                step_dy if step_dy is not None else Q_(0, "nanometer"),
-                step_dz if step_dz is not None else Q_(0, "nanometer"),
-                wait=True,
-                tolerance=tolerance,
-            )
+            self.move_stage_relative(step_dx if step_dx is not None else Q_(0, "nanometer"),
+                                     step_dy if step_dy is not None else Q_(0, "nanometer"),
+                                     step_dz if step_dz is not None else Q_(0, "nanometer"), wait=True,
+                                     tolerance=tolerance)
 
         # Final snap to the requested target (also catches tilt axes)
         self.move_stage_absolute(pos, wait=True, tolerance=tolerance)

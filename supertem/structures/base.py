@@ -176,8 +176,8 @@ class TemImageMetadataRefined:
 
 @dataclass
 class ImageSettings:
-    width: int
-    height: int
+    width: Optional[int] = None
+    height: Optional[int] = None
     x: Optional[int] = None
     y: Optional[int] = None
     binning: Optional[int] = None

@@ -3,11 +3,11 @@ import numpy as np
 from typing import Dict, Any, Optional, List, Tuple, Union
 from datetime import datetime
 from io import BytesIO
+from pint import Quantity
 
 from supertem.microscope import TemMicroscope
 from supertem.structures.base import (
     ImageSettings,
-    Quantity,
     Q_,
     ensure_quantity,
     magnitude,
@@ -18,10 +18,25 @@ from supertem.structures.base import (
 
 try:
     from PyJEM import TEM3  # type: ignore
-except Exception:  # pragma: no cover
-    TEM3 = None
+except Exception: # pragma: no cover
+    print("TEM3 is not available, trying offline version")
+    try:
+        from PyJEM.offline import TEM3
+        print("offline.TEM3 is available")
+    except Exception:
+        TEM3 = None
+        print("TEM3 is None")
 
-from PyJEM import detector
+try:
+    from PyJEM import detector
+except Exception:
+    print("Detector is not available, trying offline version")
+    try:
+        from PyJEM.offline import detector
+        print("offline.detector is available")
+    except Exception:
+        detector = None
+        print("detector is None")
 
 
 class JeolMicroscope(TemMicroscope):
@@ -57,7 +72,7 @@ class JeolMicroscope(TemMicroscope):
 
         # TEM3 controllers
         self.apt = TEM3.Apt3()
-        self.deflector = TEM3.Def()
+        self.deflector = TEM3.Def3()
         self.detector = TEM3.Detector3()
         self.eos = TEM3.EOS3()
         self.feg = TEM3.FEG3()
@@ -102,7 +117,10 @@ class JeolMicroscope(TemMicroscope):
         try:
             return bool(TEM3.is_connect())
         except Exception:
-            return False
+            try:
+                return bool(TEM3.connect())
+            except Exception:
+                return False
 
     # -----------------------
     # Status / Info
@@ -150,11 +168,15 @@ class JeolMicroscope(TemMicroscope):
         func = self.eos.GetFunctionMode()  # [index, name]
         prefix = "TEM" if temstem == 0 else "STEM"
         if isinstance(func, list) and len(func) >= 2:
-            return f"{prefix}:{str(func[0])}"
+            if temstem == 0:
+                function = [k for k, v in self._TEM_FUNCTION_MAP.items() if v == func[0]][0]
+            else:
+                function = [k for k, v in self._STEM_FUNCTION_MAP.items() if v == func[0]][0]
+            return f"{prefix}:{str(function).upper()}"
         return prefix
 
     def set_mode(self, mode: str):
-        #Mode should be "TEM/STEM:function", for example "TEM:MAG" or "STEM:SM-MAG".
+        # Mode should be "TEM/STEM:function", for example "TEM:MAG" or "STEM:SM-MAG".
         if not isinstance(mode, str) or not mode.strip():
             raise ValueError("mode must be a non-empty string")
 
@@ -171,7 +193,7 @@ class JeolMicroscope(TemMicroscope):
                     raise ValueError(f"Unknown TEM function mode: {func}")
                 self.eos.SelectFunctionMode(idx)
 
-        if obs in {"STEM"}:
+        elif obs in {"STEM"}:
             self.eos.SelectTemStem(1)
             if func:
                 key = func.replace(" ", "").lower()
@@ -191,7 +213,7 @@ class JeolMicroscope(TemMicroscope):
     def set_acceleration_voltage(self, voltage: "Quantity") -> None:
         v = ensure_quantity(voltage, "volt")
         self.ht.SetHtValue(float(v.magnitude))
-        self._log_event(f"Set acceleration voltage -> {magnitude(voltage, 'kilovolt')} kV")
+        self._log_event(f"Set acceleration voltage -> {v.to('kilovolt')}")
 
     def get_acceleration_voltage(self) -> "Quantity":
         return Q_(float(self.ht.GetHtValue()), "volt").to("kilovolt")
@@ -304,20 +326,39 @@ class JeolMicroscope(TemMicroscope):
     def list_apertures(self) -> List[str]:
         return list(self.aperture_dict.keys())
 
-    def set_aperture(self, kind: str) -> None:
+    def get_aperture_status(self) -> Dict[str, Any]:
+        status = {}
+        for aperture, idx in self.aperture_dict.items():
+            # PyJEM GetExpSize only retrieves the size of the selected aperture from SelectExpKind, it doesn't use the value of argument 'kind'. Need to first select the aperture.
+            self.select_aperture(aperture)
+            status[aperture] = self.apt.GetExpSize(idx)
+        return status
+
+    def select_aperture(self, kind: str) -> int:
         if kind not in self.aperture_dict:
             raise ValueError(f"Unknown aperture kind: {kind}. Known: {list(self.aperture_dict)}")
-        self.apt.SelectExpKind(self.aperture_dict[kind])
+        idx = self.aperture_dict[kind]
+        self.apt.SelectExpKind(idx)
         self._selected_aperture = kind
-        self._log_event(f"Selected aperture -> {kind}")
+        return idx
 
-    def insert_aperture(self, size: Optional[int]) -> None:
-        self.apt.SetExpSize(kind = self._selected_aperture, size = size)
-        self._log_event(f"Aperture: {self._selected_aperture} -> {size}")
+    def insert_aperture(self, kind: str, size: Optional[int]) -> None:
+        if size == 0:
+            raise ValueError("Size cannot be zero, use retract_aperture() instead")
+        idx = self.select_aperture(kind=kind)
+        self._log_event(f"Selected Aperture: {self._selected_aperture}")
+        self.apt.SetExpSize(kind = idx, size = size)
+        print(f"Inserting {kind}")
+        time.sleep(5)
+        self._log_event(f"Aperture: {kind} -> {size}")
 
-    def retract_aperture(self) -> None:
-        self.apt.SetExpSize(kind = self._selected_aperture, size = 0)
-        self._log_event(f"Aperture: {self._selected_aperture} -> {0}")
+    def retract_aperture(self, kind: str) -> None:
+        idx = self.select_aperture(kind=kind)
+        self._log_event(f"Selected Aperture: {self._selected_aperture}")
+        self.apt.SetExpSize(kind = idx, size = 0)
+        print(f"Retracting {kind}")
+        time.sleep(5)
+        self._log_event(f"Aperture: {kind} -> {0}")
 
     # -----------------------
     # Detectors
@@ -360,8 +401,8 @@ class JeolMicroscope(TemMicroscope):
     def acquire_image(self, settings: Optional[ImageSettings] = None) -> TemImage:
         if self._selected_detector is None:
             raise RuntimeError("Detector is not selected (call select_detector first)")
-        ext = (settings.file_format or "tiff").lower().strip(".")
-        raw = self._selected_detector.snapshotframe(ext, save=False, filename=None, show=False)
+        ext = (settings.file_format or "tif").lower().strip(".")
+        raw = self._selected_detector.snapshot(ext, save=False, filename=None, show=False)
         arr = self._decode_image_bytes(raw, ext)
 
         # Build metadata (keep it sparse + put the rest in 'extra')
@@ -481,9 +522,13 @@ class JeolMicroscope(TemMicroscope):
 
         if wait:
             self._wait_stage(pos, tolerance=tolerance)
+        current_pos = self.get_stage_position()
+        self._log_event(f"Current stage position: x = {current_pos.x}, y = {current_pos.y}, z = {current_pos.z}, tilt x = {current_pos.tilt_x}, tilt y = {current_pos.tilt_y}:")
 
-    def move_stage_relative(self, dx: "Quantity", dy: "Quantity", dz: "Quantity", wait: bool = True,
-                            tolerance: "Quantity" = None) -> None:
+    def move_stage_relative(self, dx: "Quantity" = None, dy: "Quantity" = None, dz: "Quantity" = None,
+                            wait: bool = True, tolerance: "Quantity" = None) -> None:
+        if tolerance is None:
+            tolerance = Q_(10, "nanometer")
         dx_nm = ensure_quantity(dx, "nanometer") if dx is not None else None
         if dx_nm is not None and dx_nm.magnitude != 0:
             self.stage.SetXRel(float(dx_nm.magnitude))
@@ -496,6 +541,9 @@ class JeolMicroscope(TemMicroscope):
         if wait:
             # Relative: just poll until rest; or approximate by checking delta near 0 from target.
             time.sleep(0.05)
+        current_pos = self.get_stage_position()
+        self._log_event(
+            f"Current stage position: x = {current_pos.x}, y = {current_pos.y}, z = {current_pos.z}, tilt x = {current_pos.tilt_x}, tilt y = {current_pos.tilt_y}:")
 
     def _wait_stage(self, target: TemStagePosition, tolerance: "Quantity" = None, timeout_s: float = 30.0) -> None:
         t0 = time.time()
@@ -519,13 +567,18 @@ class JeolMicroscope(TemMicroscope):
         key = mode.strip().lower()
         if key in {"motor", "m"}:
             self.stage.SelDrvMode(0)
+            self._log_event("Stage drive mode set to motor")
         elif key in {"piezo", "p"}:
             self.stage.SelDrvMode(1)
+            self._log_event("Stage drive mode set to piezo")
         else:
             raise ValueError("mode must be 'motor' / 'm' or 'piezo' / 'p'")
 
     def stop_stage(self) -> None:
         self.stage.Stop()
+        self._log_event("Stage stopped")
+        current_pos = self.get_stage_position()
+        self._log_event(f"Current stage position: x = {current_pos.x}, y = {current_pos.y}, z = {current_pos.z}, tilt x = {current_pos.tilt_x}, tilt y = {current_pos.tilt_y}:")
 
     def get_stage_status(self) -> Dict[str, Any]:
         st = self.stage.GetStatus()
@@ -593,7 +646,9 @@ class JeolMicroscope(TemMicroscope):
 
         args = params.get("args", [])
         kwargs = params.get("kwargs", {})
-        return meth(*args, **kwargs)
+        output = meth(*args, **kwargs)
+        self._log_event(f"Raw command sent: {command}, args = {args}, kwargs = {kwargs}, output = {output}")
+        return output
 
-    def safe_move_stage(self, pos: TemStagePosition, max_step_nm: float = 50000.0) -> None:
-        return super().safe_move_stage(pos, max_step_nm=max_step_nm)
+    def safe_move_stage(self, pos: TemStagePosition, max_step: "Quantity" = None, tolerance: "Quantity" = None) -> None:
+        return super().safe_move_stage(pos, max_step=max_step)
