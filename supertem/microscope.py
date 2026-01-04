@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from pint import Quantity
+import math
 
 from supertem.structures.base import SystemSettings, ImageSettings, TemStagePosition, TemImage, Q_, ensure_quantity, magnitude, TemDetectorSettings
 
@@ -208,15 +209,17 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def move_stage_absolute(
-        self, pos: TemStagePosition, wait: bool = True, tolerance: Optional[Quantity] = None
+        self, pos: TemStagePosition, exact: bool = False, tolerance_length: Optional[Quantity] = None,
+        tolerance_angle: Optional[Quantity] = None
     ) -> None:
-        """Move stage to an absolute position."""
+        """Move stage to an absolute position. Set exact to True to ensure exact position within tolerance."""
 
     @abstractmethod
     def move_stage_relative(
-        self, dx: Optional[Quantity] = None, dy: Optional[Quantity] = None, dz: Optional[Quantity] = None, wait: bool = True, tolerance: Optional[Quantity] = None
+        self, pos: TemStagePosition, exact: bool = False, tolerance_length: Optional[Quantity] = None,
+        tolerance_angle: Optional[Quantity] = None
     ) -> None:
-        """Move stage relatively by dx/dy/dz (in the same units used in TemStagePosition)."""
+        """Move stage relatively. Set exact to True to ensure exact position within tolerance."""
 
     @abstractmethod
     def set_stage_drive_mode(self, mode: str) -> None:
@@ -261,64 +264,83 @@ class TemMicroscope(ABC):
     # Convenience: safe stage movement (default implementation)
     # -----------------------
 
-    def safe_move_stage(self, pos: TemStagePosition, max_step: Optional[Quantity] = None, tolerance: Optional[Quantity] = None) -> None:
+    def safe_move_stage(
+            self,
+            pos: TemStagePosition,
+            max_step: Optional[Quantity] = None,
+            *,
+            exact: bool = True,
+            tolerance_length: Optional[Quantity] = None,
+            tolerance_angle: Optional[Quantity] = None,
+    ) -> None:
         """
-        Move in smaller increments to reduce the chance of hitting limits/collisions.
+        Move stage to `pos` in safe incremental steps.
 
-        `pos` uses Quantity-based axes (see TemStagePosition in base.py).
-        By default we step in 50 µm chunks (in nm units internally).
+        Each axis (x, y, z) moves one at a time.
+        If delta > max_step, move in multiple smaller steps.
+        Final move is an exact absolute move to target (handles tilt).
         """
-        if max_step is None:
-            max_step = Q_(50000, "nanometer")  # 50 µm
-        if tolerance is None:
-            tolerance = Q_(10, "nanometer")
-
-        max_step = ensure_quantity(max_step, "nanometer")
-        tolerance = ensure_quantity(tolerance, "nanometer")
 
         cur = self.get_stage_position()
+        max_step = Q_(1, "micrometer")
+        max_step = ensure_quantity(max_step, "nanometer")
+        pos.x = ensure_quantity(pos.x, "nanometer")
+        pos.y = ensure_quantity(pos.y, "nanometer")
+        pos.z = ensure_quantity(pos.z, "nanometer")
+        pos.tilt_x = ensure_quantity(pos.tilt_x, "degree")
+        pos.tilt_y = ensure_quantity(pos.tilt_y, "degree")
 
-        # If we can't read current position, fall back to direct absolute move.
-        if cur is None:
-            self.move_stage_absolute(pos, wait=True, tolerance=tolerance)
-            return
+        # --- Helper to move one axis safely ---
+        def _move_axis(axis: str, target: Quantity):
+            cur_val = getattr(cur, axis)
+            delta = target - cur_val
+            step_nm = max_step.to("nanometer").magnitude
+            delta_nm = delta.to("nanometer").magnitude
 
-        def delta_axis(target_q, current_q):
-            if target_q is None or current_q is None:
-                return None
-            return ensure_quantity(target_q, "nanometer") - ensure_quantity(current_q, "nanometer")
+            if abs(delta_nm) <= step_nm:
+                step_target = TemStagePosition(**{axis: target})
+                self.move_stage_absolute(
+                    pos=step_target,
+                    exact=False,
+                    tolerance_length=tolerance_length,
+                    tolerance_angle=tolerance_angle,
+                )
+                setattr(cur, axis, target)
+                return
 
-        dx = delta_axis(pos.x, cur.x)
-        dy = delta_axis(pos.y, cur.y)
-        dz = delta_axis(pos.z, cur.z)
+            n_steps = int(abs(delta_nm) // step_nm)
+            step = delta / (n_steps + 1)
+            for _ in range(n_steps):
+                next_pos = TemStagePosition(**{axis: getattr(cur, axis) + step})
+                self.move_stage_absolute(
+                    pos=next_pos,
+                    exact=False,
+                    tolerance_length=tolerance_length,
+                    tolerance_angle=tolerance_angle,
+                )
+                setattr(cur, axis, getattr(cur, axis) + step)
 
-        # If no translational axes are specified, just do the absolute move (tilt handled by vendor impl).
-        if dx is None and dy is None and dz is None:
-            self.move_stage_absolute(pos, wait=True, tolerance=tolerance)
-            return
+            # Final step to target
+            self.move_stage_absolute(
+                pos=TemStagePosition(**{axis: target}),
+                exact=False,
+                tolerance_length=tolerance_length,
+                tolerance_angle=tolerance_angle,
+            )
+            setattr(cur, axis, target)
 
-        # Determine number of steps based on the largest requested move.
-        max_abs_nm = 0.0
-        for d in (dx, dy, dz):
-            if d is not None:
-                max_abs_nm = max(max_abs_nm, abs(magnitude(d, "nanometer")))
+        # --- Step each axis independently ---
+        if pos.x is not None:
+            _move_axis("x", pos.x)
+        if pos.y is not None:
+            _move_axis("y", pos.y)
+        if pos.z is not None:
+            _move_axis("z", pos.z)
 
-        if max_abs_nm <= magnitude(max_step, "nanometer"):
-            self.move_stage_absolute(pos, wait=True, tolerance=tolerance)
-            return
-
-        import math
-        steps = int(math.ceil(max_abs_nm / magnitude(max_step, "nanometer")))
-
-        step_dx = (dx / steps) if dx is not None else None
-        step_dy = (dy / steps) if dy is not None else None
-        step_dz = (dz / steps) if dz is not None else None
-
-        for _ in range(steps):
-            self.move_stage_relative(step_dx if step_dx is not None else Q_(0, "nanometer"),
-                                     step_dy if step_dy is not None else Q_(0, "nanometer"),
-                                     step_dz if step_dz is not None else Q_(0, "nanometer"), wait=True,
-                                     tolerance=tolerance)
-
-        # Final snap to the requested target (also catches tilt axes)
-        self.move_stage_absolute(pos, wait=True, tolerance=tolerance)
+        # --- Final absolute move for tilt / precision ---
+        self.move_stage_absolute(
+            pos=pos,
+            exact=exact,
+            tolerance_length=tolerance_length,
+            tolerance_angle=tolerance_angle,
+        )

@@ -3,6 +3,8 @@ import numpy as np
 from typing import Dict, Any, Optional, List, Tuple, Union
 from datetime import datetime
 from io import BytesIO
+
+from fontTools.varLib.instancer import axisValuesFromAxisLimits
 from pint import Quantity
 
 from supertem.microscope import TemMicroscope
@@ -568,63 +570,117 @@ class JeolMicroscope(TemMicroscope):
             coordinate_system="stage",
         )
 
-    def move_stage_absolute(self, pos: TemStagePosition, wait: bool = True, tolerance: Optional[Quantity] = None) -> None:
-        if tolerance is None:
-            tolerance = Q_(10, "nanometer")
-        # Only set axes that are not None
+    def move_stage_absolute(self, pos: TemStagePosition, exact: bool = True, tolerance_length: Optional[Quantity] = None,
+                            tolerance_angle: Optional[Quantity] = None) -> None:
+        if tolerance_length is None:
+            tolerance_length = Q_(10, "nanometer")
+        if tolerance_angle is None:
+            tolerance_angle = Q_(0.1, "degree")
+
+        def ensure_stage_rest(axis: str, timeout_s: float = 30.0, poll_s: float = 0.1) -> None:
+            deadline = time.monotonic() + timeout_s
+            while True:
+                status = self.get_stage_status()
+                if status.get(axis, 1) == 0:
+                    return
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Stage axis '{axis}' did not settle within {timeout_s}s. status={status}")
+                time.sleep(poll_s)
+
+        def exceed_tolerance(cur: TemStagePosition) -> Optional[TemStagePosition]:
+            exceed = False
+            new_target = TemStagePosition()
+
+            tol_nm = magnitude(tolerance_length, "nanometer")
+            tol_deg = magnitude(tolerance_angle, "degree")
+
+            if pos.x is not None:
+                if abs(magnitude(pos.x, "nanometer") - magnitude(cur.x, "nanometer")) > tol_nm:
+                    new_target.x = pos.x
+                    exceed = True
+
+            if pos.y is not None:
+                if abs(magnitude(pos.y, "nanometer") - magnitude(cur.y, "nanometer")) > tol_nm:
+                    new_target.y = pos.y
+                    exceed = True
+
+            if pos.z is not None:
+                if abs(magnitude(pos.z, "nanometer") - magnitude(cur.z, "nanometer")) > tol_nm:
+                    new_target.z = pos.z
+                    exceed = True
+
+            if pos.tilt_x is not None:
+                if abs(magnitude(pos.tilt_x, "degree") - magnitude(cur.tilt_x, "degree")) > tol_deg:
+                    new_target.tilt_x = pos.tilt_x
+                    exceed = True
+
+            if pos.tilt_y is not None:
+                if abs(magnitude(pos.tilt_y, "degree") - magnitude(cur.tilt_y, "degree")) > tol_deg:
+                    new_target.tilt_y = pos.tilt_y
+                    exceed = True
+
+            return new_target if exceed else None
+
         if pos.x is not None:
             self.stage.SetX(float(magnitude(pos.x, "nanometer")))
+            ensure_stage_rest("x", timeout_s=30.0)
+
         if pos.y is not None:
             self.stage.SetY(float(magnitude(pos.y, "nanometer")))
+            ensure_stage_rest("y", timeout_s=30.0)
+
         if pos.z is not None:
             self.stage.SetZ(float(magnitude(pos.z, "nanometer")))
+            ensure_stage_rest("z", timeout_s=30.0)
+
         if pos.tilt_x is not None:
             self.stage.SetTiltXAngle(float(magnitude(pos.tilt_x, "degree")))
+            ensure_stage_rest("tilt_x", timeout_s=30.0)
+
         if pos.tilt_y is not None:
             self.stage.SetTiltYAngle(float(magnitude(pos.tilt_y, "degree")))
+            ensure_stage_rest("tilt_y", timeout_s=30.0)
 
-        if wait:
-            self._wait_stage(pos, tolerance=tolerance)
         current_pos = self.get_stage_position()
-        self._log_event(f"Current stage position: x = {current_pos.x}, y = {current_pos.y}, z = {current_pos.z}, tilt x = {current_pos.tilt_x}, tilt y = {current_pos.tilt_y}:")
+        new_target = exceed_tolerance(current_pos)
+        if not exact or new_target is None:
+            return
 
-    def move_stage_relative(self, dx: Optional[Quantity] = None, dy: Optional[Quantity] = None, dz: Optional[Quantity] = None,
-                            wait: bool = True, tolerance: Optional[Quantity] = None) -> None:
-        if tolerance is None:
-            tolerance = Q_(10, "nanometer")
-        dx_nm = ensure_quantity(dx, "nanometer") if dx is not None else None
-        if dx_nm is not None and dx_nm.magnitude != 0:
-            self.stage.SetXRel(float(dx_nm.magnitude))
-        dy_nm = ensure_quantity(dy, "nanometer") if dy is not None else None
-        if dy_nm is not None and dy_nm.magnitude != 0:
-            self.stage.SetYRel(float(dy_nm.magnitude))
-        dz_nm = ensure_quantity(dz, "nanometer") if dz is not None else None
-        if dz_nm is not None and dz_nm.magnitude != 0:
-            self.stage.SetZRel(float(dz_nm.magnitude))
-        if wait:
-            # Relative: just poll until rest; or approximate by checking delta near 0 from target.
-            time.sleep(0.05)
-        current_pos = self.get_stage_position()
-        self._log_event(
-            f"Current stage position: x = {current_pos.x}, y = {current_pos.y}, z = {current_pos.z}, tilt x = {current_pos.tilt_x}, tilt y = {current_pos.tilt_y}:")
+        max_retries = 5
+        for _ in range(max_retries):
+            self.move_stage_absolute(pos=new_target, exact=False,
+                                     tolerance_length=tolerance_length,
+                                     tolerance_angle=tolerance_angle)
+            cur_pos = self.get_stage_position()
+            new_target = exceed_tolerance(cur_pos)
+            if new_target is None:
+                break
+        else:
+            final_pos = self.get_stage_position()
+            raise TimeoutError(
+                f"Stage failed to reach target within tolerance after {max_retries} retries. "
+                f"target={pos} final={final_pos} remaining_axes={new_target}"
+            )
 
-    def _wait_stage(self, target: TemStagePosition, tolerance: Optional[Quantity] = None, timeout_s: float = 30.0) -> None:
-        t0 = time.time()
-        if tolerance is None:
-            tolerance = Q_(10, "nanometer")
-        tolerance = ensure_quantity(tolerance, "nanometer")
-        while time.time() - t0 < timeout_s:
-            cur = self.get_stage_position()
-            ok = True
-            if target.x is not None:
-                ok &= abs(magnitude(cur.x, "nanometer") - magnitude(target.x, "nanometer")) <= magnitude(tolerance, "nanometer")
-            if target.y is not None:
-                ok &= abs(magnitude(cur.y, "nanometer") - magnitude(target.y, "nanometer")) <= magnitude(tolerance, "nanometer")
-            if target.z is not None:
-                ok &= abs(magnitude(cur.z, "nanometer") - magnitude(target.z, "nanometer")) <= magnitude(tolerance, "nanometer")
-            if ok:
-                return
-            time.sleep(0.05)
+
+    def move_stage_relative(self, pos: TemStagePosition, exact: bool = False, tolerance_length: Optional[Quantity] = None,
+                            tolerance_angle: Optional[Quantity] = None) -> None:
+        cur = self.get_stage_position()
+        pos.x = ensure_quantity(pos.x, "nanometer")
+        pos.y = ensure_quantity(pos.y, "nanometer")
+        pos.z = ensure_quantity(pos.z, "nanometer")
+        pos.tilt_x = ensure_quantity(pos.tilt_x, "degree")
+        pos.tilt_y = ensure_quantity(pos.tilt_y, "degree")
+        target = TemStagePosition(
+            x=(cur.x + pos.x) if pos.x is not None else None,
+            y=(cur.y + pos.y) if pos.y is not None else None,
+            z=(cur.z + pos.z) if pos.z is not None else None,
+            tilt_x=(cur.tilt_x + pos.tilt_x) if pos.tilt_x is not None else None,
+            tilt_y=(cur.tilt_y + pos.tilt_y) if pos.tilt_y is not None else None,
+            coordinate_system=cur.coordinate_system,
+        )
+        self.move_stage_absolute(pos=target, exact=exact, tolerance_length=tolerance_length, tolerance_angle=tolerance_angle)
+
 
     def set_stage_drive_mode(self, mode: str) -> None:
         key = mode.strip().lower()
@@ -713,5 +769,19 @@ class JeolMicroscope(TemMicroscope):
         self._log_event(f"Raw command sent: {command}, args = {args}, kwargs = {kwargs}, output = {output}")
         return output
 
-    def safe_move_stage(self, pos: TemStagePosition, max_step: "Quantity" = None, tolerance: "Quantity" = None) -> None:
-        return super().safe_move_stage(pos, max_step=max_step)
+    def safe_move_stage(
+            self,
+            pos: TemStagePosition,
+            max_step: Optional[Quantity] = None,
+            *,
+            exact: bool = True,
+            tolerance_length: Optional[Quantity] = None,
+            tolerance_angle: Optional[Quantity] = None,
+    ) -> None:
+        return super().safe_move_stage(
+            pos=pos,
+            max_step=max_step,
+            exact=exact,
+            tolerance_length=tolerance_length,
+            tolerance_angle=tolerance_angle,
+        )
