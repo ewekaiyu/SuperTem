@@ -1182,104 +1182,79 @@ class TemImage:
 
     def __init__(self, data: np.ndarray, metadata: Optional[TemImageMetadata] = None):
         if not _check_data_format(data):
-            raise ValueError("Invalid data format for Tem Image.")
+            raise ValueError("Invalid data format for TemImage.")
         if data.ndim == 3 and data.shape[2] == 1:
             data = data[:, :, 0]
         self.data = data
         self.metadata = metadata
 
+    # -------------------------- helpers --------------------------
+
+    @staticmethod
+    def _decode_description(desc: Any) -> Optional[Dict[str, Any]]:
+        """Try to parse TIFF ImageDescription as JSON dict."""
+        if desc is None:
+            return None
+        if isinstance(desc, bytes):
+            try:
+                desc = desc.decode("utf-8", errors="replace")
+            except Exception:
+                return None
+        if not isinstance(desc, str):
+            return None
+        desc = desc.strip()
+        if not desc:
+            return None
+        try:
+            obj = json.loads(desc)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _encode_description(md: Optional[TemImageMetadata]) -> str:
+        """Serialize metadata to a JSON string for ImageDescription."""
+        if md is None:
+            return ""
+        try:
+            return json.dumps(md.to_dict(), ensure_ascii=False)
+        except Exception:
+            return ""
+
     # -------------------------- I/O --------------------------
 
     @classmethod
-    def load(cls, tiff_path: str) -> "TemImage":
-        with tff.TiffFile(tiff_path) as tiff_image:
-            data = tiff_image.asarray()
+    def load(cls, tiff_path: Union[str, Path]) -> "TemImage":
+        tiff_path = str(tiff_path)
+        with tff.TiffFile(tiff_path) as tif:
+            data = tif.asarray()
+
+            metadata: Optional[TemImageMetadata] = None
             try:
-                desc = tiff_image.pages[0].tags["ImageDescription"].value
-                metadata = TemImageMetadata.from_dict(json.loads(desc))
+                desc = tif.pages[0].tags["ImageDescription"].value
+                d = cls._decode_description(desc)
+                if d is not None:
+                    metadata = TemImageMetadata.from_dict(d)
             except Exception:
                 metadata = None
+
         return cls(data=data, metadata=metadata)
 
-    def save(self, path: Path) -> None:
+    def save(self, path: Union[str, Path]) -> Path:
+        """
+        Save as .tif with metadata stored in ImageDescription (JSON),
+        so TemImage.load() can read it back.
+        """
         path = Path(path).with_suffix(".tif")
         os.makedirs(path.parent, exist_ok=True)
-        metadata_dict = self.metadata.to_dict() if self.metadata else {}
-        tff.imwrite(path, self.data, metadata=metadata_dict)
 
-    # ---------------------- Vendor-specific ----------------------
+        desc = self._encode_description(self.metadata)
 
-    @classmethod
-    def from_jeol(cls, image, image_settings: ImageOutputSettings, state: MicroscopeState, detector: DetectorSettings):
-        """Convert Jeol image object (with Header) to TemImage."""
-        pixel_size = Point(
-            float(image.Header["MAIN"]["PixelSizeX"]),
-            float(image.Header["MAIN"]["PixelSizeY"]),
-        )
+        # Fixed: use 'description' so it ends up in ImageDescription tag.
+        tff.imwrite(path, self.data, description=desc)
 
-        metadata = TemImageMetadata(
-            image_settings=image_settings,
-            pixel_size=pixel_size,
-            microscope_state=state,
-            detector_settings=detector,
-            version=METADATA_VERSION,
-        )
-        return cls(data=np.array(image.Image), metadata=metadata)
-    
-    @classmethod
-    def from_jeol_image(
-        cls,
-        image,
-        image_settings: Optional["ImageSettings"] = None,
-        state: Optional["MicroscopeState"] = None,
-        detector: Optional["DetectorSettings"] = None,
-    ) -> "TemImage":
-        """
-        Create a TemImage from a Jeol microscope image output.
+        return path
 
-        Args:
-            image: Jeol image object (with .Header and .Image)
-            image_settings: optional, capture parameters used for acquisition
-            state: optional, current microscope state (stage, beam, etc.)
-            detector: optional, detector configuration
-
-        Returns:
-            FibsemImage: standardized image object with unified metadata
-        """
-
-        # --- Convert raw pixel data ---
-        data = np.array(image.Image)
-
-        # --- Extract standardized metadata from JEOL header ---
-        header = {section: dict(image.Header.items(section)) for section in image.Header.sections()}
-        metadata_refined = TemImageMetadata.from_jeol(header)
-
-        # --- Construct the TemImage ---
-        tem_image = cls(
-            data=data,
-            metadata=metadata_refined,
-        )
-
-        return tem_image
-
-    # ---------------------- Generic Adapter ----------------------
-
-    @classmethod
-    def from_vendor(cls, vendor: str, *args, **kwargs) -> "TemImage":
-        """
-        Universal adapter for different vendor inputs.
-        vendor: 'tescan', 'thermofisher', 'jeol', 'hitachi', etc.
-        """
-        vendor = vendor.lower()
-        if vendor == "jeol":
-            return cls.from_jeol(*args, **kwargs)
-        else:
-            # For other vendors, fallback to minimal metadata
-            data = kwargs.get("data")
-            pixel_size = kwargs.get("pixel_size", Point(1, 1))
-            image_settings = kwargs.get("image_settings", ImageOutputSettings(resolution=data.shape))
-            metadata = TemImageMetadata(image_settings=image_settings, pixel_size=pixel_size)
-            return cls(data=data, metadata=metadata)
     
 @dataclass
 class SystemInfo:
