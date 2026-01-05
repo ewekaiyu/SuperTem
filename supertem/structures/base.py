@@ -959,77 +959,212 @@ class AcquisitionRequest:
     detector_id: str
     detector: DetectorSettings
     image: ImageOutputSettings
-    
+
+
 @dataclass
 class MicroscopeState:
+    """
+    Snapshot of microscope state at a moment in time.
 
-    """Data Class representing the state of a microscope with various parameters.
-
-    Attributes:
-
-        timestamp (float): A float representing the timestamp at which the state of the microscope was recorded. Defaults to the timestamp of the current datetime.
-        stage_position (TemStagePosition): An instance of TemStagePosition representing the current absolute position of the stage. Defaults to an empty instance of TemStagePosition.
-        beam (BeamSettings): An instance of BeamSettings representing the beam settings. Defaults to to an empty instance of BeamSettings.
-        detector (TemDetectorSettings): An instance of TemDetectorSettings representing the detector settings. Defaults to an empty instance of TemDetectorSettings.
-
-    Methods:
-
-        to_dict(self) -> dict: Converts the current state of the Microscope to a dictionary and returns it.
-        from_dict(state_dict: dict) -> "MicroscopeState": Returns a new instance of MicroscopeState with attributes created from the passed dictionary.
+    Notes:
+      - timestamp is stored as unix seconds (float) for easy logging/ordering.
+      - stage_position stores Quantity internally, but serializes to plain numbers in nm/deg.
     """
 
-    timestamp: float = field(default_factory=lambda: datetime.datetime.now().timestamp())
+    timestamp: float = field(
+        default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp()
+    )
     stage_position: TemStagePosition = field(default_factory=TemStagePosition)
     beam: BeamSettings = field(default_factory=BeamSettings)
-    detector: DetectorSettings = field(default_factory=DetectorSettings)
+
+    # All known/current detector configurations (by ID)
+    detectors: Dict[str, DetectorSettings] = field(default_factory=dict)
+
+    # Which detectors are currently active / producing signal
+    active_detector_ids: List[str] = field(default_factory=list)
+
+    # Optional: the “main” detector the UI/operator considers selected
+    primary_detector_id: Optional[str] = None
+
+    # Anything session/protocol-ish you want to carry along
     protocol: Dict[str, Any] = field(default_factory=dict)
 
+    # Vendor-specific / unknown fields live here
+    extra: Dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self):
-        assert (
-            isinstance(self.stage_position, TemStagePosition)
-            or self.stage_position is None
-        ), f"absolute position must be of type TemStagePosition, currently is {type(self.stage_position)}"
-        assert (
-            isinstance(self.beam, BeamSettings) or self.beam is None
-        ), f"beam must be of type BeamSettings, currently is {type(self.beam)}"
-        assert (
-            isinstance(self.detector, DetectorSettings) or self.detector is None
-        ), f"detector must be of type DetectorSettings, currently is {type(self.detector)}"
+        # Basic normalization / defaults
+        if self.timestamp is None:
+            self.timestamp = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        self.timestamp = float(self.timestamp)
+
+        if self.stage_position is None:
+            self.stage_position = TemStagePosition()
+        if self.beam is None:
+            self.beam = BeamSettings()
+        if self.detectors is None:
+            self.detectors = {}
+        if self.active_detector_ids is None:
+            self.active_detector_ids = []
+        if self.protocol is None:
+            self.protocol = {}
+        if self.extra is None:
+            self.extra = {}
+
+        # Type checks
+        assert isinstance(self.stage_position, TemStagePosition), (
+            f"stage_position must be TemStagePosition, got {type(self.stage_position)}"
+        )
+        assert isinstance(self.beam, BeamSettings), (
+            f"beam must be BeamSettings, got {type(self.beam)}"
+        )
+        assert isinstance(self.detectors, dict), (
+            f"detectors must be dict[str, DetectorSettings], got {type(self.detectors)}"
+        )
+        assert isinstance(self.active_detector_ids, list), (
+            f"active_detector_ids must be list[str], got {type(self.active_detector_ids)}"
+        )
+        assert isinstance(self.protocol, dict), f"protocol must be dict, got {type(self.protocol)}"
+        assert isinstance(self.extra, dict), f"extra must be dict, got {type(self.extra)}"
+
+        # Ensure detector values are DetectorSettings
+        fixed: Dict[str, DetectorSettings] = {}
+        for det_id, det in self.detectors.items():
+            if isinstance(det, DetectorSettings):
+                fixed[str(det_id)] = det
+            elif isinstance(det, dict):
+                fixed[str(det_id)] = DetectorSettings.from_dict(det)
+            else:
+                raise TypeError(f"detectors['{det_id}'] must be DetectorSettings or dict, got {type(det)}")
+        self.detectors = fixed
+
+        # Normalize IDs to strings
+        self.active_detector_ids = [str(x) for x in self.active_detector_ids]
+
+        # If primary is unset but we have detectors, pick a stable one
+        if self.primary_detector_id is None and self.detectors:
+            self.primary_detector_id = next(iter(self.detectors.keys()))
 
     def to_dict(self) -> dict:
-        state_dict = {
-            "timestamp": self.timestamp,
-            "stage_position": self.stage_position.to_dict()
-            if self.stage_position is not None
-            else None,
-            "beam": self.beam.to_dict()
-            if self.beam is not None
-            else None,
-            "detector": self.detector.to_dict()
-            if self.detector is not None
-            else None,
+        ts_iso = datetime.datetime.fromtimestamp(
+            float(self.timestamp), tz=datetime.timezone.utc
+        ).isoformat()
+
+        d = {
+            "timestamp": float(self.timestamp),
+            "timestamp_iso": ts_iso,
+            "stage_position": self.stage_position.to_dict() if self.stage_position else None,
+            "beam": self.beam.to_dict() if self.beam else None,
+            "detectors": {k: v.to_dict() for k, v in self.detectors.items()},
+            "active_detector_ids": list(self.active_detector_ids),
+            "primary_detector_id": self.primary_detector_id,
         }
 
-        return state_dict
+        if self.protocol:
+            d["protocol"] = deepcopy(self.protocol)
+        if self.extra:
+            d["extra"] = deepcopy(self.extra)
+
+        return {k: v for k, v in d.items() if v is not None}
 
     @staticmethod
-    def from_dict(state_dict: dict) -> "MicroscopeState":
+    def _parse_timestamp(value: Any) -> float:
+        """Accept float seconds, int, or ISO string."""
+        if value is None:
+            return datetime.datetime.now(datetime.timezone.utc).timestamp()
 
-        if state_dict.get("beam", None) is not None:
-            beam = BeamSettings.from_dict(state_dict["beam"])
-        if state_dict.get("detector", None) is not None:
-            detector = DetectorSettings.from_dict(state_dict["detector"])
+        if isinstance(value, (int, float)):
+            return float(value)
 
-        microscope_state = MicroscopeState(
-            timestamp=state_dict["timestamp"],
-            stage_position=TemStagePosition.from_dict(
-                state_dict["stage_position"]
-            ),
-            beam=beam,
-            detector=detector,
+        if isinstance(value, str):
+            # ISO first
+            try:
+                dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                pass
+            # stringified float
+            try:
+                return float(value)
+            except Exception:
+                return datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+        return datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+    @staticmethod
+    def from_dict(state_dict: Optional[dict]) -> "MicroscopeState":
+        if not state_dict:
+            return MicroscopeState()
+
+        # timestamp
+        ts = MicroscopeState._parse_timestamp(
+            state_dict.get("timestamp", state_dict.get("timestamp_iso", None))
         )
 
-        return microscope_state
+        # stage position (legacy aliases)
+        sp_raw = (
+            state_dict.get("stage_position")
+            or state_dict.get("stage")
+            or state_dict.get("absolute_position")
+            or None
+        )
+        if isinstance(sp_raw, TemStagePosition):
+            stage_position = sp_raw
+        elif isinstance(sp_raw, dict):
+            stage_position = TemStagePosition.from_dict(sp_raw)
+        else:
+            stage_position = TemStagePosition()
+
+        # beam
+        b_raw = state_dict.get("beam", None)
+        if isinstance(b_raw, BeamSettings):
+            beam = b_raw
+        elif isinstance(b_raw, dict):
+            beam = BeamSettings.from_dict(b_raw)
+        else:
+            beam = BeamSettings()
+
+        # detectors (new)
+        detectors: Dict[str, DetectorSettings] = {}
+        dets_raw = state_dict.get("detectors", None)
+        if isinstance(dets_raw, dict):
+            for det_id, det_val in dets_raw.items():
+                if isinstance(det_val, DetectorSettings):
+                    detectors[str(det_id)] = det_val
+                elif isinstance(det_val, dict):
+                    detectors[str(det_id)] = DetectorSettings.from_dict(det_val)
+
+        active_ids = list(state_dict.get("active_detector_ids", []) or [])
+        primary_id = state_dict.get("primary_detector_id", state_dict.get("detector_id"))
+
+        protocol = state_dict.get("protocol", {}) or {}
+
+        extra = deepcopy(state_dict.get("extra", {})) if isinstance(state_dict.get("extra", None), dict) else {}
+
+        known = {
+            "timestamp", "timestamp_iso",
+            "stage_position", "stage", "absolute_position",
+            "beam",
+            "detectors", "active_detector_ids", "primary_detector_id",
+            "detector", "detector_id",
+            "protocol", "extra",
+        }
+        for k, v in state_dict.items():
+            if k not in known:
+                extra[k] = v
+
+        return MicroscopeState(
+            timestamp=ts,
+            stage_position=stage_position,
+            beam=beam,
+            detectors=detectors,
+            active_detector_ids=[str(x) for x in active_ids],
+            primary_detector_id=str(primary_id) if primary_id is not None else None,
+            protocol=protocol,
+            extra=extra,
+        )
 
 
 class TemImage:
