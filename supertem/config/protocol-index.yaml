@@ -1,0 +1,4 @@
+protocols:
+  default-protocol:
+    path: C:\Users\Acer\PycharmProjects\SuperTem\supertem\config\protocol.yaml
+default: default-protocol

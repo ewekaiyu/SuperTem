@@ -1,0 +1,46 @@
+info:
+  name: default-configuration
+  ip_address: 192.168.0.1
+  manufacturer: JEOL
+  model: Unknown
+  serial_number: Unknown
+  hardware_version: Unknown
+  software_version: Unknown
+stage:
+  rotation_reference: 0.0
+  rotation_180: 180.0
+  shuttle_pre_tilt: 35.0
+  manipulator_height_limit: 0.0
+  enabled: true
+  rotation: true
+  tilt: true
+beam:
+  enabled: true
+  eucentric_height: 0.007
+  column_tilt: 0.0
+  plasma: false
+  plasma_gas: null
+  voltage: 200000.0
+  hfw: 0.0004
+  resolution:
+  - 1024
+  - 1024
+  dwell_time: 1.0
+  detector_id: null
+  exposure_ms: null
+  binning_index: null
+  binning_xy: null
+  roi: null
+  frame_integration: null
+  gain_index: null
+  offset_index: null
+  digital_rotation_deg: null
+  capabilities: null
+  extra: {}
+image:
+  binning: null
+  exposure_ms: null
+  dwell_us: null
+  file_format: tiff
+  path: null
+  roi: null

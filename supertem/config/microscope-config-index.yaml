@@ -1,0 +1,4 @@
+configurations:
+  default-configuration:
+    path: C:\Users\Acer\PycharmProjects\SuperTem\supertem\config\microscope-configuration.yaml
+default: default-configuration
