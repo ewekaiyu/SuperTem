@@ -94,7 +94,7 @@ class Point:
 
 @dataclass
 class TemImageMetadataRefined:
-    """Universal metadata for TemImage, compatible across SEM/FIB vendors."""
+    """Universal metadata for TemImage, compatible across TEM vendors."""
 
     # --- Basic Info (from MAIN section) ---
     device: Optional[str] = None              # e.g. "TESCAN SOLARIS X"
@@ -230,35 +230,95 @@ class ImageSettings:
 
 @dataclass
 class StageSystemSettings:
-    rotation_reference: float
-    rotation_180: float
-    shuttle_pre_tilt: float
-    manipulator_height_limit: float
-    enabled: bool = True
-    rotation: bool = True
-    tilt: bool  = True
+    """Stage system configuration for safe TEM automation.
 
-    def to_dict(self):
+    Units:
+      - *_limits_nm are in nanometer
+      - *_limits_deg are in degree
+      - max_step_nm / max_step_deg define the largest single move you allow automation to command
+    """
+
+    enabled: bool = True
+
+    # Capabilities / axes availability
+    can_x: bool = True
+    can_y: bool = True
+    can_z: bool = True
+    can_r: bool = True
+    can_tilt_x: bool = True
+    can_tilt_y: bool = True
+
+    # Soft limits (optional; None means "unknown / not enforced here")
+    x_limits_nm: Optional[Tuple[float, float]] = None
+    y_limits_nm: Optional[Tuple[float, float]] = None
+    z_limits_nm: Optional[Tuple[float, float]] = None
+    r_limits_deg: Optional[Tuple[float, float]] = None
+    tilt_x_limits_deg: Optional[Tuple[float, float]] = None
+    tilt_y_limits_deg: Optional[Tuple[float, float]] = None
+
+    # Motion safety defaults
+    max_step_nm: float = 50000.0        # 50 µm
+    max_step_deg: float = 1.0
+    settle_time_s: float = 0.2
+    timeout_s: float = 10.0
+
+    # Common TEM calibration hint (optional)
+    eucentric_z_nm: Optional[float] = None
+
+    # Everything vendor-specific goes here instead of polluting the core schema
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
         return {
-            "rotation_reference": self.rotation_reference,
-            "rotation_180": self.rotation_180,
-            "shuttle_pre_tilt": self.shuttle_pre_tilt,
-            "manipulator_height_limit": self.manipulator_height_limit,
             "enabled": self.enabled,
-            "rotation": self.rotation,
-            "tilt": self.tilt,
+            "can_x": self.can_x,
+            "can_y": self.can_y,
+            "can_z": self.can_z,
+            "can_r": self.can_r,
+            "can_tilt_x": self.can_tilt_x,
+            "can_tilt_y": self.can_tilt_y,
+            "x_limits_nm": self.x_limits_nm,
+            "y_limits_nm": self.y_limits_nm,
+            "z_limits_nm": self.z_limits_nm,
+            "r_limits_deg": self.r_limits_deg,
+            "tilt_x_limits_deg": self.tilt_x_limits_deg,
+            "tilt_y_limits_deg": self.tilt_y_limits_deg,
+            "max_step_nm": self.max_step_nm,
+            "max_step_deg": self.max_step_deg,
+            "settle_time_s": self.settle_time_s,
+            "timeout_s": self.timeout_s,
+            "eucentric_z_nm": self.eucentric_z_nm,
+            "extra": deepcopy(self.extra),
         }
-    
+
     @staticmethod
-    def from_dict(settings: dict):
+    def from_dict(settings: dict) -> "StageSystemSettings":
+        if settings is None:
+            return StageSystemSettings()
+
+        # ---- Backward-compat mapping for older, weird keys ----
+        extra: Dict[str, Any] = deepcopy(settings.get("extra", {}))
+
         return StageSystemSettings(
-            rotation_reference=settings["rotation_reference"],
-            rotation_180=settings["rotation_180"],
-            shuttle_pre_tilt=settings["shuttle_pre_tilt"],
-            manipulator_height_limit=settings["manipulator_height_limit"],
-            enabled=settings.get("enabled", True),
-            rotation=settings.get("rotation", True),
-            tilt=settings.get("tilt", True),
+            enabled=bool(settings.get("enabled", True)),
+            can_x=bool(settings.get("can_x", True)),
+            can_y=bool(settings.get("can_y", True)),
+            can_z=bool(settings.get("can_z", True)),
+            can_r=bool(settings.get("can_r", True)),
+            can_tilt_x=bool(settings.get("can_tilt_x", True)),
+            can_tilt_y=bool(settings.get("can_tilt_y", True)),
+            x_limits_nm=settings.get("x_limits_nm", None),
+            y_limits_nm=settings.get("y_limits_nm", None),
+            z_limits_nm=settings.get("z_limits_nm", None),
+            r_limits_deg=settings.get("r_limits_deg", None),
+            tilt_x_limits_deg=settings.get("tilt_x_limits_deg", None),
+            tilt_y_limits_deg=settings.get("tilt_y_limits_deg", None),
+            max_step_nm=float(settings.get("max_step_nm", 50000.0)),
+            max_step_deg=float(settings.get("max_step_deg", 1.0)),
+            settle_time_s=float(settings.get("settle_time_s", 0.2)),
+            timeout_s=float(settings.get("timeout_s", 10.0)),
+            eucentric_z_nm=settings.get("eucentric_z_nm", settings.get("eucentric_height", None)),
+            extra=extra,
         )
 
 @dataclass
@@ -278,10 +338,9 @@ class TemStagePosition:
     tilt_x: Optional["Quantity"] = None
     tilt_y: Optional["Quantity"] = None
     coordinate_system: Optional[str] = None
-    stage: List[Any] = field(default_factory=list)
 
     def __post_init__(self):
-        # Normalize individual axes
+        # Normalize individual axes into canonical units.
         self.x = ensure_quantity(self.x, "nanometer")
         self.y = ensure_quantity(self.y, "nanometer")
         self.z = ensure_quantity(self.z, "nanometer")
@@ -289,8 +348,9 @@ class TemStagePosition:
         self.tilt_x = ensure_quantity(self.tilt_x, "degree")
         self.tilt_y = ensure_quantity(self.tilt_y, "degree")
 
-        if self.stage is None:
-            self.stage = [self.x, self.y, self.z, self.r, self.tilt_x, self.tilt_y]
+    @property
+    def stage(self) -> List[Optional["Quantity"]]:
+        return [self.x, self.y, self.z, self.r, self.tilt_x, self.tilt_y]
 
     def to_dict(self) -> dict:
         return {
@@ -346,8 +406,10 @@ class TemStagePosition:
             return NotImplemented
 
         def sub_axis(a, b, unit: str):
-            if a is None:
+            if a is None and b is None:
                 return None
+            if a is None:
+                return -ensure_quantity(b, unit)
             if b is None:
                 return ensure_quantity(a, unit)
             return ensure_quantity(a, unit) - ensure_quantity(b, unit)
@@ -363,140 +425,210 @@ class TemStagePosition:
             coordinate_system=self.coordinate_system,
         )
 
-    def _scale_repr(self, scale: float, precision: int = 2):
-        return f"x:{self.x*scale:.{precision}f}, y:{self.y*scale:.{precision}f}, z:{self.z*scale:.{precision}f}"
+    def is_close(
+        self,
+        other: "TemStagePosition",
+        tol_nm: float = 1.0,
+        tol_deg: float = 1e-3,
+    ) -> bool:
+        """Return True if axes differ by <= tolerances.
 
-    def is_close(self, pos2: 'TemStagePosition', tol: float = 1e-6) -> bool:
-        """Check if two positions are close to each other."""
-        return ((abs(self.x - pos2.x) < tol) and 
-                (abs(self.y - pos2.y) < tol) and 
-                (abs(self.z - pos2.z) < tol) and 
-                (abs(self.t - pos2.t) < tol) and 
-                (abs(self.r - pos2.r) < tol) and 
-                (abs(self.tilt_y - pos2.tilt_y) < tol))
+        tol_nm: tolerance for x/y/z in nanometer
+        tol_deg: tolerance for r/tilts in degree
+        """
 
-    
+        def close_axis(a, b, unit: str, tol: float) -> bool:
+            if a is None or b is None:
+                return False
+            da = abs(ensure_quantity(a, unit) - ensure_quantity(b, unit))
+            return float(da.m_as(unit)) <= float(tol)
+
+        return (
+            close_axis(self.x, other.x, "nanometer", tol_nm)
+            and close_axis(self.y, other.y, "nanometer", tol_nm)
+            and close_axis(self.z, other.z, "nanometer", tol_nm)
+            and close_axis(self.r, other.r, "degree", tol_deg)
+            and close_axis(self.tilt_x, other.tilt_x, "degree", tol_deg)
+            and close_axis(self.tilt_y, other.tilt_y, "degree", tol_deg)
+        )
+
+
 @dataclass
 class BeamSettings:
+    """Beam settings for TEM/STEM automation.
+
+    This is kept intentionally generic across TEM + STEM:
+      - voltage: accelerating voltage (kV)
+      - beam_current: probe/beam current (nA) if available
+      - spot_size: instrument-specific index (optional)
+      - convergence_angle_mrad: mainly for STEM probe formation (optional)
+
+    Shifts/stigs are kept as `Point` because different vendors expose different units/axes.
+    If you need strict units, store the vendor values plus a unit hint in `extra`.
     """
-    Dataclass representing the beam settings for an imaging session.
 
-    Attributes:
-        working_distance (float): The working distance for the microscope, in meters.
-        beam_current (float): The beam current for the microscope, in amps.
-        hfw (float): The horizontal field width for the microscope, in meters.
-        resolution (list): The desired resolution for the image.
-        dwell_time (float): The dwell time for the microscope.
-        stigmation (Point): The point for stigmation correction.
-        shift (Point): The point for shift correction.
+    voltage: Optional[float] = None  # kV
+    beam_current: Optional[float] = None  # nA (if known)
+    spot_size: Optional[int] = None
+    convergence_angle_mrad: Optional[float] = None
 
-    Methods:
-        to_dict(): Returns a dictionary representation of the object.
-        from_dict(state_dict: dict) -> BeamSettings: Returns a new BeamSettings object created from a dictionary.
-
-    """
-    working_distance: float = None
-    beam_current: float = None
-    voltage: float = None
-    hfw: float = None
-    resolution: List[int] = field(default_factory=list)
-    dwell_time: float = None
     stigmation: Point = field(default_factory=Point)
-    shift: Point = field(default_factory=Point)
-    scan_rotation: float = None
+
+    # Separate "beam shift" and "image shift" (older code used a single `shift`)
+    beam_shift: Point = field(default_factory=Point)
+    image_shift: Point = field(default_factory=Point)
+
+    # For STEM scan coordinate systems (optional)
+    scan_rotation_deg: Optional[float] = None
+
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        assert (
-            isinstance(self.working_distance, (float, int))
-            or self.working_distance is None
-        ), f"Working distance must be float or int, currently is {type(self.working_distance)}"
-        assert (
-            isinstance(self.beam_current, (float, int)) or self.beam_current is None
-        ), f"beam current must be float or int, currently is {type(self.beam_current)}"
-        assert (
-            isinstance(self.voltage, (float, int)) or self.voltage is None
-        ), f"voltage must be float or int, currently is {type(self.voltage)}"
-        assert (
-            isinstance(self.hfw, (float, int)) or self.hfw is None
-        ), f"horizontal field width (HFW) must be float or int, currently is {type(self.hfw)}"
-        assert (
-            isinstance(self.resolution, list) or self.resolution is None
-        ), f"resolution must be a list, currently is {type(self.resolution)}"
-        assert (
-            isinstance(self.dwell_time, (float, int)) or self.dwell_time is None
-        ), f"dwell_time must be float or int, currently is {type(self.dwell_time)}"
-        assert (
-            isinstance(self.stigmation, Point) or self.stigmation is None
-        ), f"stigmation must be a Point instance, currently is {type(self.stigmation)}"
-        assert (
-            isinstance(self.shift, Point) or self.shift is None
-        ), f"shift must be a Point instance, currently is {type(self.shift)}"
+        if self.voltage is not None:
+            assert isinstance(self.voltage, (float, int)), f"voltage must be float/int, got {type(self.voltage)}"
+        if self.beam_current is not None:
+            assert isinstance(self.beam_current, (float, int)), f"beam_current must be float/int, got {type(self.beam_current)}"
+        if self.spot_size is not None:
+            assert isinstance(self.spot_size, int), f"spot_size must be int, got {type(self.spot_size)}"
+        if self.convergence_angle_mrad is not None:
+            assert isinstance(self.convergence_angle_mrad, (float, int)), f"convergence_angle_mrad must be float/int, got {type(self.convergence_angle_mrad)}"
+        if self.scan_rotation_deg is not None:
+            assert isinstance(self.scan_rotation_deg, (float, int)), f"scan_rotation_deg must be float/int, got {type(self.scan_rotation_deg)}"
 
+        if self.stigmation is None:
+            self.stigmation = Point()
+        if self.beam_shift is None:
+            self.beam_shift = Point()
+        if self.image_shift is None:
+            self.image_shift = Point()
+        if self.extra is None:
+            self.extra = {}
 
     def to_dict(self) -> dict:
-        state_dict = {
-            "working_distance": self.working_distance,
-            "beam_current": self.beam_current,
-            "voltage": self.voltage,
-            "hfw": self.hfw,
-            "resolution": self.resolution,
-            "dwell_time": self.dwell_time,
-            "stigmation": self.stigmation.to_dict()
-            if self.stigmation is not None
-            else None,
-            "shift": self.shift.to_dict() if self.shift is not None else None,
-            "scan_rotation": self.scan_rotation,
+        d = {
+            "voltage": float(self.voltage) if self.voltage is not None else None,
+            "beam_current": float(self.beam_current) if self.beam_current is not None else None,
+            "spot_size": self.spot_size,
+            "convergence_angle_mrad": float(self.convergence_angle_mrad) if self.convergence_angle_mrad is not None else None,
+            "stigmation": self.stigmation.to_dict() if self.stigmation is not None else None,
+            "beam_shift": self.beam_shift.to_dict() if self.beam_shift is not None else None,
+            "image_shift": self.image_shift.to_dict() if self.image_shift is not None else None,
+            "scan_rotation_deg": float(self.scan_rotation_deg) if self.scan_rotation_deg is not None else None,
+            "extra": deepcopy(self.extra),
         }
-
-        return state_dict
+        return d
 
     @staticmethod
     def from_dict(state_dict: dict) -> "BeamSettings":
+        if state_dict is None:
+            return BeamSettings()
+
+        extra: Dict[str, Any] = deepcopy(state_dict.get("extra", {}))
+
+        # stigmation
         if "stigmation" in state_dict and state_dict["stigmation"] is not None:
             stigmation = Point.from_dict(state_dict["stigmation"])
         else:
             stigmation = Point()
-        if "shift" in state_dict and state_dict["shift"] is not None:
-            shift = Point.from_dict(state_dict["shift"])
-        else:
-            shift = Point()
-        
-        wd = state_dict.get("working_distance", state_dict.get("eucentric_height", None))
+
+        # new preferred keys
+        beam_shift = None
+        image_shift = None
+        if "beam_shift" in state_dict and state_dict["beam_shift"] is not None:
+            beam_shift = Point.from_dict(state_dict["beam_shift"])
+        if "image_shift" in state_dict and state_dict["image_shift"] is not None:
+            image_shift = Point.from_dict(state_dict["image_shift"])
+
+        if beam_shift is None:
+            beam_shift = Point()
+        if image_shift is None:
+            image_shift = Point()
+
+        # voltage key is kept for compatibility; interpret as kV
+        voltage = state_dict.get("voltage", state_dict.get("accelerating_voltage_kv", None))
+
+        # common aliases for current
         current = state_dict.get("beam_current", state_dict.get("current", None))
-
-        beam_settings = BeamSettings(
-            working_distance=wd,
+        spot_size = state_dict.get("spot_size", state_dict.get("spot", None))
+        conv = state_dict.get("convergence_angle_mrad", state_dict.get("convergence_mrad", None))
+        scan_rot = state_dict.get("scan_rotation_deg", None)
+        return BeamSettings(
+            voltage=voltage,
             beam_current=current,
-            voltage=state_dict["voltage"],
-            hfw=state_dict["hfw"],
-            resolution=state_dict["resolution"],
-            dwell_time=state_dict["dwell_time"],
+            spot_size=spot_size if spot_size is None else int(spot_size),
+            convergence_angle_mrad=conv,
             stigmation=stigmation,
-            shift=shift,
-            scan_rotation=state_dict.get("scan_rotation", 0.0),
+            beam_shift=beam_shift,
+            image_shift=image_shift,
+            scan_rotation_deg=scan_rot,
+            extra=extra,
         )
-
-        return beam_settings
 
 @dataclass
 class DetectorCapabilities:
+    """Static capability description for a detector.
+
+    Put *what the detector can do* here (ranges, supported features), not in `DetectorSettings`.
+    Per-acquisition requests belong in `DetectorSettings`.
+
+    Notes:
+      - Many vendors expose different knobs. Anything you don't want to standardize goes in `extra`.
+    """
+
+    # Binning
+    can_binning: Optional[bool] = None
+    binning_index_min: Optional[int] = None
+    binning_index_max: Optional[int] = None
+    binning_xy_min: Optional[Tuple[int, int]] = None
+    binning_xy_max: Optional[Tuple[int, int]] = None
+
+    # Exposure / timing
+    exposure_ms_min: Optional[float] = None
+    exposure_ms_max: Optional[float] = None
+    frame_integration_min: Optional[int] = None
+    frame_integration_max: Optional[int] = None
+
+    # ROI bounds (width, height)
+    roi_min: Optional[Tuple[int, int]] = None
+    roi_max: Optional[Tuple[int, int]] = None
+
+    # Gain / offset
+    can_gain: Optional[bool] = None
+    gain_index_min: Optional[int] = None
+    gain_index_max: Optional[int] = None
+
+    can_offset: Optional[bool] = None
+    offset_index_min: Optional[int] = None
+    offset_index_max: Optional[int] = None
+
+    # Digital rotation
+    can_digital_rotation: Optional[bool] = None
+    digital_rotation_deg_min: Optional[float] = None
+    digital_rotation_deg_max: Optional[float] = None
+
     extra: Dict[str, Any] = field(default_factory=dict)
 
+
 @dataclass
-class TemDetectorSettings:
+class DetectorSettings:
+    """Per-acquisition detector settings (the *requested* values).
+
+    Keep this free of hardware capability metadata; that belongs in `DetectorSystemSettings`.
+    """
+
     detector_id: Optional[str] = None
 
+    # Acquisition / camera controls
     exposure_ms: Optional[float] = None
     binning_index: Optional[int] = None
     binning_xy: Optional[Tuple[int, int]] = None
     roi: Optional[ROI] = None
 
     frame_integration: Optional[int] = None
-    gain_index: Optional[int] = None # Same as contrast
-    offset_index: Optional[int] = None # Same as brightness
+    gain_index: Optional[int] = None  # (often "contrast")
+    offset_index: Optional[int] = None  # (often "brightness")
     digital_rotation_deg: Optional[float] = None
 
-    capabilities: Optional[DetectorCapabilities] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -518,125 +650,239 @@ class TemDetectorSettings:
 
     def to_dict(self) -> dict:
         d: Dict[str, Any] = {
-            'detector_id': self.detector_id,
-            'exposure_ms': self.exposure_ms,
-            'binning_index': self.binning_index,
-            'binning_xy': list(self.binning_xy) if self.binning_xy is not None else None,
-            'frame_integration': self.frame_integration,
-            'gain_index': self.gain_index,
-            'offset_index': self.offset_index,
-            'digital_rotation_deg': self.digital_rotation_deg,
+            "detector_id": self.detector_id,
+            "exposure_ms": self.exposure_ms,
+            "binning_index": self.binning_index,
+            "binning_xy": list(self.binning_xy) if self.binning_xy is not None else None,
+            "frame_integration": self.frame_integration,
+            "gain_index": self.gain_index,
+            "offset_index": self.offset_index,
+            "digital_rotation_deg": self.digital_rotation_deg,
         }
         if self.roi is not None:
-            d['roi'] = asdict(self.roi)
-        if self.capabilities is not None:
-            d['capabilities'] = asdict(self.capabilities)
+            d["roi"] = asdict(self.roi)
         if self.extra:
-            d['extra'] = deepcopy(self.extra)
+            d["extra"] = deepcopy(self.extra)
         return d
 
     @staticmethod
-    def from_dict(settings: Dict[str, Any]) -> 'TemDetectorSettings':
+    def from_dict(settings: Dict[str, Any]) -> "DetectorSettings":
         if settings is None:
-            return TemDetectorSettings()
+            return DetectorSettings()
 
         kwargs: Dict[str, Any] = {}
         direct_keys = [
-            'detector_id', 'exposure_ms', 'binning_index', 'binning_xy',
-            'frame_integration', 'gain_index', 'offset_index', 'digital_rotation_deg', 'roi', 'capabilities', 'extra'
+            "detector_id",
+            "exposure_ms",
+            "binning_index",
+            "binning_xy",
+            "frame_integration",
+            "gain_index",
+            "offset_index",
+            "digital_rotation_deg",
+            "roi",
+            "extra",
         ]
         for k in direct_keys:
             if k in settings and k not in kwargs:
                 kwargs[k] = settings.get(k)
 
         # ROI parsing
-        roi_val = kwargs.get('roi')
+        roi_val = kwargs.get("roi")
         if isinstance(roi_val, dict):
-            # allow (w,h) naming too
-            kwargs['roi'] = ROI(
-                x=int(roi_val.get('x', 0)),
-                y=int(roi_val.get('y', 0)),
-                width=int(roi_val.get('width', roi_val.get('w', 0))),
-                height=int(roi_val.get('height', roi_val.get('h', 0))),
+            kwargs["roi"] = ROI(
+                x=int(roi_val.get("x", 0)),
+                y=int(roi_val.get("y", 0)),
+                width=int(roi_val.get("width", roi_val.get("w", 0))),
+                height=int(roi_val.get("height", roi_val.get("h", 0))),
             )
         elif roi_val is None:
-            if isinstance(settings.get('detector_roi'), dict):
-                r = settings['detector_roi']
-                kwargs['roi'] = ROI(
-                    x=int(r.get('x', 0)),
-                    y=int(r.get('y', 0)),
-                    width=int(r.get('width', r.get('w', 0))),
-                    height=int(r.get('height', r.get('h', 0))),
-                )
-            if isinstance(settings.get('imaging_area'), dict):
-                r = settings['imaging_area']
-                kwargs['roi'] = ROI(
-                    x=int(r.get('x', 0)),
-                    y=int(r.get('y', 0)),
-                    width=int(r.get('width', r.get('w', 0))),
-                    height=int(r.get('height', r.get('h', 0))),
-                )
-
-
-        # Capabilities parsing
-        cap_val = kwargs.get('capabilities')
-        if isinstance(cap_val, dict):
-            kwargs['capabilities'] = DetectorCapabilities(extra=dict(cap_val.get('extra', cap_val)))
+            # backward-compat aliases
+            for alias in ("detector_roi", "imaging_area"):
+                if isinstance(settings.get(alias), dict):
+                    r = settings[alias]
+                    kwargs["roi"] = ROI(
+                        x=int(r.get("x", 0)),
+                        y=int(r.get("y", 0)),
+                        width=int(r.get("width", r.get("w", 0))),
+                        height=int(r.get("height", r.get("h", 0))),
+                    )
+                    break
 
         # Normalize binning_xy
-        if isinstance(kwargs.get('binning_xy'), (list, tuple)) and kwargs.get('binning_xy') is not None:
-            bx = kwargs['binning_xy']
+        if isinstance(kwargs.get("binning_xy"), (list, tuple)) and kwargs.get("binning_xy") is not None:
+            bx = kwargs["binning_xy"]
             if len(bx) == 2:
-                kwargs['binning_xy'] = (int(bx[0]), int(bx[1]))
+                kwargs["binning_xy"] = (int(bx[0]), int(bx[1]))
 
-        user_extra = kwargs.pop('extra', None)
-        obj = TemDetectorSettings(
-            **{k: v for k, v in kwargs.items() if k in {f.name for f in fields(TemDetectorSettings)}})
+        user_extra = kwargs.pop("extra", None)
+        obj = DetectorSettings(**{k: v for k, v in kwargs.items() if k in {f.name for f in fields(DetectorSettings)}})
+
         if isinstance(user_extra, dict):
             obj.extra.update(user_extra)
         return obj
 
 @dataclass
-class BeamSystemSettings:
-    #need fix
-    enabled: bool
-    beam: BeamSettings
-    detector: TemDetectorSettings
-    eucentric_height: float
-    column_tilt: float
-    plasma: bool = False
-    plasma_gas: str = None
+class DetectorSystemSettings:
+    """Detector subsystem configuration (defaults + capabilities).
 
-    def to_dict(self):
-        ddict = {
+    TEM automation almost always deals with *multiple* detectors (camera, HAADF, BF, etc.).
+    A single `default_detector` becomes ambiguous fast, so we store **per-detector** defaults.
+
+    Conventions:
+      - `defaults_by_id[detector_id]` holds a known-good baseline settings object for that detector.
+      - `default_detector_id` is an *optional* session-level choice used when the caller doesn't specify
+        a detector explicitly.
+      - `capabilities_by_id[detector_id]` holds static capability/range info for that detector.
+    """
+
+    enabled: bool = True
+
+    # Per-detector baseline settings (keyed by detector_id).
+    defaults_by_id: Dict[str, DetectorSettings] = field(default_factory=dict)
+
+    # Optional: which detector should be used by default if none is specified.
+    default_detector_id: Optional[str] = None
+
+    # Capability map keyed by detector_id.
+    capabilities_by_id: Dict[str, DetectorCapabilities] = field(default_factory=dict)
+
+    # Optional list of detectors you want to advertise/allow in automation UI.
+    # If empty, it can be inferred from `capabilities_by_id` / `defaults_by_id`.
+    available_detectors: List[str] = field(default_factory=list)
+
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
             "enabled": self.enabled,
-            "eucentric_height": self.eucentric_height,
-            "column_tilt": self.column_tilt,
-            "plasma": self.plasma,
-            "plasma_gas": self.plasma_gas,
+            "default_detector_id": self.default_detector_id,
+            "defaults_by_id": {k: v.to_dict() for k, v in self.defaults_by_id.items()},
+            "capabilities_by_id": {k: asdict(v) for k, v in self.capabilities_by_id.items()},
+            "available_detectors": list(self.available_detectors),
+            "extra": deepcopy(self.extra),
         }
-        ddict.update(self.beam.to_dict())
-        ddict.update(self.detector.to_dict())
-        
-        # rename keys to match config
-        ddict["detector_mode"] = ddict.pop("mode")
-        ddict["detector_type"] = ddict.pop("type")
-        ddict["detector_brightness"] = ddict.pop("brightness")
-        ddict["detector_contrast"] = ddict.pop("contrast")
-        ddict["current"] = ddict.pop("beam_current")
 
-        return ddict
-    
     @staticmethod
-    def from_dict(settings: dict) -> 'BeamSystemSettings':
+    def from_dict(settings: Optional[dict]) -> "DetectorSystemSettings":
+        if not settings:
+            return DetectorSystemSettings()
+
+        extra: Dict[str, Any] = deepcopy(settings.get("extra", {}))
+
+        defaults_raw = (
+            settings.get("defaults_by_id")
+            or settings.get("default_detectors_by_id")
+            or settings.get("default_detector_by_id")
+            or {}
+        )
+
+        defaults_by_id: Dict[str, DetectorSettings] = {}
+
+        if isinstance(defaults_raw, dict):
+            for det_id, val in defaults_raw.items():
+                if isinstance(val, DetectorSettings):
+                    ds = val
+                else:
+                    ds = DetectorSettings.from_dict(val)
+                # Ensure detector_id is set consistently
+                if ds.detector_id is None:
+                    ds.detector_id = str(det_id)
+                defaults_by_id[str(det_id)] = ds
+
+        # ---- Capabilities map ----
+        cap_map_raw = settings.get("capabilities_by_id", {}) or {}
+        cap_map: Dict[str, DetectorCapabilities] = {}
+        if isinstance(cap_map_raw, dict):
+            for det_id, cap in cap_map_raw.items():
+                if isinstance(cap, DetectorCapabilities):
+                    cap_map[str(det_id)] = cap
+                elif isinstance(cap, dict):
+                    cap_kwargs = {f.name: cap.get(f.name) for f in fields(DetectorCapabilities) if f.name in cap}
+                    cap_extra = {k: v for k, v in cap.items() if k not in {f.name for f in fields(DetectorCapabilities)}}
+                    obj = DetectorCapabilities(**cap_kwargs)
+                    if cap_extra:
+                        obj.extra.update(cap_extra)
+                    cap_map[str(det_id)] = obj
+
+        # ---- Available detectors ----
+        available = settings.get("available_detectors", None)
+        if available is None:
+            # Prefer explicit list; otherwise infer from union of keys.
+            key_union = set(defaults_by_id.keys()) | set(cap_map.keys())
+            available = list(sorted(key_union))
+
+        # ---- Default detector id ----
+        default_detector_id = settings.get("default_detector_id", None)
+        if default_detector_id is None:
+            if len(available) == 1:
+                default_detector_id = available[0]
+            elif len(defaults_by_id) == 1:
+                default_detector_id = next(iter(defaults_by_id.keys()))
+
+        return DetectorSystemSettings(
+            enabled=bool(settings.get("enabled", True)),
+            defaults_by_id=defaults_by_id,
+            default_detector_id=str(default_detector_id) if default_detector_id is not None else None,
+            capabilities_by_id=cap_map,
+            available_detectors=[str(x) for x in (available or [])],
+            extra=extra,
+        )
+
+
+@dataclass
+class BeamSystemSettings:
+    """Beam subsystem configuration (defaults + soft constraints).
+
+    If you want detector defaults, put them in `ImageSettings` / `TemDetectorSettings`.
+    If you want vendor-specific quirks, put them in `extra`.
+    """
+
+    enabled: bool = True
+
+    # A "known good" default for automation sessions (optional).
+    default_beam: BeamSettings = field(default_factory=BeamSettings)
+
+    # Soft constraints (optional)
+    voltage_range_kv: Optional[Tuple[float, float]] = None
+    beam_current_range_na: Optional[Tuple[float, float]] = None
+    spot_size_range: Optional[Tuple[int, int]] = None
+    convergence_angle_range_mrad: Optional[Tuple[float, float]] = None
+
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "default_beam": self.default_beam.to_dict() if self.default_beam is not None else None,
+            "voltage_range_kv": self.voltage_range_kv,
+            "beam_current_range_na": self.beam_current_range_na,
+            "spot_size_range": self.spot_size_range,
+            "convergence_angle_range_mrad": self.convergence_angle_range_mrad,
+            "extra": deepcopy(self.extra),
+        }
+
+    @staticmethod
+    def from_dict(settings: dict) -> "BeamSystemSettings":
+        if settings is None:
+            return BeamSystemSettings()
+
+        extra: Dict[str, Any] = deepcopy(settings.get("extra", {}))
+
+        # Backward-compat: older schema stuffed beam+detector fields at this level.
+        # We'll treat the whole dict as a beam default if `default_beam` isn't provided.
+        default_beam_dict = settings.get("default_beam", None)
+        default_beam = BeamSettings.from_dict(default_beam_dict)
+
+
         return BeamSystemSettings(
-            enabled=settings["enabled"],
-            beam=BeamSettings.from_dict(settings),
-            detector=TemDetectorSettings.from_dict(settings),
-            eucentric_height=settings["eucentric_height"],
-            column_tilt=settings["column_tilt"],
-            plasma=settings.get("plasma", False),
-            plasma_gas=settings.get("plasma_gas", None),
+            enabled=bool(settings.get("enabled", True)),
+            default_beam=default_beam,
+            voltage_range_kv=settings.get("voltage_range_kv", settings.get("voltage_limits_kv", None)),
+            beam_current_range_na=settings.get("beam_current_range_na", None),
+            spot_size_range=settings.get("spot_size_range", None),
+            convergence_angle_range_mrad=settings.get("convergence_angle_range_mrad", None),
+            extra=extra,
         )
     
 @dataclass
@@ -660,7 +906,7 @@ class MicroscopeState:
     timestamp: float = field(default_factory=lambda: datetime.datetime.now().timestamp())
     stage_position: TemStagePosition = field(default_factory=TemStagePosition)
     beam: BeamSettings = field(default_factory=BeamSettings)
-    detector: TemDetectorSettings = field(default_factory=TemDetectorSettings)
+    detector: DetectorSettings = field(default_factory=DetectorSettings)
     protocol: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -672,8 +918,8 @@ class MicroscopeState:
             isinstance(self.beam, BeamSettings) or self.beam is None
         ), f"beam must be of type BeamSettings, currently is {type(self.beam)}"
         assert (
-            isinstance(self.detector, TemDetectorSettings) or self.detector is None
-        ), f"detector must be of type TemDetectorSettings, currently is {type(self.detector)}"
+            isinstance(self.detector, DetectorSettings) or self.detector is None
+        ), f"detector must be of type DetectorSettings, currently is {type(self.detector)}"
 
     def to_dict(self) -> dict:
         state_dict = {
@@ -697,7 +943,7 @@ class MicroscopeState:
         if state_dict.get("beam", None) is not None:
             beam = BeamSettings.from_dict(state_dict["beam"])
         if state_dict.get("detector", None) is not None:
-            detector = TemDetectorSettings.from_dict(state_dict["detector"])
+            detector = DetectorSettings.from_dict(state_dict["detector"])
 
         microscope_state = MicroscopeState(
             timestamp=state_dict["timestamp"],
@@ -754,7 +1000,7 @@ class TemImage:
     # ---------------------- Vendor-specific ----------------------
 
     @classmethod
-    def from_jeol(cls, image, image_settings: ImageSettings, state: MicroscopeState, detector: TemDetectorSettings):
+    def from_jeol(cls, image, image_settings: ImageSettings, state: MicroscopeState, detector: DetectorSettings):
         """Convert Jeol image object (with Header) to TemImage."""
         pixel_size = Point(
             float(image.Header["MAIN"]["PixelSizeX"]),
@@ -776,7 +1022,7 @@ class TemImage:
         image,
         image_settings: Optional["ImageSettings"] = None,
         state: Optional["MicroscopeState"] = None,
-        detector: Optional["TemDetectorSettings"] = None,
+        detector: Optional["DetectorSettings"] = None,
     ) -> "TemImage":
         """
         Create a TemImage from a Jeol microscope image output.
@@ -872,12 +1118,14 @@ class SystemInfo:
 class SystemSettings:
     stage: StageSystemSettings
     beam: BeamSystemSettings
+    detector: DetectorSystemSettings
     info: SystemInfo
 
     def to_dict(self):
         return {
             "stage": self.stage.to_dict(),
             "beam": self.beam.to_dict(),
+            "detector": self.detector.to_dict(),
             "info": self.info.to_dict(),
         }
     
@@ -886,6 +1134,7 @@ class SystemSettings:
         return SystemSettings(
             stage=StageSystemSettings.from_dict(settings["stage"]),
             beam=BeamSystemSettings.from_dict(settings["beam"]),
+            detector=DetectorSystemSettings.from_dict(settings["detector"]),
             info=SystemInfo.from_dict(settings["info"]),
         )
 
