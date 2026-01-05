@@ -173,153 +173,9 @@ class TemImageMetadataRefined:
         """Construct metadata from JEOL HEADER (supports SEM or FIB)."""
         pass
 
-@dataclass
-class ROI:
-    x: int = 0
-    y: int = 0
-    width: int = 0
-    height: int = 0
 
-@dataclass
-class ImageSettings:
-    roi: Optional[ROI] = None
-    binning: Optional[int] = None
-    exposure_ms: Optional["Quantity"] = None
-    dwell_us: Optional["Quantity"] = None
-    file_format: Optional[str] = "tiff"  # "tiff", "jpg", "bmp", ...
-    path: Optional[Union[str, Path]] = None  # default output directory (session dir)
 
-    def __post_init__(self):
-        # Normalize timing units
-        if self.exposure_ms is not None:
-            self.exposure_ms = ensure_quantity(self.exposure_ms, "millisecond")
-        if self.dwell_us is not None:
-            self.dwell_us = ensure_quantity(self.dwell_us, "microsecond")
 
-    def to_dict(self) -> dict:
-        d: Dict[str, Any] = {
-            "binning": self.binning,
-            "exposure_ms": magnitude(self.exposure_ms, "millisecond"),
-            "dwell_us": magnitude(self.dwell_us, "microsecond"),
-            "file_format": self.file_format,
-            "path": str(self.path) if self.path is not None else None,
-        }
-        if self.roi is not None:
-            d['roi'] = asdict(self.roi)
-        return d
-
-    @staticmethod
-    def from_dict(settings: dict) -> "ImageSettings":
-        setting = ImageSettings(
-            binning=settings.get("binning", None),
-            exposure_ms=ensure_quantity(settings.get("exposure_ms", None), "millisecond"),
-            dwell_us=ensure_quantity(settings.get("dwell_us", None), "microsecond"),
-            file_format=settings.get("file_format", "tiff"),
-            path=settings.get("path", None),
-        )
-        roi_val = settings.get('roi')
-        if roi_val is not None:
-            roi = ROI(
-                    x=int(roi_val.get('x', 0)),
-                    y=int(roi_val.get('y', 0)),
-                    width=int(roi_val.get('width', roi_val.get('w', 0))),
-                    height=int(roi_val.get('height', roi_val.get('h', 0))),
-                )
-            setting.roi = roi
-        return setting
-
-@dataclass
-class StageSystemSettings:
-    """Stage system configuration for safe TEM automation.
-
-    Units:
-      - *_limits_nm are in nanometer
-      - *_limits_deg are in degree
-      - max_step_nm / max_step_deg define the largest single move you allow automation to command
-    """
-
-    enabled: bool = True
-
-    # Capabilities / axes availability
-    can_x: bool = True
-    can_y: bool = True
-    can_z: bool = True
-    can_r: bool = True
-    can_tilt_x: bool = True
-    can_tilt_y: bool = True
-
-    # Soft limits (optional; None means "unknown / not enforced here")
-    x_limits_nm: Optional[Tuple[float, float]] = None
-    y_limits_nm: Optional[Tuple[float, float]] = None
-    z_limits_nm: Optional[Tuple[float, float]] = None
-    r_limits_deg: Optional[Tuple[float, float]] = None
-    tilt_x_limits_deg: Optional[Tuple[float, float]] = None
-    tilt_y_limits_deg: Optional[Tuple[float, float]] = None
-
-    # Motion safety defaults
-    max_step_nm: float = 50000.0        # 50 µm
-    max_step_deg: float = 1.0
-    settle_time_s: float = 0.2
-    timeout_s: float = 10.0
-
-    # Common TEM calibration hint (optional)
-    eucentric_z_nm: Optional[float] = None
-
-    # Everything vendor-specific goes here instead of polluting the core schema
-    extra: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return {
-            "enabled": self.enabled,
-            "can_x": self.can_x,
-            "can_y": self.can_y,
-            "can_z": self.can_z,
-            "can_r": self.can_r,
-            "can_tilt_x": self.can_tilt_x,
-            "can_tilt_y": self.can_tilt_y,
-            "x_limits_nm": self.x_limits_nm,
-            "y_limits_nm": self.y_limits_nm,
-            "z_limits_nm": self.z_limits_nm,
-            "r_limits_deg": self.r_limits_deg,
-            "tilt_x_limits_deg": self.tilt_x_limits_deg,
-            "tilt_y_limits_deg": self.tilt_y_limits_deg,
-            "max_step_nm": self.max_step_nm,
-            "max_step_deg": self.max_step_deg,
-            "settle_time_s": self.settle_time_s,
-            "timeout_s": self.timeout_s,
-            "eucentric_z_nm": self.eucentric_z_nm,
-            "extra": deepcopy(self.extra),
-        }
-
-    @staticmethod
-    def from_dict(settings: dict) -> "StageSystemSettings":
-        if settings is None:
-            return StageSystemSettings()
-
-        # ---- Backward-compat mapping for older, weird keys ----
-        extra: Dict[str, Any] = deepcopy(settings.get("extra", {}))
-
-        return StageSystemSettings(
-            enabled=bool(settings.get("enabled", True)),
-            can_x=bool(settings.get("can_x", True)),
-            can_y=bool(settings.get("can_y", True)),
-            can_z=bool(settings.get("can_z", True)),
-            can_r=bool(settings.get("can_r", True)),
-            can_tilt_x=bool(settings.get("can_tilt_x", True)),
-            can_tilt_y=bool(settings.get("can_tilt_y", True)),
-            x_limits_nm=settings.get("x_limits_nm", None),
-            y_limits_nm=settings.get("y_limits_nm", None),
-            z_limits_nm=settings.get("z_limits_nm", None),
-            r_limits_deg=settings.get("r_limits_deg", None),
-            tilt_x_limits_deg=settings.get("tilt_x_limits_deg", None),
-            tilt_y_limits_deg=settings.get("tilt_y_limits_deg", None),
-            max_step_nm=float(settings.get("max_step_nm", 50000.0)),
-            max_step_deg=float(settings.get("max_step_deg", 1.0)),
-            settle_time_s=float(settings.get("settle_time_s", 0.2)),
-            timeout_s=float(settings.get("timeout_s", 10.0)),
-            eucentric_z_nm=settings.get("eucentric_z_nm", settings.get("eucentric_height", None)),
-            extra=extra,
-        )
 
 @dataclass
 class TemStagePosition:
@@ -452,6 +308,98 @@ class TemStagePosition:
             and close_axis(self.tilt_y, other.tilt_y, "degree", tol_deg)
         )
 
+@dataclass
+class StageSystemSettings:
+    """Stage system configuration for safe TEM automation.
+
+    Units:
+      - *_limits_nm are in nanometer
+      - *_limits_deg are in degree
+      - max_step_nm / max_step_deg define the largest single move you allow automation to command
+    """
+
+    enabled: bool = True
+
+    # Capabilities / axes availability
+    can_x: bool = True
+    can_y: bool = True
+    can_z: bool = True
+    can_r: bool = True
+    can_tilt_x: bool = True
+    can_tilt_y: bool = True
+
+    # Soft limits (optional; None means "unknown / not enforced here")
+    x_limits_nm: Optional[Tuple[float, float]] = None
+    y_limits_nm: Optional[Tuple[float, float]] = None
+    z_limits_nm: Optional[Tuple[float, float]] = None
+    r_limits_deg: Optional[Tuple[float, float]] = None
+    tilt_x_limits_deg: Optional[Tuple[float, float]] = None
+    tilt_y_limits_deg: Optional[Tuple[float, float]] = None
+
+    # Motion safety defaults
+    max_step_nm: float = 50000.0        # 50 µm
+    max_step_deg: float = 1.0
+    settle_time_s: float = 0.2
+    timeout_s: float = 10.0
+
+    # Common TEM calibration hint (optional)
+    eucentric_z_nm: Optional[float] = None
+
+    # Everything vendor-specific goes here instead of polluting the core schema
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "can_x": self.can_x,
+            "can_y": self.can_y,
+            "can_z": self.can_z,
+            "can_r": self.can_r,
+            "can_tilt_x": self.can_tilt_x,
+            "can_tilt_y": self.can_tilt_y,
+            "x_limits_nm": self.x_limits_nm,
+            "y_limits_nm": self.y_limits_nm,
+            "z_limits_nm": self.z_limits_nm,
+            "r_limits_deg": self.r_limits_deg,
+            "tilt_x_limits_deg": self.tilt_x_limits_deg,
+            "tilt_y_limits_deg": self.tilt_y_limits_deg,
+            "max_step_nm": self.max_step_nm,
+            "max_step_deg": self.max_step_deg,
+            "settle_time_s": self.settle_time_s,
+            "timeout_s": self.timeout_s,
+            "eucentric_z_nm": self.eucentric_z_nm,
+            "extra": deepcopy(self.extra),
+        }
+
+    @staticmethod
+    def from_dict(settings: dict) -> "StageSystemSettings":
+        if settings is None:
+            return StageSystemSettings()
+
+        # ---- Backward-compat mapping for older, weird keys ----
+        extra: Dict[str, Any] = deepcopy(settings.get("extra", {}))
+
+        return StageSystemSettings(
+            enabled=bool(settings.get("enabled", True)),
+            can_x=bool(settings.get("can_x", True)),
+            can_y=bool(settings.get("can_y", True)),
+            can_z=bool(settings.get("can_z", True)),
+            can_r=bool(settings.get("can_r", True)),
+            can_tilt_x=bool(settings.get("can_tilt_x", True)),
+            can_tilt_y=bool(settings.get("can_tilt_y", True)),
+            x_limits_nm=settings.get("x_limits_nm", None),
+            y_limits_nm=settings.get("y_limits_nm", None),
+            z_limits_nm=settings.get("z_limits_nm", None),
+            r_limits_deg=settings.get("r_limits_deg", None),
+            tilt_x_limits_deg=settings.get("tilt_x_limits_deg", None),
+            tilt_y_limits_deg=settings.get("tilt_y_limits_deg", None),
+            max_step_nm=float(settings.get("max_step_nm", 50000.0)),
+            max_step_deg=float(settings.get("max_step_deg", 1.0)),
+            settle_time_s=float(settings.get("settle_time_s", 0.2)),
+            timeout_s=float(settings.get("timeout_s", 10.0)),
+            eucentric_z_nm=settings.get("eucentric_z_nm", settings.get("eucentric_height", None)),
+            extra=extra,
+        )
 
 @dataclass
 class BeamSettings:
@@ -565,49 +513,66 @@ class BeamSettings:
         )
 
 @dataclass
-class DetectorCapabilities:
-    """Static capability description for a detector.
+class BeamSystemSettings:
+    """Beam subsystem configuration (defaults + soft constraints).
 
-    Put *what the detector can do* here (ranges, supported features), not in `DetectorSettings`.
-    Per-acquisition requests belong in `DetectorSettings`.
-
-    Notes:
-      - Many vendors expose different knobs. Anything you don't want to standardize goes in `extra`.
+    If you want detector defaults, put them in `ImageSettings` / `TemDetectorSettings`.
+    If you want vendor-specific quirks, put them in `extra`.
     """
 
-    # Binning
-    can_binning: Optional[bool] = None
-    binning_index_min: Optional[int] = None
-    binning_index_max: Optional[int] = None
-    binning_xy_min: Optional[Tuple[int, int]] = None
-    binning_xy_max: Optional[Tuple[int, int]] = None
+    enabled: bool = True
 
-    # Exposure / timing
-    exposure_ms_min: Optional[float] = None
-    exposure_ms_max: Optional[float] = None
-    frame_integration_min: Optional[int] = None
-    frame_integration_max: Optional[int] = None
+    # A "known good" default for automation sessions (optional).
+    default_beam: BeamSettings = field(default_factory=BeamSettings)
 
-    # ROI bounds (width, height)
-    roi_min: Optional[Tuple[int, int]] = None
-    roi_max: Optional[Tuple[int, int]] = None
-
-    # Gain / offset
-    can_gain: Optional[bool] = None
-    gain_index_min: Optional[int] = None
-    gain_index_max: Optional[int] = None
-
-    can_offset: Optional[bool] = None
-    offset_index_min: Optional[int] = None
-    offset_index_max: Optional[int] = None
-
-    # Digital rotation
-    can_digital_rotation: Optional[bool] = None
-    digital_rotation_deg_min: Optional[float] = None
-    digital_rotation_deg_max: Optional[float] = None
+    # Soft constraints (optional)
+    voltage_range_kv: Optional[Tuple[float, float]] = None
+    beam_current_range_na: Optional[Tuple[float, float]] = None
+    spot_size_range: Optional[Tuple[int, int]] = None
+    convergence_angle_range_mrad: Optional[Tuple[float, float]] = None
 
     extra: Dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "default_beam": self.default_beam.to_dict() if self.default_beam is not None else None,
+            "voltage_range_kv": self.voltage_range_kv,
+            "beam_current_range_na": self.beam_current_range_na,
+            "spot_size_range": self.spot_size_range,
+            "convergence_angle_range_mrad": self.convergence_angle_range_mrad,
+            "extra": deepcopy(self.extra),
+        }
+
+    @staticmethod
+    def from_dict(settings: dict) -> "BeamSystemSettings":
+        if settings is None:
+            return BeamSystemSettings()
+
+        extra: Dict[str, Any] = deepcopy(settings.get("extra", {}))
+
+        # Backward-compat: older schema stuffed beam+detector fields at this level.
+        # We'll treat the whole dict as a beam default if `default_beam` isn't provided.
+        default_beam_dict = settings.get("default_beam", None)
+        default_beam = BeamSettings.from_dict(default_beam_dict)
+
+
+        return BeamSystemSettings(
+            enabled=bool(settings.get("enabled", True)),
+            default_beam=default_beam,
+            voltage_range_kv=settings.get("voltage_range_kv", settings.get("voltage_limits_kv", None)),
+            beam_current_range_na=settings.get("beam_current_range_na", None),
+            spot_size_range=settings.get("spot_size_range", None),
+            convergence_angle_range_mrad=settings.get("convergence_angle_range_mrad", None),
+            extra=extra,
+        )
+
+@dataclass
+class ROI:
+    x: int = 0
+    y: int = 0
+    width: int = 0
+    height: int = 0
 
 @dataclass
 class DetectorSettings:
@@ -723,6 +688,50 @@ class DetectorSettings:
         return obj
 
 @dataclass
+class DetectorCapabilities:
+    """Static capability description for a detector.
+
+    Put *what the detector can do* here (ranges, supported features), not in `DetectorSettings`.
+    Per-acquisition requests belong in `DetectorSettings`.
+
+    Notes:
+      - Many vendors expose different knobs. Anything you don't want to standardize goes in `extra`.
+    """
+
+    # Binning
+    can_binning: Optional[bool] = None
+    binning_index_min: Optional[int] = None
+    binning_index_max: Optional[int] = None
+    binning_xy_min: Optional[Tuple[int, int]] = None
+    binning_xy_max: Optional[Tuple[int, int]] = None
+
+    # Exposure / timing
+    exposure_ms_min: Optional[float] = None
+    exposure_ms_max: Optional[float] = None
+    frame_integration_min: Optional[int] = None
+    frame_integration_max: Optional[int] = None
+
+    # ROI bounds (width, height)
+    roi_min: Optional[Tuple[int, int]] = None
+    roi_max: Optional[Tuple[int, int]] = None
+
+    # Gain / offset
+    can_gain: Optional[bool] = None
+    gain_index_min: Optional[int] = None
+    gain_index_max: Optional[int] = None
+
+    can_offset: Optional[bool] = None
+    offset_index_min: Optional[int] = None
+    offset_index_max: Optional[int] = None
+
+    # Digital rotation
+    can_digital_rotation: Optional[bool] = None
+    digital_rotation_deg_min: Optional[float] = None
+    digital_rotation_deg_max: Optional[float] = None
+
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
 class DetectorSystemSettings:
     """Detector subsystem configuration (defaults + capabilities).
 
@@ -829,61 +838,32 @@ class DetectorSystemSettings:
             extra=extra,
         )
 
-
 @dataclass
-class BeamSystemSettings:
-    """Beam subsystem configuration (defaults + soft constraints).
-
-    If you want detector defaults, put them in `ImageSettings` / `TemDetectorSettings`.
-    If you want vendor-specific quirks, put them in `extra`.
-    """
-
-    enabled: bool = True
-
-    # A "known good" default for automation sessions (optional).
-    default_beam: BeamSettings = field(default_factory=BeamSettings)
-
-    # Soft constraints (optional)
-    voltage_range_kv: Optional[Tuple[float, float]] = None
-    beam_current_range_na: Optional[Tuple[float, float]] = None
-    spot_size_range: Optional[Tuple[int, int]] = None
-    convergence_angle_range_mrad: Optional[Tuple[float, float]] = None
-
-    extra: Dict[str, Any] = field(default_factory=dict)
+class ImageOutputSettings:
+    file_format: Optional[str] = "tiff"  # "tiff", "jpg", "bmp", ...
+    path: Optional[Union[str, Path]] = None  # default output directory (session dir)
 
     def to_dict(self) -> dict:
-        return {
-            "enabled": self.enabled,
-            "default_beam": self.default_beam.to_dict() if self.default_beam is not None else None,
-            "voltage_range_kv": self.voltage_range_kv,
-            "beam_current_range_na": self.beam_current_range_na,
-            "spot_size_range": self.spot_size_range,
-            "convergence_angle_range_mrad": self.convergence_angle_range_mrad,
-            "extra": deepcopy(self.extra),
+        d: Dict[str, Any] = {
+            "file_format": self.file_format,
+            "path": str(self.path) if self.path is not None else None,
         }
 
+        return d
+
     @staticmethod
-    def from_dict(settings: dict) -> "BeamSystemSettings":
-        if settings is None:
-            return BeamSystemSettings()
-
-        extra: Dict[str, Any] = deepcopy(settings.get("extra", {}))
-
-        # Backward-compat: older schema stuffed beam+detector fields at this level.
-        # We'll treat the whole dict as a beam default if `default_beam` isn't provided.
-        default_beam_dict = settings.get("default_beam", None)
-        default_beam = BeamSettings.from_dict(default_beam_dict)
-
-
-        return BeamSystemSettings(
-            enabled=bool(settings.get("enabled", True)),
-            default_beam=default_beam,
-            voltage_range_kv=settings.get("voltage_range_kv", settings.get("voltage_limits_kv", None)),
-            beam_current_range_na=settings.get("beam_current_range_na", None),
-            spot_size_range=settings.get("spot_size_range", None),
-            convergence_angle_range_mrad=settings.get("convergence_angle_range_mrad", None),
-            extra=extra,
+    def from_dict(settings: dict) -> "ImageOutputSettings":
+        setting = ImageOutputSettings(
+            file_format=settings.get("file_format", "tiff"),
+            path=settings.get("path", None),
         )
+        return setting
+
+@dataclass
+class AcquisitionRequest:
+    detector_id: str
+    detector: DetectorSettings
+    image: ImageOutputSettings
     
 @dataclass
 class MicroscopeState:
@@ -1000,7 +980,7 @@ class TemImage:
     # ---------------------- Vendor-specific ----------------------
 
     @classmethod
-    def from_jeol(cls, image, image_settings: ImageSettings, state: MicroscopeState, detector: DetectorSettings):
+    def from_jeol(cls, image, image_settings: ImageOutputSettings, state: MicroscopeState, detector: DetectorSettings):
         """Convert Jeol image object (with Header) to TemImage."""
         pixel_size = Point(
             float(image.Header["MAIN"]["PixelSizeX"]),
@@ -1067,7 +1047,7 @@ class TemImage:
             # For other vendors, fallback to minimal metadata
             data = kwargs.get("data")
             pixel_size = kwargs.get("pixel_size", Point(1, 1))
-            image_settings = kwargs.get("image_settings", ImageSettings(resolution=data.shape))
+            image_settings = kwargs.get("image_settings", ImageOutputSettings(resolution=data.shape))
             metadata = TemImageMetadataRefined(image_settings=image_settings, pixel_size=pixel_size)
             return cls(data=data, metadata=metadata)
     
@@ -1155,7 +1135,7 @@ class MicroscopeSettings:
     """
 
     system: SystemSettings
-    image: ImageSettings
+    image: ImageOutputSettings
     protocol: dict = None
 
     def to_dict(self) -> dict:
@@ -1177,6 +1157,6 @@ class MicroscopeSettings:
      
         return MicroscopeSettings(
             system=SystemSettings.from_dict(settings),
-            image=ImageSettings.from_dict(settings["image"]),
+            image=ImageOutputSettings.from_dict(settings["image"]),
             protocol=protocol,
         )
