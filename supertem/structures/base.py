@@ -8,9 +8,7 @@ from dataclasses import dataclass, field, asdict, fields
 from enum import Enum, auto
 from pathlib import Path
 from copy import deepcopy
-
 from typing import Any, Dict, List, Optional, Tuple, Union
-
 from pint import UnitRegistry
 
 # ---- Units (Pint) ----
@@ -92,90 +90,187 @@ class Point:
     def to_list(self) -> list:
         return [self.x, self.y, self.z]
 
-@dataclass
-class TemImageMetadataRefined:
-    """Universal metadata for TemImage, compatible across TEM vendors."""
 
-    # --- Basic Info (from MAIN section) ---
-    device: Optional[str] = None              # e.g. "TESCAN SOLARIS X"
-    model: Optional[str] = None               # e.g. "S9251X"
+
+# assumes METADATA_VERSION, MicroscopeState, AcquisitionRequest,
+# DetectorSettings, ImageOutputSettings already exist in this module
+
+@dataclass
+class TemImageMetadata:
+    """
+    Universal, vendor-agnostic image metadata.
+    """
+
+    # ---- Schema / provenance ----
+    version: str = METADATA_VERSION
+    created_at: str = field(
+        default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat()
+    )
+    user: Optional[str] = None
+
+    # ---- Instrument identity (minimal + optional) ----
+    manufacturer: Optional[str] = None
+    device: Optional[str] = None
+    model: Optional[str] = None
     serial_number: Optional[str] = None
     software_version: Optional[str] = None
-    user: Optional[str] = None
-    date: Optional[str] = None
-    time: Optional[str] = None
 
-    # --- Imaging Info ---
+    # ---- Imaging summary (canonical, cross-vendor-ish) ----
+    mode: Optional[str] = None                 # "TEM" / "STEM" (or vendor string)
+    detector_id: Optional[str] = None
+    detector_name: Optional[str] = None
+
     magnification: Optional[float] = None
-    magnification_reference: Optional[float] = None   # from MagnificationReference
-    pixel_size_x: Optional[float] = None
-    pixel_size_y: Optional[float] = None
-    resolution: Optional[List[int]] = None            # (width, height)
+    camera_length_mm: Optional[float] = None
 
-    # --- Beam & Optics ---
-    accelerating_voltage: Optional[float] = None      # HV or AcceleratorVoltage
-    emission_current: Optional[float] = None
-    beam_current: Optional[float] = None              # SpecimenCurrent or PredictedBeamCurrent
-    dwell_time: Optional[float] = None
-    spot_size: Optional[float] = None
-    gun_type: Optional[str] = None                    # e.g. "Schottky", "Mistral"
+    pixel_size_nm: Optional[Tuple[float, float]] = None   # (px_x_nm, px_y_nm)
+    image_size_px: Optional[Tuple[int, int]] = None       # (width, height), often "resolution"
 
-    # --- Imaging Environment ---
-    detector: Optional[str] = None                    # e.g. "In-Beam SE" or "SE"
-    chamber_pressure: Optional[float] = None
-    working_distance: Optional[float] = None
-    scan_rotation: Optional[float] = None
-    scan_speed: Optional[float] = None
-    injected_gas: Optional[str] = None                # e.g. "N2" (SEM specific)
-    column_tilt: Optional[float] = None               # (FIB specific)
-    column_type: Optional[str] = None                 # (FIB specific)
+    accelerating_voltage_kv: Optional[float] = None
+    beam_current_na: Optional[float] = None
+    exposure_ms: Optional[float] = None
+    dwell_time_us: Optional[float] = None
+    working_distance_mm: Optional[float] = None
 
-    # --- Stage & Geometry ---
-    stage_x: Optional[float] = None
-    stage_y: Optional[float] = None
-    stage_z: Optional[float] = None
-    stage_tilt: Optional[float] = None
-    stage_rotation: Optional[float] = None
+    # ---- Structured snapshots (reuse your base structures) ----
+    microscope_state: Optional["MicroscopeState"] = None
+    acquisition: Optional["AcquisitionRequest"] = None
 
-    # --- Image Processing / LUT ---
-    lut_minimum: Optional[float] = None
-    lut_maximum: Optional[float] = None
-    lut_gamma: Optional[float] = None
-
-    # --- Misc ---
-    session_id: Optional[str] = None
-    stigmator_x: Optional[float] = None
-    stigmator_y: Optional[float] = None
-    tilt_correction: Optional[float] = None
-    objective: Optional[float] = None
-
-    # --- For vendor-specific or unknown values ---
+    # ---- Vendor-specific or unknown stuff ----
     extra: Dict[str, Any] = field(default_factory=dict)
 
+    # ---------------- Serialization ----------------
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert metadata to a flat dictionary."""
-        return asdict(self)
-    
+        d: Dict[str, Any] = {
+            "version": self.version,
+            "created_at": self.created_at,
+            "user": self.user,
+            "manufacturer": self.manufacturer,
+            "device": self.device,
+            "model": self.model,
+            "serial_number": self.serial_number,
+            "software_version": self.software_version,
+            "mode": self.mode,
+            "detector_id": self.detector_id,
+            "detector_name": self.detector_name,
+            "magnification": self.magnification,
+            "camera_length_mm": self.camera_length_mm,
+            "pixel_size_nm": list(self.pixel_size_nm) if self.pixel_size_nm else None,
+            "image_size_px": list(self.image_size_px) if self.image_size_px else None,
+            "accelerating_voltage_kv": self.accelerating_voltage_kv,
+            "beam_current_na": self.beam_current_na,
+            "exposure_ms": self.exposure_ms,
+            "dwell_time_us": self.dwell_time_us,
+            "working_distance_mm": self.working_distance_mm,
+        }
+
+        if self.microscope_state is not None:
+            d["microscope_state"] = self.microscope_state.to_dict()
+
+        if self.acquisition is not None:
+            # AcquisitionRequest doesn't currently have to_dict(), so serialize explicitly
+            d["acquisition"] = {
+                "detector_id": self.acquisition.detector_id,
+                "detector": self.acquisition.detector.to_dict() if self.acquisition.detector else None,
+                "image": self.acquisition.image.to_dict() if self.acquisition.image else None,
+            }
+
+        if self.extra:
+            d["extra"] = deepcopy(self.extra)
+
+        # Drop keys with None to keep TIFF metadata smaller (optional)
+        return {k: v for k, v in d.items() if v is not None}
+
     @staticmethod
-    def from_dict(d: Dict[str, Any]) -> "TemImageMetadataRefined":
-        """Construct from dictionary, storing unknown keys in extra."""
-        field_names = {f.name for f in fields(TemImageMetadataRefined)}
-        known = {k: v for k, v in d.items() if k in field_names}
-        extra_data = {k: v for k, v in d.items() if k not in field_names}
-        obj = TemImageMetadataRefined(**known)
-        if extra_data:
-            obj.extra.update(extra_data)
+    def from_dict(d: Dict[str, Any]) -> "TemImageMetadata":
+        if not d:
+            return TemImageMetadata()
+
+        used_keys = set()
+
+        # --- New-style keys ---
+        version = d.get("version", d.get("metadata_version", METADATA_VERSION)); used_keys |= {"version", "metadata_version"}
+        created_at = d.get("created_at", d.get("timestamp", None)); used_keys |= {"created_at", "timestamp"}
+        user = d.get("user", None); used_keys.add("user")
+
+        obj = TemImageMetadata(
+            version=version,
+            created_at=created_at if isinstance(created_at, str) else TemImageMetadata().created_at,
+            user=user,
+            manufacturer=d.get("manufacturer", None),
+            device=d.get("device", None),
+            model=d.get("model", None),
+            serial_number=d.get("serial_number", None),
+            software_version=d.get("software_version", None),
+            mode=d.get("mode", None),
+            detector_id=d.get("detector_id", None),
+            detector_name=d.get("detector_name", None),
+            magnification=d.get("magnification", None),
+            camera_length_mm=d.get("camera_length_mm", d.get("camera_length", None)),
+            accelerating_voltage_kv=d.get("accelerating_voltage_kv", d.get("accelerating_voltage", None)),
+            beam_current_na=d.get("beam_current_na", d.get("beam_current", None)),
+            exposure_ms=d.get("exposure_ms", None),
+            dwell_time_us=d.get("dwell_time_us", d.get("dwell_time", None)),
+            working_distance_mm=d.get("working_distance_mm", d.get("working_distance", None)),
+        )
+
+        used_keys |= {
+            "manufacturer","device","model","serial_number","software_version",
+            "mode","detector_id","detector_name","magnification","camera_length_mm","camera_length",
+            "accelerating_voltage_kv","accelerating_voltage","beam_current_na","beam_current",
+            "exposure_ms","dwell_time_us","dwell_time","working_distance_mm","working_distance",
+        }
+
+        # pixel_size_nm
+        px = d.get("pixel_size_nm", None)
+        if isinstance(px, (list, tuple)) and len(px) == 2:
+            obj.pixel_size_nm = (float(px[0]), float(px[1]))
+            used_keys.add("pixel_size_nm")
+
+        # image_size_px
+        imsz = d.get("image_size_px", None)
+        if isinstance(imsz, (list, tuple)) and len(imsz) == 2:
+            obj.image_size_px = (int(imsz[0]), int(imsz[1]))
+            used_keys.add("image_size_px")
+
+        # microscope_state
+        ms = d.get("microscope_state", None)
+        if isinstance(ms, dict):
+            obj.microscope_state = MicroscopeState.from_dict(ms)
+            used_keys.add("microscope_state")
+
+        # acquisition
+        acq = d.get("acquisition", None)
+        if isinstance(acq, dict):
+            det = DetectorSettings.from_dict(acq.get("detector")) if isinstance(acq.get("detector"), dict) else DetectorSettings()
+            img = ImageOutputSettings.from_dict(acq.get("image")) if isinstance(acq.get("image"), dict) else ImageOutputSettings()
+            det_id = acq.get("detector_id", det.detector_id or "")
+            if det_id:
+                obj.acquisition = AcquisitionRequest(detector_id=str(det_id), detector=det, image=img)
+            used_keys.add("acquisition")
+
+        # extra: everything else
+        extra = deepcopy(d.get("extra", {})) if isinstance(d.get("extra", None), dict) else {}
+        used_keys.add("extra")
+
+        for k, v in d.items():
+            if k not in used_keys:
+                extra[k] = v
+        obj.extra = extra
+
         return obj
 
     # ---------- Vendor-specific constructors ----------
     @staticmethod
-    def from_jeol(header: Dict[str, Any]) -> "TemImageMetadataRefined":
-        """Construct metadata from JEOL HEADER (supports SEM or FIB)."""
-        pass
-
-
-
-
+    def from_jeol(header: Dict[str, Any]) -> "TemImageMetadata":
+        """
+        If you want: parse JEOL header -> fill the fields above + stash the rest in extra.
+        Keep it conservative: only map what you're confident about.
+        """
+        md = TemImageMetadata()
+        md.extra["jeol_header"] = header
+        return md
 
 @dataclass
 class TemStagePosition:
@@ -950,7 +1045,7 @@ class TemImage:
         - Other vendors via vendor-specific factory functions.
     """
 
-    def __init__(self, data: np.ndarray, metadata: Optional[TemImageMetadataRefined] = None):
+    def __init__(self, data: np.ndarray, metadata: Optional[TemImageMetadata] = None):
         if not _check_data_format(data):
             raise ValueError("Invalid data format for Tem Image.")
         if data.ndim == 3 and data.shape[2] == 1:
@@ -966,7 +1061,7 @@ class TemImage:
             data = tiff_image.asarray()
             try:
                 desc = tiff_image.pages[0].tags["ImageDescription"].value
-                metadata = TemImageMetadataRefined.from_dict(json.loads(desc))
+                metadata = TemImageMetadata.from_dict(json.loads(desc))
             except Exception:
                 metadata = None
         return cls(data=data, metadata=metadata)
@@ -987,7 +1082,7 @@ class TemImage:
             float(image.Header["MAIN"]["PixelSizeY"]),
         )
 
-        metadata = TemImageMetadataRefined(
+        metadata = TemImageMetadata(
             image_settings=image_settings,
             pixel_size=pixel_size,
             microscope_state=state,
@@ -1022,7 +1117,7 @@ class TemImage:
 
         # --- Extract standardized metadata from JEOL header ---
         header = {section: dict(image.Header.items(section)) for section in image.Header.sections()}
-        metadata_refined = TemImageMetadataRefined.from_jeol(header)
+        metadata_refined = TemImageMetadata.from_jeol(header)
 
         # --- Construct the TemImage ---
         tem_image = cls(
@@ -1048,7 +1143,7 @@ class TemImage:
             data = kwargs.get("data")
             pixel_size = kwargs.get("pixel_size", Point(1, 1))
             image_settings = kwargs.get("image_settings", ImageOutputSettings(resolution=data.shape))
-            metadata = TemImageMetadataRefined(image_settings=image_settings, pixel_size=pixel_size)
+            metadata = TemImageMetadata(image_settings=image_settings, pixel_size=pixel_size)
             return cls(data=data, metadata=metadata)
     
 @dataclass

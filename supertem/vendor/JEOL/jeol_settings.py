@@ -1,7 +1,7 @@
 import copy
 from typing import Any, Dict, Optional, Tuple
 
-from supertem.structures.base import TemDetectorSettings, ROI, DetectorCapabilities  # adjust import
+from supertem.structures.base import DetectorSettings, ROI, DetectorCapabilities  # adjust import
 
 JEOL_SETTING_KEYS = {
     "ImagingArea", "BinningSize",
@@ -53,7 +53,7 @@ def _bin_xy_from_dict(x: Any) -> Optional[Tuple[int, int]]:
         return None
     return (int(x.get("Width", 1)), int(x.get("Height", 1)))
 
-def from_jeol_detector_setting(payload: Dict[str, Any], detector_id: Optional[str] = None) -> TemDetectorSettings:
+def from_jeol_detector_setting(payload: Dict[str, Any], detector_id: Optional[str] = None) -> DetectorSettings:
     p = copy.deepcopy(payload)
 
     # pull settings
@@ -64,7 +64,7 @@ def from_jeol_detector_setting(payload: Dict[str, Any], detector_id: Optional[st
     exposure_idx = _pop(p, "ExposureTimeIndex")
     _pop(p, "ExposureTimeString")
 
-    settings = TemDetectorSettings(
+    settings = DetectorSettings(
         detector_id=detector_id,
         exposure_ms=_to_float(exposure_val) if exposure_val is not None else _to_float(exposure_idx),
         binning_index=_to_int(_pop(p, "BinningIndex")),
@@ -90,7 +90,7 @@ def from_jeol_detector_setting(payload: Dict[str, Any], detector_id: Optional[st
     settings.extra = misc_extra
     return settings
 
-def to_jeol_detector_setting(s: TemDetectorSettings, include_capabilities: bool = False, include_extra: bool = True) -> Dict[str, Any]:
+def to_jeol_detector_setting(s: DetectorSettings, include_capabilities: bool = False, include_extra: bool = True) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
 
     if s.binning_index is not None:
