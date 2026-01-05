@@ -173,17 +173,21 @@ class TemImageMetadataRefined:
         """Construct metadata from JEOL HEADER (supports SEM or FIB)."""
         pass
 
+@dataclass
+class ROI:
+    x: int = 0
+    y: int = 0
+    width: int = 0
+    height: int = 0
 
 @dataclass
 class ImageSettings:
-    width: Optional[int] = None
-    height: Optional[int] = None
-    x: Optional[int] = None
-    y: Optional[int] = None
+    roi: Optional[ROI] = None
     binning: Optional[int] = None
     exposure_ms: Optional["Quantity"] = None
     dwell_us: Optional["Quantity"] = None
     file_format: Optional[str] = "tiff"  # "tiff", "jpg", "bmp", ...
+    path: Optional[Union[str, Path]] = None  # default output directory (session dir)
 
     def __post_init__(self):
         # Normalize timing units
@@ -193,30 +197,36 @@ class ImageSettings:
             self.dwell_us = ensure_quantity(self.dwell_us, "microsecond")
 
     def to_dict(self) -> dict:
-        # Keep JSON-friendly magnitudes (ms / µs)
-        return {
-            "width": self.width,
-            "height": self.height,
-            "x": self.x,
-            "y": self.y,
+        d: Dict[str, Any] = {
             "binning": self.binning,
             "exposure_ms": magnitude(self.exposure_ms, "millisecond"),
             "dwell_us": magnitude(self.dwell_us, "microsecond"),
             "file_format": self.file_format,
+            "path": str(self.path) if self.path is not None else None,
         }
+        if self.roi is not None:
+            d['roi'] = asdict(self.roi)
+        return d
 
     @staticmethod
     def from_dict(settings: dict) -> "ImageSettings":
-        return ImageSettings(
-            width=settings["width"],
-            height=settings["height"],
-            x=settings.get("x", None),
-            y=settings.get("y", None),
+        setting = ImageSettings(
             binning=settings.get("binning", None),
             exposure_ms=ensure_quantity(settings.get("exposure_ms", None), "millisecond"),
             dwell_us=ensure_quantity(settings.get("dwell_us", None), "microsecond"),
             file_format=settings.get("file_format", "tiff"),
+            path=settings.get("path", None),
         )
+        roi_val = settings.get('roi')
+        if roi_val is not None:
+            roi = ROI(
+                    x=int(roi_val.get('x', 0)),
+                    y=int(roi_val.get('y', 0)),
+                    width=int(roi_val.get('width', roi_val.get('w', 0))),
+                    height=int(roi_val.get('height', roi_val.get('h', 0))),
+                )
+            setting.roi = roi
+        return setting
 
 @dataclass
 class StageSystemSettings:
@@ -468,14 +478,6 @@ class BeamSettings:
 
         return beam_settings
 
-
-@dataclass
-class DetectorROI:
-    x: int = 0
-    y: int = 0
-    width: int = 0
-    height: int = 0
-
 @dataclass
 class DetectorCapabilities:
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -487,16 +489,12 @@ class TemDetectorSettings:
     exposure_ms: Optional[float] = None
     binning_index: Optional[int] = None
     binning_xy: Optional[Tuple[int, int]] = None
-    roi: Optional[DetectorROI] = None
+    roi: Optional[ROI] = None
 
     frame_integration: Optional[int] = None
-    gain_index: Optional[int] = None
-    offset_index: Optional[int] = None
+    gain_index: Optional[int] = None # Same as contrast
+    offset_index: Optional[int] = None # Same as brightness
     digital_rotation_deg: Optional[float] = None
-
-    # display-only (if you really use it)
-    brightness: Optional[float] = None
-    contrast: Optional[float] = None
 
     capabilities: Optional[DetectorCapabilities] = None
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -518,9 +516,89 @@ class TemDetectorSettings:
 
         return obj
 
+    def to_dict(self) -> dict:
+        d: Dict[str, Any] = {
+            'detector_id': self.detector_id,
+            'exposure_ms': self.exposure_ms,
+            'binning_index': self.binning_index,
+            'binning_xy': list(self.binning_xy) if self.binning_xy is not None else None,
+            'frame_integration': self.frame_integration,
+            'gain_index': self.gain_index,
+            'offset_index': self.offset_index,
+            'digital_rotation_deg': self.digital_rotation_deg,
+        }
+        if self.roi is not None:
+            d['roi'] = asdict(self.roi)
+        if self.capabilities is not None:
+            d['capabilities'] = asdict(self.capabilities)
+        if self.extra:
+            d['extra'] = deepcopy(self.extra)
+        return d
+
+    @staticmethod
+    def from_dict(settings: Dict[str, Any]) -> 'TemDetectorSettings':
+        if settings is None:
+            return TemDetectorSettings()
+
+        kwargs: Dict[str, Any] = {}
+        direct_keys = [
+            'detector_id', 'exposure_ms', 'binning_index', 'binning_xy',
+            'frame_integration', 'gain_index', 'offset_index', 'digital_rotation_deg', 'roi', 'capabilities', 'extra'
+        ]
+        for k in direct_keys:
+            if k in settings and k not in kwargs:
+                kwargs[k] = settings.get(k)
+
+        # ROI parsing
+        roi_val = kwargs.get('roi')
+        if isinstance(roi_val, dict):
+            # allow (w,h) naming too
+            kwargs['roi'] = ROI(
+                x=int(roi_val.get('x', 0)),
+                y=int(roi_val.get('y', 0)),
+                width=int(roi_val.get('width', roi_val.get('w', 0))),
+                height=int(roi_val.get('height', roi_val.get('h', 0))),
+            )
+        elif roi_val is None:
+            if isinstance(settings.get('detector_roi'), dict):
+                r = settings['detector_roi']
+                kwargs['roi'] = ROI(
+                    x=int(r.get('x', 0)),
+                    y=int(r.get('y', 0)),
+                    width=int(r.get('width', r.get('w', 0))),
+                    height=int(r.get('height', r.get('h', 0))),
+                )
+            if isinstance(settings.get('imaging_area'), dict):
+                r = settings['imaging_area']
+                kwargs['roi'] = ROI(
+                    x=int(r.get('x', 0)),
+                    y=int(r.get('y', 0)),
+                    width=int(r.get('width', r.get('w', 0))),
+                    height=int(r.get('height', r.get('h', 0))),
+                )
+
+
+        # Capabilities parsing
+        cap_val = kwargs.get('capabilities')
+        if isinstance(cap_val, dict):
+            kwargs['capabilities'] = DetectorCapabilities(extra=dict(cap_val.get('extra', cap_val)))
+
+        # Normalize binning_xy
+        if isinstance(kwargs.get('binning_xy'), (list, tuple)) and kwargs.get('binning_xy') is not None:
+            bx = kwargs['binning_xy']
+            if len(bx) == 2:
+                kwargs['binning_xy'] = (int(bx[0]), int(bx[1]))
+
+        user_extra = kwargs.pop('extra', None)
+        obj = TemDetectorSettings(
+            **{k: v for k, v in kwargs.items() if k in {f.name for f in fields(TemDetectorSettings)}})
+        if isinstance(user_extra, dict):
+            obj.extra.update(user_extra)
+        return obj
 
 @dataclass
 class BeamSystemSettings:
+    #need fix
     enabled: bool
     beam: BeamSettings
     detector: TemDetectorSettings
@@ -581,7 +659,7 @@ class MicroscopeState:
 
     timestamp: float = field(default_factory=lambda: datetime.datetime.now().timestamp())
     stage_position: TemStagePosition = field(default_factory=TemStagePosition)
-    beam: BeamSettings = field(default_factory=lambda: BeamSettings)
+    beam: BeamSettings = field(default_factory=BeamSettings)
     detector: TemDetectorSettings = field(default_factory=TemDetectorSettings)
     protocol: Dict[str, Any] = field(default_factory=dict)
 
@@ -794,7 +872,7 @@ class SystemInfo:
 class SystemSettings:
     stage: StageSystemSettings
     beam: BeamSystemSettings
-    info: SystemInfo    
+    info: SystemInfo
 
     def to_dict(self):
         return {
@@ -805,8 +883,6 @@ class SystemSettings:
     
     @staticmethod
     def from_dict(settings: dict):
-
-            
         return SystemSettings(
             stage=StageSystemSettings.from_dict(settings["stage"]),
             beam=BeamSystemSettings.from_dict(settings["beam"]),
@@ -835,9 +911,8 @@ class MicroscopeSettings:
 
     def to_dict(self) -> dict:
         settings_dict = {
-            "imaging": self.image.to_dict(),
+            "image": self.image.to_dict(),
             "protocol": self.protocol,
-            "milling": self.milling.to_dict(),
         }
         settings_dict.update(self.system.to_dict())
 
@@ -853,6 +928,6 @@ class MicroscopeSettings:
      
         return MicroscopeSettings(
             system=SystemSettings.from_dict(settings),
-            image=ImageSettings.from_dict(settings["imaging"]),
+            image=ImageSettings.from_dict(settings["image"]),
             protocol=protocol,
         )

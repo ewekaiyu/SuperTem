@@ -63,11 +63,19 @@ def make_logging_directory(path: Path = None, name="run"):
 
 # TODO: better logs: https://www.toptal.com/python/in-depth-python-logging
 # https://stackoverflow.com/questions/61483056/save-logging-debug-and-show-only-logging-info-python
-def configure_logging(path: Path = "", log_filename="logfile", log_level=logging.DEBUG, _DEBUG: bool = False):
-    """Log to the terminal and to file simultaneously."""
-    logfile = os.path.join(path, f"{log_filename}.log")
+def configure_logging(path: Path = None, log_filename="logfile", log_level=logging.DEBUG, _DEBUG: bool = False):
+    """Log to the terminal and to file simultaneously.
 
-    file_handler = logging.FileHandler(logfile)
+    If `path` is None/empty, logs are written under cfg.LOG_PATH (see config.py).
+    """
+    if not path:
+        path = cfg.LOG_PATH
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+    logfile = path / f"{log_filename}.log"
+
+    file_handler = logging.FileHandler(str(logfile))
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(logging.INFO if _DEBUG is False else logging.DEBUG)
 
@@ -80,22 +88,15 @@ def configure_logging(path: Path = "", log_filename="logfile", log_level=logging
         force=True,
     )
 
-    return logfile
 
-
-def load_yaml(fname: Path) -> dict:
-    """load yaml file
-
-    Args:
-        fname (Path): yaml file path
-
-    Returns:
-        dict: Items in yaml
-    """
-    with open(fname, "r") as f:
-        config = yaml.safe_load(f)
-
-    return config
+def load_yaml(fname: Path, default=None):
+    """Load YAML. Return `default` if missing/invalid/empty."""
+    try:
+        with open(fname, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return default if data is None else data
+    except (FileNotFoundError, OSError, yaml.YAMLError):
+        return default
 
 
 def save_yaml(path: Path, data: dict) -> None:
@@ -156,21 +157,21 @@ def setup_session(
     """
 
     # load settings
-    settings = load_microscope_configuration(config_path, protocol_path)
+    settings = load_microscope(config_path, protocol_path)
 
     # create session directories
     session = f'{settings.protocol.get("name", "opensupertem")}_{current_timestamp()}'
-    if protocol_path is None:
-        protocol_path = os.getcwd()
 
-    # configure paths
-    if session_path is None:
-        session_path = cfg.LOG_PATH
-    os.makedirs(session_path, exist_ok=True)
+    # configure paths (root log dir -> per-session dir)
+    root_log = Path(session_path) if session_path else Path(cfg.LOG_PATH)
+    root_log.mkdir(parents=True, exist_ok=True)
+    session_dir = root_log / session
+    session_dir.mkdir(parents=True, exist_ok=True)
+
 
     # configure logging
     if setup_logging:
-        configure_logging(session_path, _DEBUG=debug)
+        configure_logging(session_dir, _DEBUG=debug)
 
     # cheap overloading
     if ip_address:
@@ -182,72 +183,80 @@ def setup_session(
     manufacturer = settings.system.info.manufacturer
     ip_address = settings.system.info.ip_address
 
+    # set default image_settings path
+    settings.image.path = session_dir
+
     if manufacturer in VALID_DEMO:
         from supertem.microscopes.demo_microscope import DemoMicroscope
-        microscope = DemoMicroscope(settings.system)
+        microscope = DemoMicroscope(settings)
         microscope.connect_to_microscope(ip_address, port=7520)
     
     elif manufacturer in VALID_JEOL:
         from supertem.microscopes.jeol_microscope import JeolMicroscope
-        microscope = JeolMicroscope(settings.system)
+        microscope = JeolMicroscope(settings)
         microscope.connect_to_microscope(ip_address, port=7520)
 
     else:
         raise NotImplementedError(f"Manufacturer {manufacturer} not supported.")
-    
-    # set default image_settings path
-    settings.image.path = session_path
 
     logging.info(f"Finished setup for session: {session}")
 
     return microscope, settings
 
+def load_microscope(config_path: Path = None, protocol_path: Path = None) -> MicroscopeSettings:
+    """Load microscope settings + protocol.
 
-def load_microscope_configuration(
-    config_path: Path = None, protocol_path: Path = None
-) -> MicroscopeSettings:
-    """Load microscope settings from configuration files
-
-    Args:
-        config_path (Path, optional): path to config directory. Defaults to None.
-        protocol_path (Path, optional): path to protocol file. Defaults to None.
-
-    Returns:
-        MicroscopeSettings: microscope settings
+    This is the thin orchestrator:
+      - `load_microscope_configuration()` resolves the microscope configuration dict
+      - `load_protocol()` resolves the protocol dict
+      - `MicroscopeSettings.from_dict()` builds the strongly-typed settings object
     """
-    if config_path is None:
-        from supertem.config import DEFAULT_CONFIGURATION_PATH
-        config_path = DEFAULT_CONFIGURATION_PATH
-    
-    # load config
-    config = load_yaml(os.path.join(config_path))
-
-    # load protocol
+    config = load_microscope_configuration(config_path)
     protocol = load_protocol(protocol_path)
+    return MicroscopeSettings.from_dict(config, protocol=protocol)
 
-    # create settings
-    settings = MicroscopeSettings.from_dict(config, protocol=protocol)
+def load_microscope_configuration(config_path: Path = None) -> dict:
+    """Load microscope configuration YAML (config only).
 
-    return settings
+    - If `config_path` is None, uses cfg.DEFAULT_CONFIGURATION_PATH.
+    - If `config_path` is a directory, expects 'microscope-configuration.yaml' inside it.
+    - If config YAML is missing/invalid, falls back to cfg.DEFAULT_MICROSCOPE_CONFIGURATION_YAML.
+
+    Protocol resolution is analogous (defaults come from cfg.DEFAULT_PROTOCOL_PATH).
+    """
+    # Resolve microscope config file
+    if config_path is None:
+        config_file = Path(getattr(cfg, "DEFAULT_CONFIGURATION_PATH", cfg.MICROSCOPE_CONFIGURATION_PATH))
+    else:
+        cp = Path(config_path)
+        config_file = cp / "microscope-configuration.yaml" if cp.is_dir() else cp
+    fallback = getattr(cfg, "DEFAULT_MICROSCOPE_CONFIGURATION_YAML", {})
+    config = load_yaml(config_file, default=fallback)
+    if not isinstance(config, dict):
+        config = getattr(cfg, "DEFAULT_MICROSCOPE_CONFIGURATION_YAML", {}) or {}
+
+    return config
 
 def load_protocol(protocol_path: Path = None) -> dict:
-    """Load the protocol file from yaml
+    """Load protocol YAML.
 
-    Args:
-        protocol_path (Path, optional): path to protocol file. Defaults to None.
-
-    Returns:
-        dict: protocol dictionary
+    - If `protocol_path` is None, uses cfg.DEFAULT_PROTOCOL_PATH (or cfg.PROTOCOL_PATH).
+    - If `protocol_path` is a directory, expects 'protocol.yaml' inside it.
+    - If missing/invalid, falls back to cfg.DEFAULT_PROTOCOL_YAML.
     """
-    if protocol_path is not None:
-        protocol = load_yaml(protocol_path)
+    # Normalize to a file path
+    if protocol_path is None:
+        protocol_file = Path(getattr(cfg, "DEFAULT_PROTOCOL_PATH", cfg.PROTOCOL_PATH))
     else:
-        protocol = {"name": "demo"}
+        pp = Path(protocol_path)
+        protocol_file = pp / "protocol.yaml" if pp.is_dir() else pp
 
-    #protocol = _format_dictionary(protocol)
+    fallback = getattr(cfg, "DEFAULT_PROTOCOL_YAML", {"name": "demo"})
+    protocol = load_yaml(protocol_file, default=fallback)
+    if not isinstance(protocol, dict):
+        protocol = dict(fallback) if isinstance(fallback, dict) else {"name": "demo"}
 
     return protocol
-
 
 def _format_dictionary(dictionary: dict) -> dict:
     """Recursively traverse dictionary and covert all numeric values to flaot.

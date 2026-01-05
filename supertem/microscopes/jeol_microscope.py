@@ -1,15 +1,16 @@
 import time
+import logging
 import numpy as np
-from typing import Dict, Any, Optional, List, Tuple, Union
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 from io import BytesIO
-
-from fontTools.varLib.instancer import axisValuesFromAxisLimits
 from pint import Quantity
+from dataclasses import asdict
 
 from supertem.microscope import TemMicroscope
 from supertem.structures.base import (
     ImageSettings,
+    MicroscopeSettings,
     Q_,
     ensure_quantity,
     magnitude,
@@ -21,27 +22,28 @@ from supertem.structures.base import (
 from supertem.vendor.JEOL.jeol_eos_tables import get_list, list_unit
 from supertem.vendor.JEOL.jeol_settings import from_jeol_detector_setting, to_jeol_detector_setting
 
+logger = logging.getLogger(__name__)
 try:
     from PyJEM import TEM3  # type: ignore
 except Exception: # pragma: no cover
-    print("TEM3 is not available, trying offline version")
+    logger.warning("TEM3 is not available; trying offline version.")
     try:
         from PyJEM.offline import TEM3
-        print("offline.TEM3 is available")
+        logger.info("offline.TEM3 is available.")
     except Exception:
         TEM3 = None
-        print("TEM3 is None")
+        logger.error("TEM3 is None.")
 
 try:
     from PyJEM import detector
 except Exception:
-    print("Detector is not available, trying offline version")
+    logger.warning("Detector is not available, trying offline version")
     try:
         from PyJEM.offline import detector
-        print("offline.detector is available")
+        logger.info("offline.detector is available")
     except Exception:
         detector = None
-        print("detector is None")
+        logger.error("detector is None.")
 
 
 class JeolMicroscope(TemMicroscope):
@@ -71,9 +73,16 @@ class JeolMicroscope(TemMicroscope):
         "rocking": 5,
     }
 
-    def __init__(self):
+    def __init__(self, settings: Optional[MicroscopeSettings] = None, logger_: Optional[logging.Logger] = None):
         if TEM3 is None:
             raise ImportError("PyJEM TEM3 is not available. Install PyJEM on the microscope control PC.")
+
+        if settings is None:
+            settings = MicroscopeSettings()
+        self.settings = settings
+        self._system_settings = settings.system
+        self._image_settings = settings.image
+        self.logger = logger_ or logging.getLogger(__name__)
 
         # TEM3 controllers
         self.apt = TEM3.Apt3()
@@ -90,19 +99,15 @@ class JeolMicroscope(TemMicroscope):
         # Cached "software state" for features TEM3 doesn't report back reliably
         self._selected_aperture: Optional[str] = None
         self._selected_detector: Optional[Any] = None
-        self._defocus_cache: "Quantity" = Q_(0, "nanometer")  # cached defocus (nm by default)
+        self._defocus_cache: Optional[Quantity] = Q_(0, "nanometer")  # cached defocus (nm by default)
         self._stigmation_cache: Tuple[float, float] = (0.0, 0.0)
-        self._image_settings: ImageSettings = ImageSettings()  # for camera integration later
-        self._log: List[str] = []
         self.aperture_dict = dict(CL1 = 0, CL2 = 1, OL_Upper = 2, Ol_Lower = 3, SA = 4, ENT = 5, HX = 6, BF = 7, AUX1 = 8, AUX2 = 9, AUX3 = 10, AUX4 = 11)
 
     def _log_event(self, msg: str) -> None:
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._log.append(f"[{stamp}] {msg}")
-
-    # -----------------------
-    # Connection
-    # -----------------------
+        try:
+            self.logger.info(msg)
+        except Exception:
+            pass
 
     def connect_to_microscope(self, ip_address: str = "0.0.0.0", port: int = 0, timeout_s: float = 5.0) -> None:
         try:
@@ -273,7 +278,7 @@ class JeolMicroscope(TemMicroscope):
             )
         return float(val)
 
-    def set_camera_length(self, camera_length: Quantity) -> None:
+    def set_camera_length(self, camera_length: Optional[Quantity]) -> None:
         """Set camera length for the current mode.
 
         - TEM:DIFF uses EOS selector (MagList contains lengths, e.g. cm/mm).
@@ -403,7 +408,7 @@ class JeolMicroscope(TemMicroscope):
         idx = self.select_aperture(kind=kind)
         self._log_event(f"Selected Aperture: {self._selected_aperture}")
         self.apt.SetExpSize(kind = idx, size = size)
-        print(f"Inserting {kind}")
+        self._log_event(f"Inserting {kind}")
         time.sleep(5)
         self._log_event(f"Aperture: {kind} -> {size}")
 
@@ -411,7 +416,7 @@ class JeolMicroscope(TemMicroscope):
         idx = self.select_aperture(kind=kind)
         self._log_event(f"Selected Aperture: {self._selected_aperture}")
         self.apt.SetExpSize(kind = idx, size = 0)
-        print(f"Retracting {kind}")
+        self._log_event(f"Retracting {kind}")
         time.sleep(5)
         self._log_event(f"Aperture: {kind} -> {0}")
 
@@ -462,16 +467,18 @@ class JeolMicroscope(TemMicroscope):
         return np.frombuffer(data, dtype=np.uint8)
 
     def acquire_image(self, settings: Optional[ImageSettings] = None) -> TemImage:
+        if settings is None:
+            settings = self._image_settings
         if self._selected_detector is None:
             raise RuntimeError("Detector is not selected (call select_detector first)")
+        detector_setting = TemDetectorSettings.from_dict(settings.to_dict())
+        self.set_detector_settings(settings=detector_setting)
         ext = (settings.file_format or "tif").lower().strip(".")
         if ext == 'tiff':
             ext = 'tif'
         raw = self._selected_detector.snapshot(ext, save=False, filename=None, show=False)
         arr = self._decode_image_bytes(raw, ext)
 
-        # Build metadata (keep it sparse + put the rest in 'extra')
-        stage = None
         try:
             stage = self.get_stage_position()
         except Exception:
@@ -483,7 +490,7 @@ class JeolMicroscope(TemMicroscope):
             time=datetime.now().time().isoformat(timespec="seconds"),
             magnification=self.get_magnification(),
             accelerating_voltage=magnitude(self.get_acceleration_voltage(), "kilovolt"),
-            emission_current=self.get_emission_current(),
+            emission_current=magnitude(self.get_emission_current(), "microampere"),
             dwell_time=magnitude(settings.dwell_us, "microsecond"),
             stage_x=magnitude(stage.x, "nanometer"),
             stage_y=magnitude(stage.y, "nanometer"),
@@ -491,7 +498,7 @@ class JeolMicroscope(TemMicroscope):
             extra={
                 "mode": self.get_mode(),
                 "detector": self._selected_detector.detectorname,
-                "imaging_area": (settings.width, settings.height, settings.x, settings.y),
+                "imaging_area": asdict(settings.roi),
                 "binning": settings.binning,
                 "exposure_ms": magnitude(settings.exposure_ms, "millisecond"),
             },
@@ -513,7 +520,7 @@ class JeolMicroscope(TemMicroscope):
         self._selected_detector.livestop()
         self._log_event(f"{self._selected_detector.detectorname} live-stopped")
 
-    def get_live_frame(self) -> bytes:
+    def get_live_frame(self) -> Optional[bytes]:
         if self._selected_detector is None:
             raise RuntimeError("Detector is not selected (call select_detector first)")
         try:
@@ -589,37 +596,37 @@ class JeolMicroscope(TemMicroscope):
 
         def exceed_tolerance(cur: TemStagePosition) -> Optional[TemStagePosition]:
             exceed = False
-            new_target = TemStagePosition()
+            new_tgt = TemStagePosition()
 
             tol_nm = magnitude(tolerance_length, "nanometer")
             tol_deg = magnitude(tolerance_angle, "degree")
 
             if pos.x is not None:
                 if abs(magnitude(pos.x, "nanometer") - magnitude(cur.x, "nanometer")) > tol_nm:
-                    new_target.x = pos.x
+                    new_tgt.x = pos.x
                     exceed = True
 
             if pos.y is not None:
                 if abs(magnitude(pos.y, "nanometer") - magnitude(cur.y, "nanometer")) > tol_nm:
-                    new_target.y = pos.y
+                    new_tgt.y = pos.y
                     exceed = True
 
             if pos.z is not None:
                 if abs(magnitude(pos.z, "nanometer") - magnitude(cur.z, "nanometer")) > tol_nm:
-                    new_target.z = pos.z
+                    new_tgt.z = pos.z
                     exceed = True
 
             if pos.tilt_x is not None:
                 if abs(magnitude(pos.tilt_x, "degree") - magnitude(cur.tilt_x, "degree")) > tol_deg:
-                    new_target.tilt_x = pos.tilt_x
+                    new_tgt.tilt_x = pos.tilt_x
                     exceed = True
 
             if pos.tilt_y is not None:
                 if abs(magnitude(pos.tilt_y, "degree") - magnitude(cur.tilt_y, "degree")) > tol_deg:
-                    new_target.tilt_y = pos.tilt_y
+                    new_tgt.tilt_y = pos.tilt_y
                     exceed = True
 
-            return new_target if exceed else None
+            return new_tgt if exceed else None
 
         if pos.x is not None:
             self.stage.SetX(float(magnitude(pos.x, "nanometer")))

@@ -1,7 +1,7 @@
 import copy
 from typing import Any, Dict, Optional, Tuple
 
-from supertem.structures.base import TemDetectorSettings, DetectorROI, DetectorCapabilities  # adjust import
+from supertem.structures.base import TemDetectorSettings, ROI, DetectorCapabilities  # adjust import
 
 JEOL_SETTING_KEYS = {
     "ImagingArea", "BinningSize",
@@ -38,10 +38,10 @@ def _to_float(v: Any) -> Optional[float]:
     except Exception:
         return None
 
-def _roi_from_dict(x: Any) -> Optional[DetectorROI]:
+def _roi_from_dict(x: Any) -> Optional[ROI]:
     if not isinstance(x, dict):
         return None
-    return DetectorROI(
+    return ROI(
         x=int(x.get("X", 0)),
         y=int(x.get("Y", 0)),
         width=int(x.get("Width", 0)),
