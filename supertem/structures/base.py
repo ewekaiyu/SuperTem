@@ -662,9 +662,9 @@ class TemImageMetadata:
         self.microscope_state = ms_parsed
 
         acq = self.acquisition
-        acq_parsed = MicroscopeState.from_dict_lenient(ms)
-        if acq_parsed is None and ms is not None:
-            self.extra["TemImageMetadata.acquisition_raw"] = repr(ms)
+        acq_parsed = MicroscopeState.from_dict_lenient(acq)
+        if acq_parsed is None and acq is not None:
+            self.extra["TemImageMetadata.acquisition_raw"] = repr(acq)
         self.acquisition = acq_parsed
 
         self.extra = normalize_extra(self.extra)
@@ -2512,10 +2512,13 @@ class TemImage:
     """
 
     def __init__(self, data: np.ndarray, metadata: Optional[TemImageMetadata] = None):
+        if data.ndim == 3 and data.shape[0] == 1:
+            data = data[0]
+        if data.ndim == 3 and data.shape[-1] == 1:
+            data = data[..., 0]
+
         if not _check_data_format(data):
             raise ValueError("Invalid data format for TemImage.")
-        if data.ndim == 3 and data.shape[2] == 1:
-            data = data[:, :, 0]
         self.data = data
         if isinstance(metadata, dict):
             metadata = TemImageMetadata.from_dict(metadata)
