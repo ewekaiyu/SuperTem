@@ -1,3 +1,49 @@
+# =============================================================================
+# Serialization, Normalization, and Validation Rules (Reference)
+#
+# This module follows a two-stage lifecycle for converting between dictionaries
+# (JSON-compatible payloads) and dataclass instances.
+#
+# 1) Deserialization: dict -> dataclass
+#    a) Class.from_dict(d) is the primary entry point for external inputs.
+#       - Initializes and populates Extras via collect_extra(...).
+#       - Parses fields using parse_optional_* helpers.
+#       - Preserves unrecognized keys under extra.unknown for forward compatibility.
+#       - Preserves unparsed/invalid original values under extra.raw where applicable.
+#       - Constructs the dataclass instance: Class(..., extra=extra).
+#
+#    b) __post_init__ executes automatically after construction.
+#       - Performs internal normalization (e.g., coercions, nested conversions).
+#       - Enforces invariants and cross-field consistency rules.
+#       - Strictness is role-dependent:
+#           * Control / command objects (settings, requests) may be strict and raise on
+#             invalid values to avoid unsafe automation behavior.
+#           * State / metadata objects should be resilient, avoid raising when possible,
+#             and record irregularities in extra.raw and/or extra.notes.
+#
+#    c) from_dict_lenient(...) is provided for ingestion paths that must not fail hard
+#       (typically metadata/state). It degrades gracefully (e.g., returns None) instead
+#       of propagating exceptions.
+#
+# 2) Serialization: dataclass -> dict
+#    a) obj.to_dict() is the canonical serializer.
+#       - Emits schema fields and serializes nested dataclasses recursively.
+#       - add_extra_if_any(out, obj.extra) includes "extra" only when non-empty.
+#       - drop_none_keys(out) removes keys with None values to keep payloads minimal.
+#
+# Extras policy:
+#   - extra.unknown: schema-unknown keys preserved for compatibility and debugging.
+#   - extra.vendor: vendor-specific structured extensions.
+#   - extra.raw: original values retained when parsing/normalization cannot be applied.
+#   - extra.notes: non-fatal warnings and normalization breadcrumbs.
+#
+# Summary:
+#   from_dict    : parse external payloads and collect extras
+#   __post_init__: normalize and validate (strict for control, resilient for metadata)
+#   to_dict      : emit clean JSON-compatible output (drop None, include extras if needed)
+# =============================================================================
+
+
 import datetime
 import json
 import os
@@ -5,13 +51,15 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple, Union, Iterable, Set
-from pint import UnitRegistry
 import numpy as np
 from PIL import Image
 
 import tifffile as tff
 
-from supertem.config import METADATA_VERSION
+try:
+    from supertem.config import METADATA_VERSION  # type: ignore
+except Exception:
+    METADATA_VERSION = "1"
 
 from importlib.metadata import version, PackageNotFoundError
 
@@ -23,6 +71,16 @@ except PackageNotFoundError:
     except PackageNotFoundError:
         __version__ = "unknown"
 
+# -----------------------
+# Quantity
+# -----------------------
+
+try:
+    from pint import UnitRegistry
+except ImportError as e:
+    raise ImportError(
+        "Dependency missing: 'pint' is required. Install it with `pip install pint`."
+    ) from e
 
 ureg = UnitRegistry()
 Q_ = ureg.Quantity
@@ -32,7 +90,6 @@ try:  # Pint >= 0.20 often exposes Quantity at top-level
     from pint import Quantity  # type: ignore
 except Exception:  # pragma: no cover
     from pint.facets.plain.quantity import Quantity  # type: ignore
-
 
 def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
     """Coerce `value` into a Pint Quantity using the project registry, in `unit`.
@@ -109,38 +166,225 @@ def _check_data_format(data: np.ndarray) -> bool:
         return False
     return (data.dtype.kind == "u") and (data.dtype.itemsize in (1, 2))
 
-def collect_extra(d: Optional[Dict[str, Any]], known: Iterable[str]) -> Dict[str, Any]:
+# -----------------------
+# Extras
+# -----------------------
+
+@dataclass
+class Extras:
+    """Structured extras bucket.
+
+    - vendor: vendor-specific extension payloads (namespaced by vendor key)
+    - unknown: unknown top-level keys swept during from_dict (forward compatibility)
+    - raw: raw/unparsed values for known fields
+    - notes: non-fatal validation / normalization notes
     """
-    Start from d.get("extra", {}), then sweep *all* unknown top-level keys into extra.
-    This makes from_dict forward-compatible and prevents silent drops.
+
+    vendor: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    unknown: Dict[str, Any] = field(default_factory=dict)
+    raw: Dict[str, Any] = field(default_factory=dict)
+    notes: Dict[str, Any] = field(default_factory=dict)
+
+    def is_empty(self) -> bool:
+        return not (self.vendor or self.unknown or self.raw or self.notes)
+
+    def to_native_dict(self) -> Dict[str, Any]:
+        """Return a deep-copied native-python representation.
+
+        Note: this may include non-JSON-serializable objects. Use `to_dict()`
+        when you need a JSON-safe payload.
+        """
+        out: Dict[str, Any] = {}
+        if self.vendor:
+            out["vendor"] = deepcopy(self.vendor)
+        if self.unknown:
+            out["unknown"] = deepcopy(self.unknown)
+        if self.raw:
+            out["raw"] = deepcopy(self.raw)
+        if self.notes:
+            out["notes"] = deepcopy(self.notes)
+        return out
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-safe payload representation."""
+        return _jsonable(self.to_native_dict())
+
+    @staticmethod
+    def from_any(value: Any, *, owner: str = "unknown") -> "Extras":
+        if value is None:
+            return Extras()
+        if isinstance(value, Extras):
+            return value
+        if isinstance(value, dict):
+            # New (bucketed) format
+            ex = Extras()
+            if any(k in value for k in ("vendor", "unknown", "raw", "notes")):
+
+                v = value.get("vendor", {})
+                if isinstance(v, dict):
+                    # enforce vendor namespace -> dict
+                    for vend, payload in v.items():
+                        if isinstance(payload, dict):
+                            ex.vendor[str(vend)] = deepcopy(payload)
+                        else:
+                            ex.vendor[str(vend)] = {"_value": deepcopy(payload)}
+                elif v is not None:
+                    ex.raw[f"{owner}.extra.vendor"] = deepcopy(v)
+
+                u = value.get("unknown", {})
+                if isinstance(u, dict):
+                    ex.unknown = deepcopy(u)
+                elif u is not None:
+                    ex.raw[f"{owner}.extra.unknown"] = deepcopy(u)
+
+                r = value.get("raw", {})
+                if isinstance(r, dict):
+                    ex.raw.update(deepcopy(r))
+                elif r is not None:
+                    ex.raw[f"{owner}.extra.raw"] = deepcopy(r)
+
+                n = value.get("notes", {})
+                if isinstance(n, dict):
+                    ex.notes = deepcopy(n)
+                elif n is not None:
+                    ex.raw[f"{owner}.extra.notes"] = deepcopy(n)
+
+                return ex
+            else:
+                # treat as legacy/flat extras
+                try:
+                    ex.unknown = deepcopy(value)
+                except Exception:
+                    ex.raw[f"{owner}.extra"] = repr(value)
+                return ex
+
+        # Totally unexpected: keep something rather than crash
+        ex = Extras()
+        ex.raw[f"{owner}.extra"] = repr(value)
+        return ex
+
+def _extra_put_raw(extra: Any, key: str, value: Any) -> None:
+    if extra is None:
+        return
+    if isinstance(extra, Extras):
+        extra.raw[key] = value
+        return
+    if isinstance(extra, dict):
+        extra[f"{key}_raw"] = value
+
+def _extra_put_note(extra: Any, key: str, value: Any) -> None:
+    if extra is None:
+        return
+    if isinstance(extra, Extras):
+        extra.notes[key] = value
+        return
+    if isinstance(extra, dict):
+        extra[key] = value
+
+def _extra_put_unknown(extra: Any, key: str, value: Any) -> None:
+    if extra is None:
+        return
+    if isinstance(extra, Extras):
+        extra.unknown[key] = value
+        return
+    if isinstance(extra, dict):
+        extra[key] = value
+
+def collect_extra(d: Optional[Dict[str, Any]], known: Iterable[str], *, owner: str = "unknown") -> Extras:
+    """
+    Start from d.get("extra", {}), then sweep *all* unknown top-level keys into extra.unknown.
+
+    - Preserves raw parse failures under extra.raw
+    - Keeps forward compatibility by not dropping unknown keys.
     """
     if not isinstance(d, dict):
-        return {}
+        return Extras()
 
     known_set: Set[str] = set(known)
 
-    base = d.get("extra", {})
-    extra: Dict[str, Any] = deepcopy(base) if isinstance(base, dict) else {}
+    ex = normalize_extra_lenient(d.get("extra", None), owner)
 
     for k, v in d.items():
         if k == "extra":
             continue
         if k not in known_set:
-            extra[k] = v
-    extra = {k: v for k, v in extra.items() if v is not None}
+            try:
+                ex.unknown[str(k)] = deepcopy(v)
+            except Exception:
+                ex.unknown[str(k)] = repr(v)
 
-    return extra
+    return ex
 
-def add_extra_if_any(out: Dict[str, Any], extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if isinstance(extra, dict):
-        cleaned = {k: v for k, v in extra.items() if v is not None}
-        if cleaned:
-            out["extra"] = deepcopy(cleaned)
+def add_extra_if_any(out: Dict[str, Any], extra: Any) -> Dict[str, Any]:
+    if extra is None:
+        return out
+
+    if isinstance(extra, Extras):
+        payload = extra.to_dict()
+    else:
+        payload = Extras.from_any(extra).to_dict()
+
+    # Remove empty buckets
+    payload = {k: v for k, v in payload.items() if v}
+
+    if payload:
+        out["extra"] = payload
     return out
 
 def drop_none_keys(out: Dict[str, Any]) -> Dict[str, Any]:
     """Return a shallow copy of out with any keys whose value is None removed."""
     return {k: v for k, v in out.items() if v is not None}
+
+def normalize_extra(extra: Any) -> Extras:
+    if extra is None:
+        return Extras()
+    if isinstance(extra, Extras):
+        return extra
+    if isinstance(extra, dict):
+        return Extras.from_any(extra)
+    raise TypeError(f"extra must be Extras, dict, or None, got {type(extra)}")
+
+def normalize_extra_lenient(extra: Any, owner: str) -> Extras:
+    try:
+        return normalize_extra(extra)
+    except Exception:
+        ex = Extras()
+        ex.raw[f"{owner}.extra"] = repr(extra)
+        return ex
+
+def _deep_merge_dict_inplace(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge src into dst (dict-to-dict only).
+
+    - If both dst[k] and src[k] are dicts, merge recursively.
+    - Otherwise, src overwrites dst (deepcopied).
+    """
+    for k, v in src.items():
+        if k in dst and isinstance(dst.get(k), dict) and isinstance(v, dict):
+            _deep_merge_dict_inplace(dst[k], v)  # type: ignore[arg-type]
+        else:
+            dst[k] = deepcopy(v)
+    return dst
+
+def merge_extras(dst: Extras, src: Any, *, owner: str) -> Extras:
+    s = Extras.from_any(src, owner=owner)
+
+    # vendor: deep-merge per vendor namespace to avoid clobbering nested payloads
+    for vend, payload in s.vendor.items():
+        if vend in dst.vendor and isinstance(dst.vendor.get(vend), dict) and isinstance(payload, dict):
+            _deep_merge_dict_inplace(dst.vendor[vend], payload)
+        else:
+            # Extras.from_any enforces payload is a dict (or wraps it as {"_value": ...})
+            dst.vendor[vend] = deepcopy(payload)
+
+    # other buckets are flat
+    dst.unknown.update(deepcopy(s.unknown))
+    dst.raw.update(deepcopy(s.raw))
+    dst.notes.update(deepcopy(s.notes))
+    return dst
+
+# -----------------------
+# Parsers
+# -----------------------
 
 def parse_bool(value: Any, default: bool = False, *, strict: bool = False) -> bool:
     """Parse booleans robustly (handles YAML/CLI strings like 'false', '0', 'no')."""
@@ -168,14 +412,14 @@ def parse_bool(value: Any, default: bool = False, *, strict: bool = False) -> bo
         raise TypeError(f"Invalid boolean type: {type(value)}")
     return bool(value)
 
-def parse_optional_int_like(value: Any, *, name: str, strict: bool = False, extra: Optional[Dict[str, Any]] = None) -> Optional[int]:
+def parse_optional_int_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[int]:
     if value is None:
         return None
 
     # bool is a subclass of int -> reject it
     if isinstance(value, bool):
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         if strict:
             raise TypeError(f"{name} must be int-like, got bool")
         return None
@@ -206,12 +450,12 @@ def parse_optional_int_like(value: Any, *, name: str, strict: bool = False, extr
 
     except Exception:
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         if strict:
             raise
         return None
 
-def parse_optional_float_like(value: Any, *, name: str, strict: bool = False, extra: Optional[Dict[str, Any]] = None) -> Optional[float]:
+def parse_optional_float_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[float]:
     """Parse an optional float from int/float/np scalar or numeric string.
 
     If strict=False, returns None on invalid input and (optionally) stores the raw value in extra.
@@ -223,7 +467,7 @@ def parse_optional_float_like(value: Any, *, name: str, strict: bool = False, ex
     # bool is a subclass of int -> reject it
     if isinstance(value, bool):
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         if strict:
             raise TypeError(f"{name} must be float-like, got bool")
         return None
@@ -242,12 +486,12 @@ def parse_optional_float_like(value: Any, *, name: str, strict: bool = False, ex
 
     except Exception:
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         if strict:
             raise
         return None
 
-def parse_optional_bool_like(value: Any, *, name: str, strict: bool = False, extra: Optional[Dict[str, Any]] = None) -> Optional[bool]:
+def parse_optional_bool_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[bool]:
     if value is None:
         return None
     if isinstance(value, str) and value.strip() == "":
@@ -256,12 +500,12 @@ def parse_optional_bool_like(value: Any, *, name: str, strict: bool = False, ext
         return parse_bool(value, default=False, strict=True)
     except Exception:
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         if strict:
             raise
         return None
 
-def parse_optional_str_like(value: Any, *, name: str, strict: bool = False, extra: Optional[Dict[str, Any]] = None) -> Optional[str]:
+def parse_optional_str_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[str]:
     if value is None:
         return None
 
@@ -272,13 +516,13 @@ def parse_optional_str_like(value: Any, *, name: str, strict: bool = False, extr
     # If strict, non-str is an error. Capture raw only on error.
     if strict:
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         raise TypeError(f"{name} must be str-like, got {type(value)}")
 
     # Be consistent with your int/float parsers: bool is suspicious.
     if isinstance(value, bool):
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         return None
 
     # Non-str input: coerce without polluting extra unless it fails.
@@ -286,12 +530,12 @@ def parse_optional_str_like(value: Any, *, name: str, strict: bool = False, extr
         s = str(value).strip()
     except Exception:
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         return None
 
     return s or None
 
-def parse_optional_pair_int_like(value: Any, *, name: str, sort: bool = False, strict: bool = False, extra: Optional[Dict[str, Any]] = None) -> Optional[Tuple[int, int]]:
+def parse_optional_pair_int_like(value: Any, *, name: str, sort: bool = False, strict: bool = False, extra: Any = None) -> Optional[Tuple[int, int]]:
     """Parse an optional 2-tuple of int-like values (keeps order unless sort=True)."""
     if value is None:
         return None
@@ -310,12 +554,12 @@ def parse_optional_pair_int_like(value: Any, *, name: str, sort: bool = False, s
 
     except Exception:
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         if strict:
             raise
         return None
 
-def parse_optional_pair_float_like(value: Any, *, name: str, sort: bool = False, strict: bool = False, extra: Optional[Dict[str, Any]] = None,) -> Optional[Tuple[float, float]]:
+def parse_optional_pair_float_like(value: Any, *, name: str, sort: bool = False, strict: bool = False, extra: Any = None,) -> Optional[Tuple[float, float]]:
     """Parse an optional 2-tuple of float-like values (keeps order unless sort=True)."""
     if value is None:
         return None
@@ -334,26 +578,45 @@ def parse_optional_pair_float_like(value: Any, *, name: str, sort: bool = False,
 
     except Exception:
         if extra is not None:
-            extra[f"{name}_raw"] = value
+            _extra_put_raw(extra, name, value)
         if strict:
             raise
         return None
 
-def normalize_extra(extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if extra is None:
-        return {}
-    if not isinstance(extra, dict):
-        raise TypeError(f"extra must be dict or None, got {type(extra)}")
-    return {k: v for k, v in extra.items() if v is not None}
+def parse_optional_id_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[str]:
+    """
+    Like parse_optional_str_like, but records empty-string inputs into extra.raw/notes.
+    Intended for identifiers (detector_id, primary_detector_id, default_detector_id, etc.).
+    """
+    if value is None:
+        return None
 
-def normalize_extra_lenient(extra: Any, owner: str) -> Dict[str, Any]:
-    try:
-        return normalize_extra(extra)  # strict function
-    except Exception:
-        out: Dict[str, Any] = {}
+    if isinstance(value, str) and value.strip() == "":
         if extra is not None:
-            out[f"{owner}.extra_raw"] = repr(extra)
-        return out
+            _extra_put_raw(extra, name, value)
+            # optional breadcrumb (keeps raw for exact value, note for intent)
+            try:
+                extra.notes.setdefault("empty_id_fields", []).append(name)
+            except Exception:
+                pass
+        return None
+
+    return parse_optional_str_like(value, name=name, strict=strict, extra=extra)
+
+def _maybe_point(v: Any, *, extra: Any = None, name: str = "point") -> Optional["Point"]:
+    if v is None:
+        return None
+    if isinstance(v, Point):
+        return v
+    if isinstance(v, (dict, list, tuple)):
+        return Point.from_dict(v)
+    if extra is not None:
+        _extra_put_raw(extra, name, v)
+    return None
+
+# -----------------------
+# Helpers
+# -----------------------
 
 def _jsonable(obj: Any) -> Any:
     # primitives
@@ -394,16 +657,7 @@ def _jsonable(obj: Any) -> Any:
     # fallback: stringify (better than crashing or losing everything)
     return str(obj)
 
-def _maybe_point(v: Any, *, extra: Optional[Dict[str, Any]] = None, name: str = "point") -> Optional["Point"]:
-    if v is None:
-        return None
-    if isinstance(v, Point):
-        return v
-    if isinstance(v, (dict, list, tuple)):
-        return Point.from_dict(v)
-    if extra is not None:
-        extra[f"{name}_raw"] = v
-    return None
+
 
 
 @dataclass
@@ -423,7 +677,7 @@ class Point:
         self.name = parse_optional_str_like(self.name, name="Point.name", strict=False)
 
     def to_dict(self) -> dict:
-        return drop_none_keys({"x": self.x, "y": self.y, "z": self.z, "name": self.name})
+        return _jsonable(drop_none_keys({"x": self.x, "y": self.y, "z": self.z, "name": self.name}))
 
     @staticmethod
     def from_dict(d: Any) -> "Point":
@@ -457,8 +711,8 @@ class Point:
 class ROI:
     x: int = 0
     y: int = 0
-    width: int = 0
-    height: int = 0
+    width: int = 512
+    height: int = 512
 
     def __post_init__(self):
         ix = parse_optional_int_like(self.x, name="ROI.x", strict=True)
@@ -467,39 +721,33 @@ class ROI:
         ih = parse_optional_int_like(self.height, name="ROI.height", strict=True)
         self.x = 0 if ix is None else int(ix)
         self.y = 0 if iy is None else int(iy)
-        self.width = 0 if iw is None else int(iw)
-        self.height = 0 if ih is None else int(ih)
+        self.width = 512 if iw is None else int(iw)
+        self.height = 512 if ih is None else int(ih)
 
         if self.x < 0 or self.y < 0:
             raise ValueError(f"ROI x/y must be >= 0, got x={self.x}, y={self.y}")
-        if self.width < 0 or self.height < 0:
-            raise ValueError(f"ROI width/height must be >= 0, got w={self.width}, h={self.height}")
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(f"ROI width/height must be > 0, got w={self.width}, h={self.height}")
 
     def to_dict(self) -> dict:
-        return drop_none_keys({"x": self.x, "y": self.y, "width": self.width, "height": self.height})
+        return _jsonable(drop_none_keys({"x": self.x, "y": self.y, "width": self.width, "height": self.height}))
 
     @staticmethod
     def from_dict(d: Any) -> "ROI":
         if isinstance(d, ROI):
             return d
-        try:
-            if isinstance(d, (list, tuple)) and len(d) == 4:
-                return ROI(x=d[0], y=d[1], width=d[2], height=d[3])
-            if not isinstance(d, dict):
-                return ROI()
-
-            def _i(v: Any, default: int = 0) -> int:
-                out = parse_optional_int_like(v, name="ROI", strict=False)
-                return default if out is None else int(out)
-
-            return ROI(
-                x=_i(d.get("x", 0)),
-                y=_i(d.get("y", 0)),
-                width=_i(d.get("width", d.get("w", 0))),
-                height=_i(d.get("height", d.get("h", 0))),
-            )
-        except Exception:
-            return ROI()
+        if isinstance(d, (list, tuple)):
+            if len(d) != 4:
+                raise ValueError(f"ROI list/tuple must have len 4, got {len(d)}")
+            return ROI(x=d[0], y=d[1], width=d[2], height=d[3])
+        if not isinstance(d, dict):
+            raise TypeError(f"ROI must be dict/list/tuple/ROI, got {type(d)}")
+        return ROI(
+            x=d.get("x", 0),
+            y = d.get("y", 0),
+            width = d.get("width", d.get("w", 512)),
+            height = d.get("height", d.get("h", 512)),
+        )
 
 @dataclass
 class TemImageMetadata:
@@ -543,7 +791,7 @@ class TemImageMetadata:
     acquisition: Optional["AcquisitionRequest"] = None
 
     # ---- Vendor-specific or unknown stuff ----
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
         # ---- extra: be lenient here (metadata should not brick loading) ----
@@ -566,29 +814,37 @@ class TemImageMetadata:
 
         if isinstance(raw_created, (int, float)) and not isinstance(raw_created, bool):
             try:
-                created_iso = datetime.datetime.fromtimestamp(
-                    float(raw_created), tz=datetime.timezone.utc
-                ).isoformat()
+                ts = float(raw_created)
+                if np.isfinite(ts):
+                    created_iso = datetime.datetime.fromtimestamp(
+                        ts, tz=datetime.timezone.utc
+                    ).isoformat()
+                else:
+                    self.extra.raw["TemImageMetadata.created_at"] = raw_created
+                    created_iso = None
             except Exception:
-                self.extra["TemImageMetadata.created_at_raw"] = raw_created
+                self.extra.raw["TemImageMetadata.created_at"] = raw_created
+                created_iso = None
         else:
-            s = parse_optional_str_like(
-                raw_created, name="TemImageMetadata.created_at", strict=False, extra=self.extra
-            )
+            s = parse_optional_str_like(raw_created, name="TemImageMetadata.created_at", strict=False, extra=self.extra)
             if s is not None:
                 ss = s.strip()
-                # numeric string (supports e.g. "1700000000", "1700000000.5", "1e9")
+                # ISO first
                 try:
-                    ts = float(ss)
-                    if np.isfinite(ts):
-                        created_iso = datetime.datetime.fromtimestamp(
-                            ts, tz=datetime.timezone.utc
-                        ).isoformat()
-                    else:
-                        self.extra["TemImageMetadata.created_at_raw"] = ss
-                        created_iso = None
+                    dt = datetime.datetime.fromisoformat(ss.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=datetime.timezone.utc)
+                    created_iso = dt.astimezone(datetime.timezone.utc).isoformat()
                 except Exception:
-                    created_iso = ss
+                    # numeric string
+                    try:
+                        ts = float(ss)
+                        if np.isfinite(ts):
+                            created_iso = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).isoformat()
+                        else:
+                            self.extra.raw["TemImageMetadata.created_at"] = ss
+                    except Exception:
+                        self.extra.raw["TemImageMetadata.created_at"] = ss
 
         if not created_iso:
             created_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -609,7 +865,7 @@ class TemImageMetadata:
 
         # ---- imaging summary ----
         self.mode = parse_optional_str_like(self.mode, name="TemImageMetadata.mode", strict=False, extra=self.extra)
-        self.detector_id = parse_optional_str_like(self.detector_id, name="TemImageMetadata.detector_id", strict=False,
+        self.detector_id = parse_optional_id_like(self.detector_id, name="TemImageMetadata.detector_id", strict=False,
                                                    extra=self.extra)
         self.detector_name = parse_optional_str_like(self.detector_name, name="TemImageMetadata.detector_name",
                                                      strict=False, extra=self.extra)
@@ -658,16 +914,14 @@ class TemImageMetadata:
         ms = self.microscope_state
         ms_parsed = MicroscopeState.from_dict_lenient(ms)
         if ms_parsed is None and ms is not None:
-            self.extra["TemImageMetadata.microscope_state_raw"] = repr(ms)
+            self.extra.raw["TemImageMetadata.microscope_state"] = repr(ms)
         self.microscope_state = ms_parsed
 
         acq = self.acquisition
-        acq_parsed = MicroscopeState.from_dict_lenient(acq)
+        acq_parsed = AcquisitionRequest.from_dict_lenient(acq)
         if acq_parsed is None and acq is not None:
-            self.extra["TemImageMetadata.acquisition_raw"] = repr(acq)
+            self.extra.raw["TemImageMetadata.acquisition"] = repr(acq)
         self.acquisition = acq_parsed
-
-        self.extra = normalize_extra(self.extra)
 
     def to_dict(self) -> dict:
         d: Dict[str, Any] = {
@@ -700,7 +954,7 @@ class TemImageMetadata:
             d["acquisition"] = self.acquisition.to_dict()
 
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(d: Any) -> "TemImageMetadata":
@@ -747,13 +1001,15 @@ class TemImageMetadata:
             # extras
             "extra",
         }
-        extra = collect_extra(d, known)
+        extra = collect_extra(d, known, owner="TemImageMetadata")
 
         def _default_created_at() -> str:
             return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         def _opt_str(val: Any, name: str) -> Optional[str]:
-            return parse_optional_str_like(val, name=name, strict=False, extra=extra)
+            if name == "detector_id":
+                return parse_optional_id_like(val, name=f"TemImageMetadata.{name}", strict=False, extra=extra)
+            return parse_optional_str_like(val, name=f"TemImageMetadata.{name}", strict=False, extra=extra)
 
         # version: keep as str (METADATA_VERSION is your canonical default)
         version_raw = d.get("version", d.get("metadata_version", METADATA_VERSION))
@@ -768,10 +1024,10 @@ class TemImageMetadata:
                 if np.isfinite(ts):
                     created_at = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).isoformat()
                 else:
-                    extra["TemImageMetadata.created_at_raw"] = created_raw
+                    extra.raw["TemImageMetadata.created_at"] = created_raw
                     created_at = _default_created_at()
             except Exception:
-                extra["TemImageMetadata.created_at_raw"] = created_raw
+                extra.raw["TemImageMetadata.created_at"] = created_raw
                 created_at = _default_created_at()
         else:
             # let __post_init__ deal with numeric strings like "1e9"
@@ -790,57 +1046,57 @@ class TemImageMetadata:
         detector_id = _opt_str(d.get("detector_id", None), "detector_id")
         detector_name = _opt_str(d.get("detector_name", None), "detector_name")
 
-        magnification = parse_optional_float_like(d.get("magnification", None), name="magnification", strict=False, extra=extra)
+        magnification = parse_optional_float_like(d.get("magnification", None), name="TemImageMetadata.magnification", strict=False, extra=extra)
         camera_length_mm = parse_optional_float_like(
             d.get("camera_length_mm", d.get("camera_length", None)),
-            name="camera_length_mm",
+            name="TemImageMetadata.camera_length_mm",
             strict=False,
             extra=extra,
         )
 
         accelerating_voltage_kv = parse_optional_float_like(
             d.get("accelerating_voltage_kv", d.get("accelerating_voltage", None)),
-            name="accelerating_voltage_kv",
+            name="TemImageMetadata.accelerating_voltage_kv",
             strict=False,
             extra=extra,
         )
         beam_current_na = parse_optional_float_like(
             d.get("beam_current_na", d.get("beam_current", None)),
-            name="beam_current_na",
+            name="TemImageMetadata.beam_current_na",
             strict=False,
             extra=extra,
         )
-        exposure_ms = parse_optional_float_like(d.get("exposure_ms", None), name="exposure_ms", strict=False, extra=extra)
+        exposure_ms = parse_optional_float_like(d.get("exposure_ms", None), name="TemImageMetadata.exposure_ms", strict=False, extra=extra)
         dwell_time_us = parse_optional_float_like(
             d.get("dwell_time_us", d.get("dwell_time", None)),
-            name="dwell_time_us",
+            name="TemImageMetadata.dwell_time_us",
             strict=False,
             extra=extra,
         )
         working_distance_mm = parse_optional_float_like(
             d.get("working_distance_mm", d.get("working_distance", None)),
-            name="working_distance_mm",
+            name="TemImageMetadata.working_distance_mm",
             strict=False,
             extra=extra,
         )
 
         pixel_size_nm = parse_optional_pair_float_like(
-            d.get("pixel_size_nm", None), name="pixel_size_nm", sort=False, strict=False, extra=extra
+            d.get("pixel_size_nm", None), name="TemImageMetadata.pixel_size_nm", sort=False, strict=False, extra=extra
         )
         image_size_px = parse_optional_pair_int_like(
-            d.get("image_size_px", None), name="image_size_px", sort=False, strict=False, extra=extra
+            d.get("image_size_px", None), name="TemImageMetadata.image_size_px", sort=False, strict=False, extra=extra
         )
 
         # nested objects
         ms_raw = d.get("microscope_state", None)
         microscope_state = MicroscopeState.from_dict_lenient(ms_raw)
         if microscope_state  is None and ms_raw is not None:
-            extra["TemImageMetadata.microscope_state_raw"] = repr(ms_raw)
+            extra.raw["TemImageMetadata.microscope_state"] = repr(ms_raw)
 
         acq_raw = d.get("acquisition", None)
         acquisition = AcquisitionRequest.from_dict_lenient(acq_raw)
         if acquisition is None and acq_raw is not None:
-            extra["TemImageMetadata.acquisition_raw"] = repr(acq_raw)
+            extra.raw["TemImageMetadata.acquisition"] = repr(acq_raw)
 
         return TemImageMetadata(
             version=version,
@@ -914,7 +1170,7 @@ class TemStagePosition:
             "tilt_y": magnitude(self.tilt_y, "degree"),
             "coordinate_system": self.coordinate_system,
         }
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(d: Any) -> "TemStagePosition":
@@ -1013,7 +1269,6 @@ class TemStagePosition:
                 and close_axis(self.tilt_y, other.tilt_y, "degree", tol_deg)
         )
 
-
 @dataclass
 class StageSystemSettings:
     """Stage system configuration for safe TEM automation.
@@ -1052,7 +1307,7 @@ class StageSystemSettings:
     eucentric_z_nm: Optional[float] = None
 
     # Everything vendor-specific goes here instead of polluting the core schema
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
         self.enabled = parse_bool(self.enabled, default=True)
@@ -1064,27 +1319,27 @@ class StageSystemSettings:
         self.can_tilt_y = parse_bool(self.can_tilt_y, default=False)
 
         # Use your robust pair parser (rejects bool, enforces length==2)
-        self.x_limits_nm = parse_optional_pair_float_like(self.x_limits_nm, name="x_limits_nm", sort=True, strict=True)
-        self.y_limits_nm = parse_optional_pair_float_like(self.y_limits_nm, name="y_limits_nm", sort=True, strict=True)
-        self.z_limits_nm = parse_optional_pair_float_like(self.z_limits_nm, name="z_limits_nm", sort=True, strict=True)
-        self.r_limits_deg = parse_optional_pair_float_like(self.r_limits_deg, name="r_limits_deg", sort=True,
+        self.x_limits_nm = parse_optional_pair_float_like(self.x_limits_nm, name="StageSystemSettings.x_limits_nm", sort=True, strict=True)
+        self.y_limits_nm = parse_optional_pair_float_like(self.y_limits_nm, name="StageSystemSettings.y_limits_nm", sort=True, strict=True)
+        self.z_limits_nm = parse_optional_pair_float_like(self.z_limits_nm, name="StageSystemSettings.z_limits_nm", sort=True, strict=True)
+        self.r_limits_deg = parse_optional_pair_float_like(self.r_limits_deg, name="StageSystemSettings.r_limits_deg", sort=True,
                                                            strict=True)
-        self.tilt_x_limits_deg = parse_optional_pair_float_like(self.tilt_x_limits_deg, name="tilt_x_limits_deg",
+        self.tilt_x_limits_deg = parse_optional_pair_float_like(self.tilt_x_limits_deg, name="StageSystemSettings.tilt_x_limits_deg",
                                                                 sort=True, strict=True)
-        self.tilt_y_limits_deg = parse_optional_pair_float_like(self.tilt_y_limits_deg, name="tilt_y_limits_deg",
+        self.tilt_y_limits_deg = parse_optional_pair_float_like(self.tilt_y_limits_deg, name="StageSystemSettings.tilt_y_limits_deg",
                                                                 sort=True, strict=True)
 
         # Floats: reject bool, allow numeric strings, keep defaults if None
-        v = parse_optional_float_like(self.max_step_nm, name="max_step_nm", strict=True)
+        v = parse_optional_float_like(self.max_step_nm, name="StageSystemSettings.max_step_nm", strict=True)
         self.max_step_nm = 50000.0 if v is None else v
 
-        v = parse_optional_float_like(self.max_step_deg, name="max_step_deg", strict=True)
+        v = parse_optional_float_like(self.max_step_deg, name="StageSystemSettings.max_step_deg", strict=True)
         self.max_step_deg = 1.0 if v is None else v
 
-        v = parse_optional_float_like(self.settle_time_s, name="settle_time_s", strict=True)
+        v = parse_optional_float_like(self.settle_time_s, name="StageSystemSettings.settle_time_s", strict=True)
         self.settle_time_s = 0.2 if v is None else v
 
-        v = parse_optional_float_like(self.timeout_s, name="timeout_s", strict=True)
+        v = parse_optional_float_like(self.timeout_s, name="StageSystemSettings.timeout_s", strict=True)
         self.timeout_s = 10.0 if v is None else v
 
         if self.max_step_nm <= 0:
@@ -1096,7 +1351,7 @@ class StageSystemSettings:
         if self.timeout_s <= 0:
             raise ValueError(f"timeout_s must be > 0, got {self.timeout_s}")
 
-        self.eucentric_z_nm = parse_optional_float_like(self.eucentric_z_nm, name="eucentric_z_nm", strict=True)
+        self.eucentric_z_nm = parse_optional_float_like(self.eucentric_z_nm, name="StageSystemSettings.eucentric_z_nm", strict=True)
 
         self.extra = normalize_extra(self.extra)
 
@@ -1122,7 +1377,7 @@ class StageSystemSettings:
             "eucentric_z_nm": self.eucentric_z_nm,
         }
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(settings: Any) -> "StageSystemSettings":
@@ -1142,34 +1397,34 @@ class StageSystemSettings:
             "eucentric_height",
             "extra",
         }
-        extra = collect_extra(settings, known)
+        extra = collect_extra(settings, known, owner="StageSystemSettings")
 
         def _f_pos(key: str, default: float) -> float:
             raw = settings.get(key, None)
-            v = parse_optional_float_like(raw, name=key, strict=False, extra=extra)
+            v = parse_optional_float_like(raw, name=f"StageSystemSettings.{key}", strict=False, extra=extra)
             if v is None:
                 return default
             fv = float(v)
             if fv <= 0:
                 # avoid __post_init__ raising; treat as "not provided" and stash raw
-                extra[f"{key}_raw"] = raw
+                extra.raw[f"StageSystemSettings.{key}"] = raw
                 return default
             return fv
 
         def _f_nonneg(key: str, default: float) -> float:
             raw = settings.get(key, None)
-            v = parse_optional_float_like(raw, name=key, strict=False, extra=extra)
+            v = parse_optional_float_like(raw, name=f"StageSystemSettings.{key}", strict=False, extra=extra)
             if v is None:
                 return default
             fv = float(v)
             if fv < 0:
-                extra[f"{key}_raw"] = raw
+                extra.raw[f"StageSystemSettings.{key}"] = raw
                 return default
             return fv
 
         def _pair(key: str) -> Optional[Tuple[float, float]]:
             raw = settings.get(key, None)
-            return parse_optional_pair_float_like(raw, name=key, sort=True, strict=False, extra=extra)
+            return parse_optional_pair_float_like(raw, name=f"StageSystemSettings.{key}", sort=True, strict=False, extra=extra)
 
         x_limits_nm = _pair("x_limits_nm")
         y_limits_nm = _pair("y_limits_nm")
@@ -1184,7 +1439,7 @@ class StageSystemSettings:
         timeout_s = _f_pos("timeout_s", 10.0)
 
         euc_raw = settings.get("eucentric_z_nm", settings.get("eucentric_height", None))
-        eucentric_z_nm = parse_optional_float_like(euc_raw, name="eucentric_z_nm", strict=False, extra=extra)
+        eucentric_z_nm = parse_optional_float_like(euc_raw, name="StageSystemSettings.eucentric_z_nm", strict=False, extra=extra)
 
         return StageSystemSettings(
             enabled=parse_bool(settings.get("enabled"), default=True),
@@ -1234,19 +1489,20 @@ class BeamSettings:
     # For STEM scan coordinate systems (optional)
     scan_rotation_deg: Optional[float] = None
 
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
+        self.extra = normalize_extra(self.extra)
         # Numeric-ish inputs are accepted (e.g. "200", "200.0", numpy scalars).
         # Truly invalid values raise, because you don't want silent nonsense in automation.
-        self.voltage = parse_optional_float_like(self.voltage, name="voltage", strict=True)
-        self.beam_current = parse_optional_float_like(self.beam_current, name="beam_current", strict=True)
+        self.voltage = parse_optional_float_like(self.voltage, name="BeamSettings.voltage", strict=True)
+        self.beam_current = parse_optional_float_like(self.beam_current, name="BeamSettings.beam_current", strict=True)
         self.convergence_angle_mrad = parse_optional_float_like(
-            self.convergence_angle_mrad, name="convergence_angle_mrad", strict=True
+            self.convergence_angle_mrad, name="BeamSettings.convergence_angle_mrad", strict=True
         )
-        self.scan_rotation_deg = parse_optional_float_like(self.scan_rotation_deg, name="scan_rotation_deg", strict=True)
+        self.scan_rotation_deg = parse_optional_float_like(self.scan_rotation_deg, name="BeamSettings.scan_rotation_deg", strict=True)
 
-        self.spot_size = parse_optional_int_like(self.spot_size, name="spot_size", strict=True)
+        self.spot_size = parse_optional_int_like(self.spot_size, name="BeamSettings.spot_size", strict=True)
         if self.spot_size is not None and self.spot_size < 0:
             raise ValueError(f"spot_size must be >= 0, got {self.spot_size}")
 
@@ -1254,8 +1510,6 @@ class BeamSettings:
         self.stigmation = _maybe_point(self.stigmation, extra=self.extra, name="BeamSettings.stigmation")
         self.beam_shift = _maybe_point(self.beam_shift, extra=self.extra, name="BeamSettings.beam_shift")
         self.image_shift = _maybe_point(self.image_shift, extra=self.extra, name="BeamSettings.image_shift")
-
-        self.extra = normalize_extra(self.extra)
 
     def to_dict(self) -> dict:
         d = {
@@ -1269,7 +1523,7 @@ class BeamSettings:
             "scan_rotation_deg": float(self.scan_rotation_deg) if self.scan_rotation_deg is not None else None,
         }
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(settings: Any) -> "BeamSettings":
@@ -1287,7 +1541,7 @@ class BeamSettings:
             "scan_rotation_deg",
             "extra",
         }
-        extra = collect_extra(settings, known)
+        extra = collect_extra(settings, known, owner="BeamSettings")
 
         # Points
         stigmation = _maybe_point(settings.get("stigmation"), extra=extra, name="BeamSettings.stigmation")
@@ -1300,15 +1554,15 @@ class BeamSettings:
         conv_raw = settings.get("convergence_angle_mrad", settings.get("convergence_mrad", None))
         scan_rot_raw = settings.get("scan_rotation_deg", None)
 
-        voltage = parse_optional_float_like(voltage_raw, name="voltage", strict=False, extra=extra)
-        beam_current = parse_optional_float_like(current_raw, name="beam_current", strict=False, extra=extra)
-        convergence = parse_optional_float_like(conv_raw, name="convergence_angle_mrad", strict=False, extra=extra)
-        scan_rot = parse_optional_float_like(scan_rot_raw, name="scan_rotation_deg", strict=False, extra=extra)
+        voltage = parse_optional_float_like(voltage_raw, name="BeamSettings.voltage", strict=False, extra=extra)
+        beam_current = parse_optional_float_like(current_raw, name="BeamSettings.beam_current", strict=False, extra=extra)
+        convergence = parse_optional_float_like(conv_raw, name="BeamSettings.convergence_angle_mrad", strict=False, extra=extra)
+        scan_rot = parse_optional_float_like(scan_rot_raw, name="BeamSettings.scan_rotation_deg", strict=False, extra=extra)
 
         spot_raw = settings.get("spot_size", settings.get("spot", None))
-        spot = parse_optional_int_like(spot_raw, name="spot_size", strict=False, extra=extra)
+        spot = parse_optional_int_like(spot_raw, name="BeamSettings.spot_size", strict=False, extra=extra)
         if spot is not None and spot < 0:
-            extra["spot_size_raw"] = spot_raw
+            extra.raw["BeamSettings.spot_size"] = spot_raw
             spot = None
 
         return BeamSettings(
@@ -1342,7 +1596,7 @@ class BeamSystemSettings:
     spot_size_range: Optional[Tuple[int, int]] = None
     convergence_angle_range_mrad: Optional[Tuple[float, float]] = None
 
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
         self.enabled = parse_bool(self.enabled, default=True)
@@ -1354,16 +1608,16 @@ class BeamSystemSettings:
             raise TypeError(f"default_beam must be BeamSettings/dict, got {type(self.default_beam)}")
 
         self.voltage_range_kv = parse_optional_pair_float_like(
-            self.voltage_range_kv, name="voltage_range_kv", sort=True, strict=True
+            self.voltage_range_kv, name="BeamSystemSettings.voltage_range_kv", sort=True, strict=True
         )
         self.beam_current_range_na = parse_optional_pair_float_like(
-            self.beam_current_range_na, name="beam_current_range_na", sort=True, strict=True
+            self.beam_current_range_na, name="BeamSystemSettings.beam_current_range_na", sort=True, strict=True
         )
         self.convergence_angle_range_mrad = parse_optional_pair_float_like(
-            self.convergence_angle_range_mrad, name="convergence_angle_range_mrad", sort=True, strict=True
+            self.convergence_angle_range_mrad, name="BeamSystemSettings.convergence_angle_range_mrad", sort=True, strict=True
         )
         self.spot_size_range = parse_optional_pair_int_like(
-            self.spot_size_range, name="spot_size_range", sort=True, strict=True
+            self.spot_size_range, name="BeamSystemSettings.spot_size_range", sort=True, strict=True
         )
 
         self.extra = normalize_extra(self.extra)
@@ -1378,7 +1632,7 @@ class BeamSystemSettings:
             "convergence_angle_range_mrad": self.convergence_angle_range_mrad,
         }
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(settings: Any) -> "BeamSystemSettings":
@@ -1396,22 +1650,22 @@ class BeamSystemSettings:
             "convergence_angle_range_mrad",
             "extra",
         }
-        extra = collect_extra(settings, known)
+        extra = collect_extra(settings, known, owner="BeamSystemSettings")
 
         default_beam = BeamSettings.from_dict(settings.get("default_beam", None))
 
         voltage_raw = settings.get("voltage_range_kv", settings.get("voltage_limits_kv", None))
         voltage_range_kv = parse_optional_pair_float_like(
-            voltage_raw, name="voltage_range_kv", sort=True, strict=False, extra=extra
+            voltage_raw, name="BeamSystemSettings.voltage_range_kv", sort=True, strict=False, extra=extra
         )
         beam_current_range_na = parse_optional_pair_float_like(
-            settings.get("beam_current_range_na", None), name="beam_current_range_na", sort=True, strict=False, extra=extra
+            settings.get("beam_current_range_na", None), name="BeamSystemSettings.beam_current_range_na", sort=True, strict=False, extra=extra
         )
         spot_size_range = parse_optional_pair_int_like(
-            settings.get("spot_size_range", None), name="spot_size_range", sort=True, strict=False, extra=extra
+            settings.get("spot_size_range", None), name="BeamSystemSettings.spot_size_range", sort=True, strict=False, extra=extra
         )
         convergence_angle_range_mrad = parse_optional_pair_float_like(
-            settings.get("convergence_angle_range_mrad", None), name="convergence_angle_range_mrad", sort=True, strict=False, extra=extra
+            settings.get("convergence_angle_range_mrad", None), name="BeamSystemSettings.convergence_angle_range_mrad", sort=True, strict=False, extra=extra
         )
 
         return BeamSystemSettings(
@@ -1444,51 +1698,58 @@ class DetectorSettings:
     offset_index: Optional[int] = None  # (often "brightness")
     digital_rotation_deg: Optional[float] = None
 
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
         self.extra = normalize_extra(self.extra)
 
-        self.detector_id = parse_optional_str_like(self.detector_id, name="detector_id", strict=False, extra=self.extra)
+        self.detector_id = parse_optional_id_like(self.detector_id, name="DetectorSettings.detector_id", strict=False, extra=self.extra)
 
-        self.exposure_ms = parse_optional_float_like(self.exposure_ms, name="exposure_ms", strict=True)
+        self.exposure_ms = parse_optional_float_like(self.exposure_ms, name="DetectorSettings.exposure_ms", strict=True)
         if self.exposure_ms is not None and self.exposure_ms < 0:
             raise ValueError(f"exposure_ms must be >= 0, got {self.exposure_ms}")
 
-        self.binning_index = parse_optional_int_like(self.binning_index, name="binning_index", strict=True)
+        self.binning_index = parse_optional_int_like(self.binning_index, name="DetectorSettings.binning_index", strict=True)
         if self.binning_index is not None and self.binning_index < 0:
             raise ValueError(f"binning_index must be >= 0, got {self.binning_index}")
 
-        self.binning_xy = parse_optional_pair_int_like(self.binning_xy, name="binning_xy", sort=False, strict=True)
+        self.binning_xy = parse_optional_pair_int_like(self.binning_xy, name="DetectorSettings.binning_xy", sort=False, strict=True)
         if self.binning_xy is not None and (self.binning_xy[0] < 0 or self.binning_xy[1] < 0):
             raise ValueError(f"binning_xy values must be >= 0, got {self.binning_xy}")
 
         if self.roi is not None:
-            if isinstance(self.roi, (ROI, dict, list, tuple)):
-                self.roi = ROI.from_dict(self.roi)
+            raw_roi = self.roi
+            if isinstance(raw_roi, (list, tuple)):
+                if len(raw_roi) != 4:
+                    self.extra.notes["DetectorSettings.roi_invalid_shape"] = {"value": deepcopy(raw_roi)}
+                    self.roi = None
+                else:
+                    self.roi = ROI.from_dict(raw_roi)
+            elif isinstance(raw_roi, dict):
+                self.roi = ROI.from_dict(raw_roi)
+            elif isinstance(raw_roi, ROI) or raw_roi is None:
+                pass
             else:
                 raise TypeError(f"roi must be ROI/dict/list/tuple, got {type(self.roi)}")
-        if self.roi is not None and (self.roi.width == 0 or self.roi.height == 0):
-            self.extra["roi_invalid_or_empty"] = {"parsed": self.roi.to_dict()}
+        if self.roi is not None and (self.roi.width <= 0 or self.roi.height <= 0):
+            self.extra.notes["DetectorSettings.roi_invalid_or_empty"] = {"parsed": self.roi.to_dict()}
             self.roi = None
 
-        self.frame_integration = parse_optional_int_like(self.frame_integration, name="frame_integration", strict=True)
+        self.frame_integration = parse_optional_int_like(self.frame_integration, name="DetectorSettings.frame_integration", strict=True)
         if self.frame_integration is not None and self.frame_integration < 0:
             raise ValueError(f"frame_integration must be >= 0, got {self.frame_integration}")
 
-        self.gain_index = parse_optional_int_like(self.gain_index, name="gain_index", strict=True)
+        self.gain_index = parse_optional_int_like(self.gain_index, name="DetectorSettings.gain_index", strict=True)
         if self.gain_index is not None and self.gain_index < 0:
             raise ValueError(f"gain_index must be >= 0, got {self.gain_index}")
 
-        self.offset_index = parse_optional_int_like(self.offset_index, name="offset_index", strict=True)
+        self.offset_index = parse_optional_int_like(self.offset_index, name="DetectorSettings.offset_index", strict=True)
         if self.offset_index is not None and self.offset_index < 0:
             raise ValueError(f"offset_index must be >= 0, got {self.offset_index}")
 
         self.digital_rotation_deg = parse_optional_float_like(
-            self.digital_rotation_deg, name="digital_rotation_deg", strict=True
+            self.digital_rotation_deg, name="DetectorSettings.digital_rotation_deg", strict=True
         )
-
-        self.extra = normalize_extra(self.extra)
 
     @classmethod
     def from_kwargs(cls, **kwargs):
@@ -1497,15 +1758,20 @@ class DetectorSettings:
         init_kwargs = {k: v for k, v in kwargs.items() if k in field_names}
         extra_kwargs = {k: v for k, v in kwargs.items() if k not in field_names}
 
-        # If caller already provided extra=..., merge it
         user_extra = init_kwargs.pop("extra", None)
         obj = cls(**init_kwargs)
 
-        if isinstance(user_extra, dict):
-            obj.extra.update(user_extra)
-        obj.extra.update(extra_kwargs)
-        obj.extra = normalize_extra(obj.extra)
+        # merge provided extra (bucketed)
+        merge_extras(obj.extra, user_extra, owner=f"{cls.__name__}")
 
+        # unknown kwargs go to unknown bucket (not vendor)
+        for k, v in extra_kwargs.items():
+            try:
+                obj.extra.unknown[str(k)] = deepcopy(v)
+            except Exception:
+                obj.extra.unknown[str(k)] = repr(v)
+
+        obj.extra = normalize_extra(obj.extra)
         return obj
 
     def to_dict(self) -> dict:
@@ -1521,7 +1787,7 @@ class DetectorSettings:
             "digital_rotation_deg": self.digital_rotation_deg,
         }
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(settings: Any) -> "DetectorSettings":
@@ -1545,49 +1811,49 @@ class DetectorSettings:
             "imaging_area",
             "extra",
         }
-        extra = collect_extra(settings, known)
+        extra = collect_extra(settings, known, owner="DetectorSettings")
 
-        detector_id = parse_optional_str_like(settings.get("detector_id", None), name="detector_id", strict=False, extra=extra)
+        detector_id = parse_optional_id_like(settings.get("detector_id", None), name="DetectorSettings.detector_id", strict=False, extra=extra)
 
         exposure_raw = settings.get("exposure_ms", None)
-        exposure_ms = parse_optional_float_like(exposure_raw, name="exposure_ms", strict=False, extra=extra)
+        exposure_ms = parse_optional_float_like(exposure_raw, name="DetectorSettings.exposure_ms", strict=False, extra=extra)
         if exposure_ms is not None and exposure_ms < 0:
-            extra["exposure_ms_raw"] = exposure_raw
+            extra.raw["DetectorSettings.exposure_ms"] = exposure_raw
             exposure_ms = None
 
         binning_index_raw = settings.get("binning_index", None)
-        binning_index = parse_optional_int_like(binning_index_raw, name="binning_index", strict=False, extra=extra)
+        binning_index = parse_optional_int_like(binning_index_raw, name="DetectorSettings.binning_index", strict=False, extra=extra)
         if binning_index is not None and binning_index < 0:
-            extra["binning_index_raw"] = binning_index_raw
+            extra.raw["DetectorSettings.binning_index"] = binning_index_raw
             binning_index = None
 
         binning_xy_raw = settings.get("binning_xy", None)
-        binning_xy = parse_optional_pair_int_like(binning_xy_raw, name="binning_xy", sort=False, strict=False, extra=extra)
+        binning_xy = parse_optional_pair_int_like(binning_xy_raw, name="DetectorSettings.binning_xy", sort=False, strict=False, extra=extra)
         if binning_xy is not None and (binning_xy[0] < 0 or binning_xy[1] < 0):
-            extra["binning_xy_raw"] = binning_xy_raw
+            extra.raw["DetectorSettings.binning_xy"] = binning_xy_raw
             binning_xy = None
 
         frame_integration_raw = settings.get("frame_integration", None)
-        frame_integration = parse_optional_int_like(frame_integration_raw, name="frame_integration", strict=False, extra=extra)
+        frame_integration = parse_optional_int_like(frame_integration_raw, name="DetectorSettings.frame_integration", strict=False, extra=extra)
         if frame_integration is not None and frame_integration < 0:
-            extra["frame_integration_raw"] = frame_integration_raw
+            extra.raw["DetectorSettings.frame_integration"] = frame_integration_raw
             frame_integration = None
 
         gain_index_raw = settings.get("gain_index", None)
-        gain_index = parse_optional_int_like(gain_index_raw, name="gain_index", strict=False, extra=extra)
+        gain_index = parse_optional_int_like(gain_index_raw, name="DetectorSettings.gain_index", strict=False, extra=extra)
         if gain_index is not None and gain_index < 0:
-            extra["gain_index_raw"] = gain_index_raw
+            extra.raw["DetectorSettings.gain_index"] = gain_index_raw
             gain_index = None
 
         offset_index_raw = settings.get("offset_index", None)
-        offset_index = parse_optional_int_like(offset_index_raw, name="offset_index", strict=False, extra=extra)
+        offset_index = parse_optional_int_like(offset_index_raw, name="DetectorSettings.offset_index", strict=False, extra=extra)
         if offset_index is not None and offset_index < 0:
-            extra["offset_index_raw"] = offset_index_raw
+            extra.raw["DetectorSettings.offset_index"] = offset_index_raw
             offset_index = None
 
         digital_rotation_raw = settings.get("digital_rotation_deg", None)
         digital_rotation_deg = parse_optional_float_like(
-            digital_rotation_raw, name="digital_rotation_deg", strict=False, extra=extra
+            digital_rotation_raw, name="DetectorSettings.digital_rotation_deg", strict=False, extra=extra
         )
 
         roi_raw = settings.get("roi", None)
@@ -1596,10 +1862,26 @@ class DetectorSettings:
                 if alias in settings:
                     roi_raw = settings.get(alias)
                     break
-        roi = ROI.from_dict(roi_raw) if roi_raw is not None else None
+
+        roi = None
+        if isinstance(roi_raw, ROI):
+            roi = roi_raw
+        elif isinstance(roi_raw, dict):
+            roi = ROI.from_dict(roi_raw)
+        elif isinstance(roi_raw, (list, tuple)):
+            if len(roi_raw) == 4:
+                roi = ROI.from_dict(roi_raw)
+            else:
+                extra.notes["DetectorSettings.roi_invalid_shape"] = {"roi_raw": deepcopy(roi_raw)}
+                extra.raw["DetectorSettings.roi"] = deepcopy(roi_raw)
+                roi = None
+        elif roi_raw is not None:
+            extra.raw["DetectorSettings.roi"] = deepcopy(roi_raw)
+            roi = None
+
         # If ROI was provided but parses to an empty/invalid ROI, drop it and record why.
-        if roi_raw is not None and roi is not None and (roi.width == 0 or roi.height == 0):
-            extra["roi_invalid_or_empty"] = {"roi_raw": roi_raw, "parsed": roi.to_dict()}
+        if roi_raw is not None and roi is not None and (roi.width <= 0 or roi.height <= 0):
+            extra.notes["DetectorSettings.roi_invalid_or_empty"] = {"roi_raw": roi_raw, "parsed": roi.to_dict()}
             roi = None
 
         return DetectorSettings(
@@ -1657,16 +1939,16 @@ class DetectorCapabilities:
     digital_rotation_deg_min: Optional[float] = None
     digital_rotation_deg_max: Optional[float] = None
 
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
         self.extra = normalize_extra(self.extra)
 
         # Tuple-ish
-        self.binning_xy_min = parse_optional_pair_int_like(self.binning_xy_min, name="binning_xy_min", strict=False, extra=self.extra)
-        self.binning_xy_max = parse_optional_pair_int_like(self.binning_xy_max, name="binning_xy_max", strict=False, extra=self.extra)
-        self.roi_min = parse_optional_pair_int_like(self.roi_min, name="roi_min", strict=False, extra=self.extra)
-        self.roi_max = parse_optional_pair_int_like(self.roi_max, name="roi_max", strict=False, extra=self.extra)
+        self.binning_xy_min = parse_optional_pair_int_like(self.binning_xy_min, name="DetectorCapabilities.binning_xy_min", strict=False, extra=self.extra)
+        self.binning_xy_max = parse_optional_pair_int_like(self.binning_xy_max, name="DetectorCapabilities.binning_xy_max", strict=False, extra=self.extra)
+        self.roi_min = parse_optional_pair_int_like(self.roi_min, name="DetectorCapabilities.roi_min", strict=False, extra=self.extra)
+        self.roi_max = parse_optional_pair_int_like(self.roi_max, name="DetectorCapabilities.roi_max", strict=False, extra=self.extra)
 
         # Int-like ranges
         for name in (
@@ -1676,17 +1958,17 @@ class DetectorCapabilities:
             "offset_index_min", "offset_index_max",
         ):
             v = getattr(self, name)
-            setattr(self, name, parse_optional_int_like(v, name=name, strict=False, extra=self.extra))
+            setattr(self, name, parse_optional_int_like(v, name=f"DetectorCapabilities.{name}", strict=False, extra=self.extra))
 
         # Float-like ranges
         for name in ("exposure_ms_min", "exposure_ms_max", "digital_rotation_deg_min", "digital_rotation_deg_max"):
             v = getattr(self, name)
-            setattr(self, name, parse_optional_float_like(v, name=name, strict=False, extra=self.extra))
+            setattr(self, name, parse_optional_float_like(v, name=f"DetectorCapabilities.{name}", strict=False, extra=self.extra))
 
         # Optional bools
         for name in ("can_binning", "can_gain", "can_offset", "can_digital_rotation"):
             v = getattr(self, name)
-            setattr(self, name, parse_optional_bool_like(v, name=name, strict=False, extra=self.extra))
+            setattr(self, name, parse_optional_bool_like(v, name=f"DetectorCapabilities.{name}", strict=False, extra=self.extra))
 
         def _repair_minmax(min_name: str, max_name: str) -> None:
             v_min = getattr(self, min_name)
@@ -1694,7 +1976,7 @@ class DetectorCapabilities:
             if v_min is None or v_max is None:
                 return
             if v_min > v_max:
-                self.extra[f"{min_name}_gt_{max_name}"] = {"min": v_min, "max": v_max}
+                self.extra.notes[f"DetectorCapabilities.{min_name}_gt_{max_name}"] = {"min": v_min, "max": v_max}
                 setattr(self, min_name, v_max)
                 setattr(self, max_name, v_min)
 
@@ -1707,7 +1989,7 @@ class DetectorCapabilities:
             min_w, min_h = v_min
             max_w, max_h = v_max
             if min_w > max_w or min_h > max_h:
-                self.extra[f"{min_name}_gt_{max_name}"] = {"min": v_min, "max": v_max}
+                self.extra.notes[f"DetectorCapabilities.{min_name}_gt_{max_name}"] = {"min": v_min, "max": v_max}
                 min_w, max_w = sorted((min_w, max_w))
                 min_h, max_h = sorted((min_h, max_h))
                 setattr(self, min_name, (min_w, min_h))
@@ -1722,7 +2004,6 @@ class DetectorCapabilities:
         _repair_minmax("offset_index_min", "offset_index_max")
         _repair_minmax("digital_rotation_deg_min", "digital_rotation_deg_max")
 
-        self.extra = normalize_extra(self.extra)
 
     def to_dict(self) -> dict:
         # Serialize only non-None, and only include extra if non-empty
@@ -1735,7 +2016,7 @@ class DetectorCapabilities:
                 continue
             d[f.name] = v
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(d: Any) -> "DetectorCapabilities":
@@ -1745,7 +2026,7 @@ class DetectorCapabilities:
             return DetectorCapabilities()
 
         known = {f.name for f in fields(DetectorCapabilities)} | {"extra"}
-        extra = collect_extra(d, known)
+        extra = collect_extra(d, known, owner="DetectorCapabilities")
 
         # Parse into canonical types, but don't die if vendor dumps weird stuff into the JSON.
         kwargs: Dict[str, Any] = {}
@@ -1767,13 +2048,13 @@ class DetectorCapabilities:
             v = d.get(f.name)
 
             if f.name in pair_fields:
-                kwargs[f.name] = parse_optional_pair_int_like(v, name=f.name, strict=False, extra=extra)
+                kwargs[f.name] = parse_optional_pair_int_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
             elif f.name in int_fields:
-                kwargs[f.name] = parse_optional_int_like(v, name=f.name, strict=False, extra=extra)
+                kwargs[f.name] = parse_optional_int_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
             elif f.name in float_fields:
-                kwargs[f.name] = parse_optional_float_like(v, name=f.name, strict=False, extra=extra)
+                kwargs[f.name] = parse_optional_float_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
             elif f.name in bool_fields:
-                kwargs[f.name] = parse_optional_bool_like(v, name=f.name, strict=False, extra=extra)
+                kwargs[f.name] = parse_optional_bool_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
             else:
                 kwargs[f.name] = v
 
@@ -1808,7 +2089,7 @@ class DetectorSystemSettings:
     # If empty, it can be inferred from `capabilities_by_id` / `defaults_by_id`.
     available_detectors: List[str] = field(default_factory=list)
 
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
         self.extra = normalize_extra(self.extra)
@@ -1816,17 +2097,28 @@ class DetectorSystemSettings:
         self.enabled = parse_bool(self.enabled, default=True)
         if self.defaults_by_id is None:
             self.defaults_by_id = {}
+        elif not isinstance(self.defaults_by_id, dict):
+            self.extra.raw["DetectorSystemSettings.defaults_by_id"] = repr(self.defaults_by_id)
+            self.defaults_by_id = {}
+
         if self.capabilities_by_id is None:
             self.capabilities_by_id = {}
+        elif not isinstance(self.capabilities_by_id, dict):
+            self.extra.raw["DetectorSystemSettings.capabilities_by_id"] = repr(self.capabilities_by_id)
+            self.capabilities_by_id = {}
+
         if self.available_detectors is None:
+            self.available_detectors = []
+        elif not isinstance(self.available_detectors, list):
+            self.extra.raw["DetectorSystemSettings.available_detectors"] = repr(self.available_detectors)
             self.available_detectors = []
 
         # Normalize dict keys to str, and values to proper objects
         new_defaults: Dict[str, DetectorSettings] = {}
         for k, v in self.defaults_by_id.items():
-            det_id = parse_optional_str_like(k, name="defaults_by_id.key", strict=False, extra=self.extra)
+            det_id = parse_optional_id_like(k, name="DetectorSystemSettings.defaults_by_id.key", strict=False, extra=self.extra)
             if det_id is None:
-                self.extra[f"defaults_by_id.{k}_raw_key"] = k
+                self.extra.notes[f"DetectorSystemSettings.defaults_by_id.{k}_raw_key"] = k
                 continue
             if isinstance(v, dict):
                 v = DetectorSettings.from_dict(v)
@@ -1835,7 +2127,7 @@ class DetectorSystemSettings:
             if v.detector_id is None:
                 v.detector_id = det_id
             elif str(v.detector_id) != det_id:
-                self.extra[f"defaults_by_id.{det_id}.detector_id_mismatch"] = {
+                self.extra.notes[f"DetectorSystemSettings.defaults_by_id.{det_id}.detector_id_mismatch"] = {
                     "key": det_id,
                     "detector_id": v.detector_id,
                 }
@@ -1845,9 +2137,9 @@ class DetectorSystemSettings:
 
         new_caps: Dict[str, DetectorCapabilities] = {}
         for k, v in self.capabilities_by_id.items():
-            det_id = parse_optional_str_like(k, name="capabilities_by_id.key", strict=False, extra=self.extra)
+            det_id = parse_optional_id_like(k, name="DetectorSystemSettings.capabilities_by_id.key", strict=False, extra=self.extra)
             if det_id is None:
-                self.extra[f"capabilities_by_id.{k}_raw_key"] = k
+                self.extra.notes[f"DetectorSystemSettings.capabilities_by_id.{k}_raw_key"] = k
                 continue
             if isinstance(v, dict):
                 v = DetectorCapabilities.from_dict(v)
@@ -1857,12 +2149,14 @@ class DetectorSystemSettings:
         self.capabilities_by_id = new_caps
 
         # Normalize available list
-        cleaned: List[str] = []
-        for x in self.available_detectors:
-            sx = parse_optional_str_like(x, name="available_detectors", strict=False, extra=self.extra)
-            if sx is not None:
-                cleaned.append(sx)
-        self.available_detectors = cleaned
+        raw = self.available_detectors or []
+        norm = []
+        for x in raw:
+            s = parse_optional_id_like(x, name="DetectorSystemSettings.available_detectors[]", strict=False,
+                extra=self.extra)
+            if s:
+                norm.append(s)
+        self.available_detectors = list(dict.fromkeys(norm))
 
         # Infer available detectors if empty
         if not self.available_detectors:
@@ -1870,7 +2164,7 @@ class DetectorSystemSettings:
             self.available_detectors = list(sorted(key_union))
 
         # Normalize default detector id
-        ddi = parse_optional_str_like(self.default_detector_id, name="default_detector_id", strict=False,
+        ddi = parse_optional_id_like(self.default_detector_id, name="DetectorSystemSettings.default_detector_id", strict=False,
                                        extra=self.extra)
         if ddi is None:
             self.default_detector_id = self.available_detectors[0] if self.available_detectors else None
@@ -1878,14 +2172,12 @@ class DetectorSystemSettings:
             self.default_detector_id = ddi
             if self.default_detector_id not in self.available_detectors:
                 # be consistent with from_dict(): keep it, and add it
-                self.extra["default_detector_id_not_in_available"] = {
+                self.extra.notes["DetectorSystemSettings.default_detector_id_not_in_available"] = {
                        "default_detector_id": self.default_detector_id,
                         "available_detectors": list(self.available_detectors),
                 }
                 self.available_detectors.append(self.default_detector_id)
                 self.available_detectors = list(dict.fromkeys(self.available_detectors))
-
-        self.extra = normalize_extra(self.extra)
 
     def to_dict(self) -> dict:
         d = {
@@ -1896,7 +2188,7 @@ class DetectorSystemSettings:
             "available_detectors": deepcopy(self.available_detectors),
         }
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(settings: Any) -> "DetectorSystemSettings":
@@ -1913,7 +2205,7 @@ class DetectorSystemSettings:
             "capabilities_by_id",
             "extra",
         }
-        extra = collect_extra(settings, known)
+        extra = collect_extra(settings, known, owner="DetectorSystemSettings")
 
         # defaults
         if "defaults_by_id" in settings:
@@ -1927,21 +2219,21 @@ class DetectorSystemSettings:
         if defaults_raw is None:
             defaults_raw = {}
         elif not isinstance(defaults_raw, dict):
-            extra["defaults_by_id_raw"] = defaults_raw
+            extra.raw["DetectorSystemSettings.defaults_by_id"] = defaults_raw
             defaults_raw = {}
 
         defaults_by_id: Dict[str, DetectorSettings] = {}
         for det_id, det_cfg in defaults_raw.items():
-            key = parse_optional_str_like(det_id, name="defaults_by_id.key", strict=False, extra=extra)
+            key = parse_optional_id_like(det_id, name="DetectorSystemSettings.defaults_by_id.key", strict=False, extra=extra)
             if key is None:
-                extra[f"defaults_by_id.{det_id}_raw_key"] = det_id
+                extra.notes[f"DetectorSystemSettings.defaults_by_id.{det_id}_raw_key"] = det_id
                 continue
             if isinstance(det_cfg, DetectorSettings):
                 ds = det_cfg
             elif isinstance(det_cfg, dict):
                 ds = DetectorSettings.from_dict(det_cfg)
             else:
-                extra[f"defaults_by_id.{key}_raw"] = det_cfg
+                extra.raw[f"DetectorSystemSettings.defaults_by_id.{key}"] = det_cfg
                 continue
             if ds.detector_id is None:
                 ds.detector_id = key
@@ -1952,14 +2244,14 @@ class DetectorSystemSettings:
         if cap_raw is None:
             cap_raw = {}
         elif not isinstance(cap_raw, dict):
-            extra["capabilities_by_id_raw"] = cap_raw
+            extra.raw["DetectorSystemSettings.capabilities_by_id"] = cap_raw
             cap_raw = {}
 
         capabilities_by_id: Dict[str, DetectorCapabilities] = {}
         for det_id, cap_cfg in cap_raw.items():
-            key = parse_optional_str_like(det_id, name="capabilities_by_id.key", strict=False, extra=extra)
+            key = parse_optional_id_like(det_id, name="DetectorSystemSettings.capabilities_by_id.key", strict=False, extra=extra)
             if key is None:
-                extra[f"capabilities_by_id.{det_id}_raw_key"] = det_id
+                extra.notes[f"DetectorSystemSettings.capabilities_by_id.{det_id}_raw_key"] = det_id
                 continue
 
             if isinstance(cap_cfg, DetectorCapabilities):
@@ -1967,7 +2259,7 @@ class DetectorSystemSettings:
             elif isinstance(cap_cfg, dict):
                 cap = DetectorCapabilities.from_dict(cap_cfg)
             else:
-                extra[f"capabilities_by_id.{key}_raw"] = cap_cfg
+                extra.raw[f"DetectorSystemSettings.capabilities_by_id.{key}"] = cap_cfg
                 continue
 
             capabilities_by_id[key] = cap
@@ -1979,13 +2271,13 @@ class DetectorSystemSettings:
         elif isinstance(available_raw, (list, tuple)):
             cleaned: List[str] = []
             for i, x in enumerate(available_raw):
-                sx = parse_optional_str_like(x, name=f"available_detectors[{i}]", strict=False, extra=extra)
+                sx = parse_optional_id_like(x, name=f"DetectorSystemSettings.available_detectors[{i}]", strict=False, extra=extra)
                 if sx is not None:
                     cleaned.append(sx)
             # treat empty list as "not provided"
             available = cleaned or None
         else:
-            extra["available_detectors_raw"] = available_raw
+            extra.raw["DetectorSystemSettings.available_detectors"] = available_raw
             available = None
 
         if available is None:
@@ -1997,7 +2289,7 @@ class DetectorSystemSettings:
 
         # default detector id
         ddi_raw = settings.get("default_detector_id", None)
-        ddi = parse_optional_str_like(ddi_raw, name="default_detector_id", strict=False, extra=extra)
+        ddi = parse_optional_id_like(ddi_raw, name="DetectorSystemSettings.default_detector_id", strict=False, extra=extra)
 
         if ddi is None:
             default_detector_id = available[0] if available else None
@@ -2005,7 +2297,7 @@ class DetectorSystemSettings:
             default_detector_id = ddi
             if default_detector_id not in available:
                 # keep it consistent (and avoid __post_init__ raising)
-                extra["default_detector_id_not_in_available"] = {
+                extra.notes["DetectorSystemSettings.default_detector_id_not_in_available"] = {
                     "default_detector_id": default_detector_id,
                     "available_detectors": list(available),
                 }
@@ -2025,14 +2317,14 @@ class DetectorSystemSettings:
 class ImageOutputSettings:
     file_format: Optional[str] = "tiff"  #  supported = {"tiff", "tif", "png", "jpg", "jpeg", "bmp"}
     path: Optional[Union[str, Path]] = None  # default output directory (session dir)
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
         self.extra = normalize_extra(self.extra)
 
         supported = {"tiff", "tif", "png", "jpg", "jpeg", "bmp"}
 
-        ff = parse_optional_str_like(self.file_format, name="file_format", strict=False, extra=self.extra)
+        ff = parse_optional_str_like(self.file_format, name="ImageOutputSettings.file_format", strict=False, extra=self.extra)
         self.file_format = (ff or "tiff").lower()
 
         if self.file_format is not None and self.file_format not in supported:
@@ -2045,10 +2337,9 @@ class ImageOutputSettings:
             if isinstance(self.path, (str, bytes)):
                 self.path = Path(self.path)
             else:
-                self.extra.setdefault("path_raw", self.path)
+                self.extra.raw["ImageOutputSettings.path"] = _jsonable(self.path)
                 self.path = None
 
-        self.extra = normalize_extra(self.extra)
 
     def to_dict(self) -> dict:
         d: Dict[str, Any] = {
@@ -2056,7 +2347,7 @@ class ImageOutputSettings:
             "path": str(self.path) if self.path is not None else None,
         }
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(settings: Any) -> "ImageOutputSettings":
@@ -2066,11 +2357,11 @@ class ImageOutputSettings:
             return ImageOutputSettings()
 
         known = ("file_format", "path", "extra")
-        extra = collect_extra(settings, known=known)
+        extra = collect_extra(settings, known=known, owner="ImageOutputSettings")
 
-        ff = parse_optional_str_like(settings.get("file_format", "tiff"), name="file_format", strict=False,
+        ff = parse_optional_str_like(settings.get("file_format", "tiff"), name="ImageOutputSettings.file_format", strict=False,
                                      extra=extra) or "tiff"
-        p = parse_optional_str_like(settings.get("path", None), name="path", strict=False, extra=extra)
+        p = parse_optional_str_like(settings.get("path", None), name="ImageOutputSettings.path", strict=False, extra=extra)
 
         return ImageOutputSettings(file_format=ff, path=p, extra=extra)
 
@@ -2079,7 +2370,7 @@ class AcquisitionRequest:
     detector_id: str
     detector: DetectorSettings
     image: ImageOutputSettings
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
         # normalize first
@@ -2122,7 +2413,7 @@ class AcquisitionRequest:
             "image": self.image.to_dict() if self.image is not None else None,
         }
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(d: Any) -> "AcquisitionRequest":
@@ -2132,7 +2423,7 @@ class AcquisitionRequest:
             raise ValueError("AcquisitionRequest.from_dict expects a non-empty dict")
 
         used_keys = {"detector_id", "detector", "image", "extra"}
-        extra = collect_extra(d, used_keys)
+        extra = collect_extra(d, used_keys, owner="AcquisitionRequest")
 
         det_raw = d.get("detector")
         if isinstance(det_raw, DetectorSettings):
@@ -2153,7 +2444,7 @@ class AcquisitionRequest:
         raw = d.get("detector_id", None)
         if raw is None:
             raw = det.detector_id
-        det_id = parse_optional_str_like(raw, name="detector_id", strict=False, extra=extra)
+        det_id = parse_optional_str_like(raw, name="AcquisitionRequest.detector_id", strict=False, extra=extra)
         if det_id is None:
             raise ValueError("AcquisitionRequest missing detector_id (and detector.detector_id)")
 
@@ -2203,10 +2494,10 @@ class MicroscopeState:
     protocol: Dict[str, Any] = field(default_factory=dict)
 
     # Vendor-specific / unknown fields live here
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
-        self.extra = normalize_extra(self.extra)
+        self.extra = normalize_extra_lenient(self.extra, "MicroscopeState")
 
         # timestamp
         self.timestamp = float(self._parse_timestamp(self.timestamp))
@@ -2220,7 +2511,7 @@ class MicroscopeState:
         elif isinstance(sp, dict):
             self.stage_position = TemStagePosition.from_dict(sp)
         else:
-            self.extra["stage_position_raw"] = repr(sp)
+            self.extra.raw["MicroscopeState.stage_position"] = repr(sp)
             self.stage_position = TemStagePosition()
 
         # beam
@@ -2232,7 +2523,7 @@ class MicroscopeState:
         elif isinstance(b, dict):
             self.beam = BeamSettings.from_dict(b)
         else:
-            self.extra["beam_raw"] = repr(b)
+            self.extra.raw["MicroscopeState.beam"] = repr(b)
             self.beam = BeamSettings()
 
         # detectors
@@ -2240,14 +2531,14 @@ class MicroscopeState:
         if dets_raw is None:
             dets_raw = {}
         if not isinstance(dets_raw, dict):
-            self.extra["detectors_raw"] = dets_raw
+            self.extra.raw["MicroscopeState.detectors"] = dets_raw
             dets_raw = {}
 
         fixed: Dict[str, DetectorSettings] = {}
         for det_id, det in dets_raw.items():
-            key = parse_optional_str_like(det_id, name="detectors.key", strict=False, extra=self.extra)
+            key = parse_optional_id_like(det_id, name="MicroscopeState.detectors.key", strict=False, extra=self.extra)
             if key is None:
-                self.extra[f"detectors.{det_id}_raw_key"] = det_id
+                self.extra.notes[f"MicroscopeState.detectors.{det_id}_raw_key"] = det_id
                 continue
             try:
                 if isinstance(det, DetectorSettings):
@@ -2255,18 +2546,18 @@ class MicroscopeState:
                 elif isinstance(det, dict):
                     ds = DetectorSettings.from_dict(det)
                 else:
-                    self.extra[f"detectors.{key}_raw"] = det
+                    self.extra.raw[f"MicroscopeState.detectors.{key}"] = det
                     continue
 
                 if ds.detector_id is None:
                     ds.detector_id = key
                 elif str(ds.detector_id) != key:
-                    self.extra[f"detectors.{key}.detector_id_mismatch"] = ds.detector_id
+                    self.extra.notes[f"MicroscopeState.detectors.{key}.detector_id_mismatch"] = ds.detector_id
                     ds.detector_id = key
 
                 fixed[key] = ds
             except Exception:
-                self.extra[f"detectors.{key}_raw"] = det
+                self.extra.raw[f"MicroscopeState.detectors.{key}"] = det
 
         self.detectors = fixed
 
@@ -2277,12 +2568,37 @@ class MicroscopeState:
         if isinstance(active_raw, (list, tuple)):
             cleaned: List[str] = []
             for i, x in enumerate(active_raw):
-                sx = parse_optional_str_like(x, name=f"active_detector_ids[{i}]", strict=False, extra=self.extra)
+                sx = parse_optional_id_like(x, name=f"MicroscopeState.active_detector_ids[{i}]", strict=False, extra=self.extra)
                 if sx is not None:
                     cleaned.append(sx)
-            self.active_detector_ids = cleaned
+            # preserve order, drop duplicates
+            seen: Set[str] = set()
+            deduped: List[str] = []
+            for s in cleaned:
+                if s not in seen:
+                    deduped.append(s)
+                    seen.add(s)
+            self.active_detector_ids = deduped
+
+            # If detector map is known, drop active IDs that are not present.
+            # If detector map is empty/missing, keep as-is but record that we couldn't validate.
+            if self.active_detector_ids:
+                if isinstance(self.detectors, dict) and self.detectors:
+                    known = set(self.detectors.keys())
+                    kept = [d for d in self.active_detector_ids if d in known]
+                    dropped = [d for d in self.active_detector_ids if d not in known]
+                    if dropped:
+                        self.extra.notes.setdefault(
+                            "MicroscopeState.active_detector_ids.dropped_unknown", dropped
+                        )
+                    self.active_detector_ids = kept
+                else:
+                    self.extra.notes.setdefault(
+                        "MicroscopeState.active_detector_ids.unvalidated",
+                        "detectors empty/missing; keeping active_detector_ids as provided",
+                    )
         else:
-            self.extra["active_detector_ids_raw"] = active_raw
+            self.extra.raw["MicroscopeState.active_detector_ids"] = active_raw
             self.active_detector_ids = []
 
         # protocol
@@ -2292,11 +2608,11 @@ class MicroscopeState:
         if isinstance(proto_raw, dict):
             self.protocol = proto_raw
         else:
-            self.extra["protocol_raw"] = proto_raw
+            self.extra.raw["MicroscopeState.protocol"] = proto_raw
             self.protocol = {}
 
         # primary detector id
-        self.primary_detector_id = parse_optional_str_like(self.primary_detector_id, name="primary_detector_id", strict=False, extra=self.extra)
+        self.primary_detector_id = parse_optional_id_like(self.primary_detector_id, name="MicroscopeState.primary_detector_id", strict=False, extra=self.extra)
 
         # choose a stable primary if needed
         if self.primary_detector_id is None and self.detectors:
@@ -2305,16 +2621,9 @@ class MicroscopeState:
         if self.detectors:
             known = set(self.detectors.keys())
 
-            dropped = [x for x in self.active_detector_ids if x not in known]
-            if dropped:
-                self.extra["active_detector_ids_unknown"] = dropped
-                self.active_detector_ids = [x for x in self.active_detector_ids if x in known]
-
             if self.primary_detector_id is not None and self.primary_detector_id not in known:
-                self.extra["primary_detector_id_unknown"] = self.primary_detector_id
+                self.extra.notes["MicroscopeState.primary_detector_id_unknown"] = self.primary_detector_id
                 self.primary_detector_id = sorted(known)[0]
-
-        self.extra = normalize_extra(self.extra)
 
     def to_dict(self) -> dict:
         ts_iso = datetime.datetime.fromtimestamp(float(self.timestamp), tz=datetime.timezone.utc).isoformat()
@@ -2331,7 +2640,7 @@ class MicroscopeState:
         if self.protocol:
             d["protocol"] = deepcopy(self.protocol)
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def _parse_timestamp(value: Any) -> float:
@@ -2343,7 +2652,10 @@ class MicroscopeState:
             return datetime.datetime.now(datetime.timezone.utc).timestamp()
 
         if isinstance(value, (int, float)):
-            return float(value)
+            v = float(value)
+            if np.isfinite(v):
+                return v
+            return datetime.datetime.now(datetime.timezone.utc).timestamp()
 
         if isinstance(value, str):
             # ISO first
@@ -2356,7 +2668,10 @@ class MicroscopeState:
                 pass
             # stringified float
             try:
-                return float(value)
+                v = float(value)
+                if np.isfinite(v):
+                    return v
+                return datetime.datetime.now(datetime.timezone.utc).timestamp()
             except Exception:
                 return datetime.datetime.now(datetime.timezone.utc).timestamp()
 
@@ -2379,12 +2694,12 @@ class MicroscopeState:
             "protocol",
             "extra",
         }
-        extra = collect_extra(state_dict, known)
+        extra = collect_extra(state_dict, known, owner="MicroscopeState")
 
         # timestamp
         ts_raw = state_dict.get("timestamp", state_dict.get("timestamp_iso", None))
         if isinstance(ts_raw, bool):
-            extra["timestamp_raw"] = ts_raw
+            extra.raw["MicroscopeState.timestamp"] = ts_raw
             ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
         else:
             ts = MicroscopeState._parse_timestamp(ts_raw)
@@ -2419,9 +2734,9 @@ class MicroscopeState:
         dets_raw = state_dict.get("detectors", None)
         if isinstance(dets_raw, dict):
             for det_id, det_val in dets_raw.items():
-                key = parse_optional_str_like(det_id, name="detectors.key", strict=False, extra=extra)
+                key = parse_optional_id_like(det_id, name="MicroscopeState.detectors.key", strict=False, extra=extra)
                 if key is None:
-                    extra[f"detectors.{det_id}_raw_key"] = det_id
+                    extra.notes[f"MicroscopeState.detectors.{det_id}_raw_key"] = det_id
                     continue
 
                 if isinstance(det_val, DetectorSettings):
@@ -2429,39 +2744,39 @@ class MicroscopeState:
                 elif isinstance(det_val, dict):
                     ds = DetectorSettings.from_dict(det_val)
                 else:
-                    extra[f"detectors.{key}_raw"] = det_val
+                    extra.raw[f"MicroscopeState.detectors.{key}"] = det_val
                     continue
 
                 if ds.detector_id is None:
                     ds.detector_id = key
                 elif str(ds.detector_id) != key:
-                    extra[f"detectors.{key}.detector_id_mismatch"] = ds.detector_id
+                    extra.notes[f"MicroscopeState.detectors.{key}.detector_id_mismatch"] = ds.detector_id
                     ds.detector_id = key
 
                 detectors[key] = ds
         elif dets_raw is not None:
-            extra["detectors_raw"] = dets_raw
+            extra.raw["MicroscopeState.detectors"] = dets_raw
 
         # active ids
         active_ids: List[str] = []
         active_raw = state_dict.get("active_detector_ids", None)
         if isinstance(active_raw, (list, tuple)):
             for i, x in enumerate(active_raw):
-                sx = parse_optional_str_like(x, name=f"active_detector_ids[{i}]", strict=False, extra=extra)
+                sx = parse_optional_id_like(x, name=f"MicroscopeState.active_detector_ids[{i}]", strict=False, extra=extra)
                 if sx is not None:
                     active_ids.append(sx)
         elif active_raw is not None:
-            extra["active_detector_ids_raw"] = active_raw
+            extra.raw["MicroscopeState.active_detector_ids"] = active_raw
 
         # primary id
         primary_raw = state_dict.get("primary_detector_id", state_dict.get("detector_id"))
         if primary_raw is None:
             primary_id = None
         elif isinstance(primary_raw, bool):
-            extra["primary_detector_id_raw"] = primary_raw
+            extra.raw["MicroscopeState.primary_detector_id"] = primary_raw
             primary_id = None
         else:
-            primary_id = parse_optional_str_like(primary_raw, name="primary_detector_id", strict=False, extra=extra)
+            primary_id = parse_optional_id_like(primary_raw, name="MicroscopeState.primary_detector_id", strict=False, extra=extra)
 
         # protocol
         protocol_raw = state_dict.get("protocol", None)
@@ -2470,7 +2785,7 @@ class MicroscopeState:
         elif isinstance(protocol_raw, dict):
             protocol = protocol_raw
         else:
-            extra["protocol_raw"] = protocol_raw
+            extra.raw["MicroscopeState.protocol"] = protocol_raw
             protocol = {}
 
         return MicroscopeState(
@@ -2560,6 +2875,32 @@ class TemImage:
             # last-ditch: at least keep something
             minimal = {"created_at": getattr(md, "created_at", None), "version": getattr(md, "version", None)}
             return json.dumps(_jsonable(minimal), ensure_ascii=False)
+
+    @staticmethod
+    def _to_uint8_preview(arr: np.ndarray, p_low: float = 1.0, p_high: float = 99.0) -> np.ndarray:
+        """
+        Convert arbitrary numeric image to uint8 for preview exports (JPEG/BMP).
+        Uses percentile scaling to avoid single hot pixels ruining contrast.
+        """
+        a = np.asarray(arr)
+
+        if a.size == 0:
+            return a.astype(np.uint8, copy=False)
+
+        # Work in float for scaling
+        af = a.astype(np.float32, copy=False)
+
+        finite = af[np.isfinite(af)]
+        if finite.size == 0:
+            return np.zeros_like(a, dtype=np.uint8)
+
+        lo, hi = np.percentile(finite, [p_low, p_high])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            # constant image or broken stats
+            return np.zeros_like(a, dtype=np.uint8)
+
+        scaled = (af - lo) * (255.0 / (hi - lo))
+        return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
 
     # -------------------------- I/O --------------------------
 
@@ -2675,7 +3016,7 @@ class TemImage:
         desc = self._encode_description(self.metadata)
 
         if fmt == "tiff":
-            tff.imwrite(path, self.data, description=desc)
+            tff.imwrite(str(path), self.data, description=desc)
             return path
 
         # Other formats: save pixels via Pillow (metadata via sidecar)
@@ -2683,10 +3024,8 @@ class TemImage:
 
         # JPEG/BMP can't store uint16 grayscale reliably; create a uint8 preview.
         if fmt in ("jpg", "jpeg", "bmp"):
-            if data_to_save.dtype == np.uint16:
-                data_to_save = (data_to_save >> 8).astype(np.uint8)
-            elif data_to_save.dtype != np.uint8:
-                data_to_save = np.clip(data_to_save, 0, 255).astype(np.uint8)
+            if data_to_save.dtype != np.uint8:
+                data_to_save = self._to_uint8_preview(data_to_save)
         else:
             # PNG supports uint16, but keep it uint8/uint16 only.
             if data_to_save.dtype not in (np.uint8, np.uint16):
@@ -2726,31 +3065,30 @@ class SystemInfo:
     application: Optional[str] = None
     application_version: Optional[str] = None
 
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Extras = field(default_factory=Extras)
 
     def __post_init__(self):
         self.extra = normalize_extra(self.extra)
 
-        self.name = parse_optional_str_like(self.name, name="name", strict=False, extra=self.extra) or "Unknown"
-        self.ip_address = parse_optional_str_like(self.ip_address, name="ip_address", strict=False,
+        self.name = parse_optional_str_like(self.name, name="SystemInfo.name", strict=False, extra=self.extra) or "Unknown"
+        self.ip_address = parse_optional_str_like(self.ip_address, name="SystemInfo.ip_address", strict=False,
                                                   extra=self.extra) or "Unknown"
-        self.manufacturer = parse_optional_str_like(self.manufacturer, name="manufacturer", strict=False,
+        self.manufacturer = parse_optional_str_like(self.manufacturer, name="SystemInfo.manufacturer", strict=False,
                                                     extra=self.extra) or "Unknown"
-        self.model = parse_optional_str_like(self.model, name="model", strict=False, extra=self.extra) or "Unknown"
-        self.serial_number = parse_optional_str_like(self.serial_number, name="serial_number", strict=False,
+        self.model = parse_optional_str_like(self.model, name="SystemInfo.model", strict=False, extra=self.extra) or "Unknown"
+        self.serial_number = parse_optional_str_like(self.serial_number, name="SystemInfo.serial_number", strict=False,
                                                      extra=self.extra) or "Unknown"
-        self.hardware_version = parse_optional_str_like(self.hardware_version, name="hardware_version", strict=False,
+        self.hardware_version = parse_optional_str_like(self.hardware_version, name="SystemInfo.hardware_version", strict=False,
                                                         extra=self.extra) or "Unknown"
-        self.software_version = parse_optional_str_like(self.software_version, name="software_version", strict=False,
+        self.software_version = parse_optional_str_like(self.software_version, name="SystemInfo.software_version", strict=False,
                                                         extra=self.extra) or "Unknown"
-        self.supertem_version = parse_optional_str_like(self.supertem_version, name="supertem_version", strict=False,
+        self.supertem_version = parse_optional_str_like(self.supertem_version, name="SystemInfo.supertem_version", strict=False,
                                                         extra=self.extra) or __version__
 
-        self.application = parse_optional_str_like(self.application, name="application", strict=False, extra=self.extra)
-        self.application_version = parse_optional_str_like(self.application_version, name="application_version",
+        self.application = parse_optional_str_like(self.application, name="SystemInfo.application", strict=False, extra=self.extra)
+        self.application_version = parse_optional_str_like(self.application_version, name="SystemInfo.application_version",
                                                            strict=False, extra=self.extra)
 
-        self.extra = normalize_extra(self.extra)
 
     def to_dict(self) -> dict:
         d = {
@@ -2766,7 +3104,7 @@ class SystemInfo:
             "application_version": self.application_version,
         }
         add_extra_if_any(d, self.extra)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(settings: Any) -> "SystemInfo":
@@ -2781,7 +3119,7 @@ class SystemInfo:
             "application","application_version",
             "extra",
         )
-        extra = collect_extra(settings, known=known)
+        extra = collect_extra(settings, known=known, owner="SystemInfo")
 
         return SystemInfo(
             name=settings.get("name", "Unknown"),
@@ -2804,6 +3142,24 @@ class SystemSettings:
     detector: DetectorSystemSettings = field(default_factory=DetectorSystemSettings)
     info: SystemInfo = field(default_factory=SystemInfo)
 
+    def __post_init__(self):
+        if isinstance(self.stage, dict):
+            self.stage = StageSystemSettings.from_dict(self.stage)
+        else:
+            self.stage = StageSystemSettings()
+        if isinstance(self.beam, dict):
+            self.beam = BeamSystemSettings.from_dict(self.beam)
+        else:
+            self.beam = BeamSystemSettings()
+        if isinstance(self.detector, dict):
+            self.detector = DetectorSystemSettings.from_dict(self.detector)
+        else:
+            self.detector = DetectorSystemSettings()
+        if isinstance(self.info, dict):
+            self.info = SystemInfo.from_dict(self.info)
+        else:
+            self.info = SystemInfo()
+
     def to_dict(self) -> dict:
         d = {
             "stage": self.stage.to_dict(),
@@ -2811,7 +3167,7 @@ class SystemSettings:
             "detector": self.detector.to_dict(),
             "info": self.info.to_dict(),
         }
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(settings: Any) -> "SystemSettings":
@@ -2846,6 +3202,18 @@ class MicroscopeSettings:
     image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
     protocol: Dict[str, Any] = field(default_factory=lambda: {"name":"demo"})
 
+    def __post_init__(self):
+        if isinstance(self.system, dict):
+            self.system = SystemSettings.from_dict(self.system)
+        else:
+            self.system = SystemSettings()
+        if isinstance(self.image, dict):
+            self.image = ImageOutputSettings.from_dict(self.image)
+        else:
+            self.image = ImageOutputSettings()
+        if not isinstance(self.protocol, dict):
+            self.protocol = {"name":"demo"}
+
     def to_dict(self) -> dict:
         d = {
             "system": self.system.to_dict(),
@@ -2853,7 +3221,7 @@ class MicroscopeSettings:
         }
         if self.protocol:
             d["protocol"] = deepcopy(self.protocol)
-        return drop_none_keys(d)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(settings: Any, protocol: Optional[Dict[str, Any]] = None) -> "MicroscopeSettings":
