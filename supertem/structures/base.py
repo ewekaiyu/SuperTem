@@ -171,7 +171,7 @@ import datetime
 import json
 import math
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace, is_dataclass
 from pathlib import Path
 from copy import deepcopy
 from enum import Enum
@@ -821,13 +821,13 @@ def maybe_from_dict(
     # Already parsed
     try:
         if isinstance(raw, cls):
-            # Avoid mutating _mode (it doesn't re-run parsing). Enforce mode via validate if available.
-            validate = getattr(raw, "validate", None)
-            if callable(validate):
-                try:
-                    validate(mode=mode)
-                except TypeError:
-                    validate()
+            # Already-parsed instance: do not validate during parsing.
+            # Re-home to requested mode without mutating the original instance.
+            try:
+                if is_dataclass(raw):
+                    return replace(raw, _mode=mode)  # type: ignore[call-arg]
+            except Exception:
+                pass
             return raw
     except TypeError:
         pass
@@ -956,10 +956,19 @@ class Point:
 
 @dataclass
 class ROI:
+    """Detector region-of-interest (pixel coordinates).
+
+    Parsing/normalization happens in __post_init__.
+    Semantic constraints (e.g. non-negative origin, positive size) live in validate().
+    """
+
     x: int = 0
     y: int = 0
     width: int = 512
     height: int = 512
+
+    # Capture unknown keys / raw values / repair notes.
+    extra: Extras = field(default_factory=Extras)
 
     # Parsing / validation mode (strict by default).
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
@@ -968,48 +977,58 @@ class ROI:
         mode = as_parse_mode(self._mode)
         strict = is_strict(mode)
 
-        ix = parse_optional_int_like(self.x, name="ROI.x", strict=strict)
-        iy = parse_optional_int_like(self.y, name="ROI.y", strict=strict)
-        iw = parse_optional_int_like(self.width, name="ROI.width", strict=strict)
-        ih = parse_optional_int_like(self.height, name="ROI.height", strict=strict)
+        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "ROI")
 
-        self.x = 0 if ix is None else int(ix)
-        self.y = 0 if iy is None else int(iy)
-        self.width = 512 if iw is None else int(iw)
-        self.height = 512 if ih is None else int(ih)
+        ix = parse_optional_int_like(self.x, name="ROI.x", strict=strict, extra=self.extra)
+        iy = parse_optional_int_like(self.y, name="ROI.y", strict=strict, extra=self.extra)
+        iw = parse_optional_int_like(self.width, name="ROI.width", strict=strict, extra=self.extra)
+        ih = parse_optional_int_like(self.height, name="ROI.height", strict=strict, extra=self.extra)
 
-        # Semantic constraints live in validate().
-        self.validate(mode=mode)
+        # Lenient fallback defaults (STRICT would have raised above).
+        self.x = 0 if ix is None else ix
+        self.y = 0 if iy is None else iy
+        self.width = 512 if iw is None else iw
+        self.height = 512 if ih is None else ih
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        """Validate ROI semantics.
-
-        - parse/normalization belongs in __post_init__.
-        - semantic constraints belong here.
-        """
+        """Returns True iff ROI was already valid (no repairs needed)."""
         mode = as_parse_mode(self._mode if mode is None else mode)
         strict = is_strict(mode)
 
+        was_valid = True
+
         if self.x < 0 or self.y < 0:
-            err = ValueError(f"ROI.x/ROI.y must be >= 0, got x={self.x}, y={self.y}")
-            if strict:
-                raise err
-            self.x = max(self.x, 0)
-            self.y = max(self.y, 0)
+            was_valid = False
+            note_or_raise(
+                self.extra,
+                "ROI.xy",
+                ValueError(f"ROI.x/ROI.y must be >= 0, got x={self.x}, y={self.y}"),
+                mode=mode,
+                raw={"x": self.x, "y": self.y},
+            )
+            if not strict:
+                self.x = max(self.x, 0)
+                self.y = max(self.y, 0)
 
-        invalid_size = (self.width <= 0) or (self.height <= 0)
-        if invalid_size:
-            err = ValueError(f"ROI.width/ROI.height must be > 0, got width={self.width}, height={self.height}")
-            if strict:
-                raise err
-            # lenient: keep a safe placeholder size, but report invalid so callers can decide to drop ROI.
-            self.width = 512 if self.width <= 0 else self.width
-            self.height = 512 if self.height <= 0 else self.height
+        if (self.width <= 0) or (self.height <= 0):
+            was_valid = False
+            note_or_raise(
+                self.extra,
+                "ROI.size",
+                ValueError(f"ROI.width/ROI.height must be > 0, got width={self.width}, height={self.height}"),
+                mode=mode,
+                raw={"width": self.width, "height": self.height},
+            )
+            if not strict:
+                self.width = 512 if self.width <= 0 else self.width
+                self.height = 512 if self.height <= 0 else self.height
 
-        return not invalid_size
+        return was_valid
 
     def to_dict(self) -> dict:
-        return _jsonable(drop_none_keys({"x": self.x, "y": self.y, "width": self.width, "height": self.height}))
+        d: Dict[str, Any] = {"x": self.x, "y": self.y, "width": self.width, "height": self.height}
+        add_extra_if_any(d, self.extra)
+        return _jsonable(drop_none_keys(d))
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ROI":
@@ -1017,23 +1036,37 @@ class ROI:
         strict = is_strict(mode)
 
         if isinstance(d, ROI):
-            d.validate(mode=mode)
+            try:
+                if is_dataclass(d):
+                    return replace(d, _mode=mode)  # type: ignore[call-arg]
+            except Exception:
+                pass
             return d
+
+        ex = Extras() if strict else normalize_extra_lenient(None, "ROI")
+
+        if d is None:
+            return ROI(extra=ex, _mode=mode)
+
         if isinstance(d, (list, tuple)):
             if len(d) != 4:
-                if strict:
-                    raise ValueError(f"ROI list/tuple must have len 4, got {len(d)}")
-                return ROI(_mode=mode)
-            return ROI(x=d[0], y=d[1], width=d[2], height=d[3], _mode=mode)
+                note_or_raise(ex, "ROI", ValueError(f"ROI list/tuple must have len 4, got {len(d)}"),
+                              mode=mode, raw=deepcopy(d))
+                return ROI(extra=ex, _mode=mode)
+            return ROI(x=d[0], y=d[1], width=d[2], height=d[3], extra=ex, _mode=mode)
+
         if not isinstance(d, dict):
-            if strict:
-                raise TypeError(f"ROI must be dict/list/tuple/ROI, got {type(d)}")
-            return ROI(_mode=mode)
+            note_or_raise(ex, "ROI", TypeError(f"ROI must be dict/list/tuple/ROI, got {type(d)}"),
+                          mode=mode, raw=deepcopy(d))
+            return ROI(extra=ex, _mode=mode)
+
+        ex = collect_extra(d, known=("x", "y", "width", "height", "w", "h"), owner="ROI")
         return ROI(
             x=d.get("x", 0),
             y=d.get("y", 0),
             width=d.get("width", d.get("w", 512)),
             height=d.get("height", d.get("h", 512)),
+            extra=ex,
             _mode=mode,
         )
 
@@ -1139,9 +1172,14 @@ class TemImageMetadata:
                         self.extra.raw["TemImageMetadata.created_at"] = ss
 
         if not created_iso:
-            # TODO: didn't use noteandraise
-            if strict and raw_created not in (None, ""):
-                raise ValueError(f"TemImageMetadata.created_at is invalid: {raw_created!r}")
+            if raw_created not in (None, ""):
+                note_or_raise(
+                    self.extra,
+                    "TemImageMetadata.created_at",
+                    ValueError(f"TemImageMetadata.created_at is invalid: {raw_created!r}"),
+                    mode=mode,
+                    raw=raw_created,
+                )
             created_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         self.created_at = created_iso
@@ -1222,9 +1260,6 @@ class TemImageMetadata:
             key="TemImageMetadata.acquisition",
             allow_empty_dict=False,
         )
-
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
         strict = is_strict(mode)
@@ -1315,7 +1350,11 @@ class TemImageMetadata:
         strict = is_strict(mode)
 
         if isinstance(d, TemImageMetadata):
-            d.validate(mode=mode)
+            try:
+                if is_dataclass(d):
+                    return replace(d, _mode=mode)  # type: ignore[call-arg]
+            except Exception:
+                pass
             return d
         if not isinstance(d, dict):
             if strict:
@@ -1510,6 +1549,8 @@ class TemStagePosition:
     tilt_y: Optional["Quantity"] = None
     coordinate_system: Optional[str] = None
 
+    extra: Extras = field(default_factory=Extras)
+
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
 
@@ -1517,15 +1558,24 @@ class TemStagePosition:
         mode = as_parse_mode(self._mode)
         strict = is_strict(mode)
 
-        self.name = parse_optional_str_like(self.name, name="TemStagePosition.name", strict=strict)
+        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, 'TemStagePosition')
+
+        self.name = parse_optional_str_like(self.name, name="TemStagePosition.name", strict=strict, extra=self.extra)
         self.coordinate_system = parse_optional_str_like(
-            self.coordinate_system, name="TemStagePosition.coordinate_system", strict=strict
+            self.coordinate_system, name="TemStagePosition.coordinate_system", strict=strict, extra=self.extra
         )
 
         def coerce_axis(raw: Any, unit: str, field_name: str) -> Optional["Quantity"]:
             q = ensure_quantity(raw, unit)
-            if strict and (raw is not None) and (q is None):
-                raise ValueError(f"{field_name} must be convertible to {unit}, got {raw!r}")
+            if (raw is not None) and (q is None):
+                note_or_raise(
+                    self.extra,
+                    field_name,
+                    ValueError(f"{field_name} must be convertible to {unit}, got {raw!r}"),
+                    mode=mode,
+                    raw=raw,
+                )
+                return None
             return q
 
         # Normalize individual axes into canonical units.
@@ -1535,9 +1585,6 @@ class TemStagePosition:
         self.r = coerce_axis(self.r, "degree", "TemStagePosition.r")
         self.tilt_x = coerce_axis(self.tilt_x, "degree", "TemStagePosition.tilt_x")
         self.tilt_y = coerce_axis(self.tilt_y, "degree", "TemStagePosition.tilt_y")
-
-        self.validate(mode=mode)
-
     @property
     def stage(self) -> List[Optional["Quantity"]]:
         return [self.x, self.y, self.z, self.r, self.tilt_x, self.tilt_y]
@@ -1553,15 +1600,20 @@ class TemStagePosition:
             "tilt_y": magnitude(self.tilt_y, "degree"),
             "coordinate_system": self.coordinate_system,
         }
+        add_extra_if_any(d, self.extra)
         return _jsonable(drop_none_keys(d))
 
     @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "TemStagePosition":
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> 'TemStagePosition':
         mode = as_parse_mode(mode)
         strict = is_strict(mode)
 
         if isinstance(d, TemStagePosition):
-            d.validate(mode=mode)
+            try:
+                if is_dataclass(d):
+                    return replace(d, _mode=mode)  # type: ignore[call-arg]
+            except Exception:
+                pass
             return d
         if d is None:
             return TemStagePosition(_mode=mode)
@@ -1569,6 +1621,16 @@ class TemStagePosition:
             if strict:
                 raise TypeError(f"TemStagePosition.from_dict expects a dict, got {type(d)}")
             return TemStagePosition(_mode=mode)
+
+        ex = collect_extra(
+            d,
+            known=(
+                "name", "x", "y", "z", "r", "tilt_x", "tilt_y",
+                "coordinate_system", "coord_system", "cs",
+                "extra",
+            ),
+            owner="TemStagePosition",
+        )
 
         return TemStagePosition(
             name=d.get("name", None),
@@ -1582,6 +1644,7 @@ class TemStagePosition:
                 "coordinate_system",
                 d.get("coord_system", d.get("cs", None)),
             ),
+            extra=ex,
             _mode=mode,
         )
 
@@ -1594,15 +1657,15 @@ class TemStagePosition:
             if qq is None:
                 if q is None:
                     return None
-                note_or_raise(None, field_name, ValueError(f"{field_name} must be convertible to {unit}"), mode=mode, raw=q)
+                note_or_raise(self.extra, field_name, ValueError(f"{field_name} must be convertible to {unit}"), mode=mode, raw=q)
                 return None
             try:
                 mag = float(qq.to(unit).magnitude)
             except Exception as e:
-                note_or_raise(None, field_name, e, mode=mode, raw=qq)
+                note_or_raise(self.extra, field_name, e, mode=mode, raw=qq)
                 return None
             if not math.isfinite(mag):
-                note_or_raise(None, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode, raw=mag)
+                note_or_raise(self.extra, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode, raw=mag)
                 return None
             return qq
 
@@ -1616,7 +1679,7 @@ class TemStagePosition:
         return True
 
 
-    def __add__(self, other: "TemStagePosition") -> "TemStagePosition":
+    def __add__(self, other: 'TemStagePosition') -> 'TemStagePosition':
         if not isinstance(other, TemStagePosition):
             return NotImplemented
 
@@ -1643,7 +1706,7 @@ class TemStagePosition:
             coordinate_system=self.coordinate_system,
         )
 
-    def __sub__(self, other: "TemStagePosition") -> "TemStagePosition":
+    def __sub__(self, other: 'TemStagePosition') -> 'TemStagePosition':
         if not isinstance(other, TemStagePosition):
             return NotImplemented
 
@@ -1670,7 +1733,7 @@ class TemStagePosition:
             coordinate_system=self.coordinate_system,
         )
 
-    def is_close(self, other: "TemStagePosition", tol_nm: float = 1.0, tol_deg: float = 1e-3, *, compare_only_specified: bool = True) -> bool:
+    def is_close(self, other: 'TemStagePosition', tol_nm: float = 1.0, tol_deg: float = 1e-3, *, compare_only_specified: bool = True) -> bool:
         def close_axis(a, b, unit: str, tol: float) -> bool:
             # If either side doesn't specify this axis, ignore it (don't care).
             if compare_only_specified and (a is None or b is None):
@@ -1791,8 +1854,6 @@ class StageSystemSettings:
         )
 
         # Semantic constraints live in validate().
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Validate StageSystemSettings semantics."""
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -1974,8 +2035,6 @@ class BeamSettings:
         self.image_shift = _maybe_point(self.image_shift, extra=self.extra, name="BeamSettings.image_shift")
 
         # Semantic constraints live in validate().
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Validate beam-setting semantics.
 
@@ -2137,8 +2196,6 @@ class BeamSystemSettings:
         )
 
         # Semantic constraints live in validate().
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Validate beam-system semantics."""
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -2353,8 +2410,6 @@ class DetectorSettings:
 
 
         # Semantic constraints live in validate().
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Validate detector-setting semantics.
 
@@ -2817,8 +2872,6 @@ class DetectorSystemSettings:
         self.available_detectors = [x for x in norm_avail if not (x in seen or seen.add(x))]
 
         # Semantic constraints live in validate().
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Validate detector-system semantics."""
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -2946,8 +2999,6 @@ class ImageOutputSettings:
                 self.path = None
 
         # Semantic constraints live in validate().
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Validate ImageOutputSettings semantics."""
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -3015,8 +3066,13 @@ class AcquisitionRequest:
         if det_raw is None:
             self.detector = DetectorSettings(_mode=mode)
         elif isinstance(det_raw, DetectorSettings):
-            det_raw.validate(mode=mode)
-            self.detector = det_raw
+            try:
+                if is_dataclass(det_raw):
+                    self.detector = replace(det_raw, _mode=mode)  # type: ignore[call-arg]
+                else:
+                    self.detector = det_raw
+            except Exception:
+                self.detector = det_raw
         elif isinstance(det_raw, dict):
             try:
                 self.detector = DetectorSettings.from_dict(det_raw, mode=mode)
@@ -3037,8 +3093,13 @@ class AcquisitionRequest:
         if img_raw is None:
             self.image = ImageOutputSettings(_mode=mode)
         elif isinstance(img_raw, ImageOutputSettings):
-            img_raw.validate(mode=mode)
-            self.image = img_raw
+            try:
+                if is_dataclass(img_raw):
+                    self.image = replace(img_raw, _mode=mode)  # type: ignore[call-arg]
+                else:
+                    self.image = img_raw
+            except Exception:
+                self.image = img_raw
         elif isinstance(img_raw, dict):
             try:
                 self.image = ImageOutputSettings.from_dict(img_raw, mode=mode)
@@ -3066,8 +3127,6 @@ class AcquisitionRequest:
             self.detector_id = str(self.detector.detector_id)
 
         # Semantic constraints live in validate().
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Enforce request invariants (strictness depends on mode).
 
@@ -3077,27 +3136,27 @@ class AcquisitionRequest:
         strict = is_strict(mode)
 
         if not isinstance(self.detector, DetectorSettings):
+            note_or_raise(
+                self.extra,
+                "AcquisitionRequest.detector",
+                TypeError(f"AcquisitionRequest.detector must be DetectorSettings, got {type(self.detector)}"),
+                mode=mode,
+                raw=self.detector,
+            )
             if strict:
-                note_or_raise(
-                    self.extra,
-                    "AcquisitionRequest.detector",
-                    TypeError(f"AcquisitionRequest.detector must be DetectorSettings, got {type(self.detector)}"),
-                    mode=mode,
-                    raw=self.detector,
-                )
                 return False
-            self.detector = DetectorSettings()
+            self.detector = DetectorSettings(_mode=mode)
         if not isinstance(self.image, ImageOutputSettings):
+            note_or_raise(
+                self.extra,
+                "AcquisitionRequest.image",
+                TypeError(f"AcquisitionRequest.image must be ImageOutputSettings, got {type(self.image)}"),
+                mode=mode,
+                raw=self.image,
+            )
             if strict:
-                note_or_raise(
-                    self.extra,
-                    "AcquisitionRequest.image",
-                    TypeError(f"AcquisitionRequest.image must be ImageOutputSettings, got {type(self.image)}"),
-                    mode=mode,
-                    raw=self.image
-                )
                 return False
-            self.image = ImageOutputSettings()
+            self.image = ImageOutputSettings(_mode=mode)
 
         # Resolve the effective detector_id (request field wins).
         det_id = self.detector_id
@@ -3135,8 +3194,10 @@ class AcquisitionRequest:
             if strict:
                 return False
             self.detector.detector_id = det_id
-
-        return True
+        ok = True
+        ok = self.detector.validate(mode=mode) and ok
+        ok = self.image.validate(mode=mode) and ok
+        return ok
 
     def to_dict(self) -> dict:
         d = {
@@ -3153,7 +3214,11 @@ class AcquisitionRequest:
         strict = is_strict(mode)
 
         if isinstance(d, AcquisitionRequest):
-            d.validate(mode=mode)
+            try:
+                if is_dataclass(d):
+                    return replace(d, _mode=mode)  # type: ignore[call-arg]
+            except Exception:
+                pass
             return d
         if not isinstance(d, dict):
             if strict:
@@ -3237,9 +3302,15 @@ class MicroscopeState:
         # stage_position
         sp = self.stage_position
         if sp is None:
-            self.stage_position = TemStagePosition()
+            self.stage_position = TemStagePosition(_mode=mode)
         elif isinstance(sp, TemStagePosition):
-            self.stage_position = sp
+            try:
+                if is_dataclass(sp):
+                    self.stage_position = replace(sp, _mode=mode)  # type: ignore[call-arg]
+                else:
+                    self.stage_position = sp
+            except Exception:
+                self.stage_position = sp
         elif isinstance(sp, dict):
             try:
                 self.stage_position = TemStagePosition.from_dict(sp, mode=mode)
@@ -3261,8 +3332,13 @@ class MicroscopeState:
         if b is None:
             self.beam = BeamSettings(_mode=mode)
         elif isinstance(b, BeamSettings):
-            b.validate(mode=mode)
-            self.beam = b
+            try:
+                if is_dataclass(b):
+                    self.beam = replace(b, _mode=mode)  # type: ignore[call-arg]
+                else:
+                    self.beam = b
+            except Exception:
+                self.beam = b
         elif isinstance(b, dict):
             try:
                 self.beam = BeamSettings.from_dict(b, mode=mode)
@@ -3301,8 +3377,13 @@ class MicroscopeState:
                 continue
             try:
                 if isinstance(det, DetectorSettings):
-                    ds = det
-                    ds.validate(mode=mode)
+                    try:
+                        if is_dataclass(det):
+                            ds = replace(det, _mode=mode)  # type: ignore[call-arg]
+                        else:
+                            ds = det
+                    except Exception:
+                        ds = det
                 elif isinstance(det, dict):
                     ds = DetectorSettings.from_dict(det, mode=mode)
                 else:
@@ -3351,12 +3432,16 @@ class MicroscopeState:
         if self.protocol is None:
             self.protocol = {}
         elif not isinstance(self.protocol, dict):
-            self.extra.raw["MicroscopeState.protocol"] = _jsonable(self.protocol)
+            note_or_raise(
+                self.extra,
+                "MicroscopeState.protocol",
+                TypeError(f"MicroscopeState.protocol must be dict, got {type(self.protocol)}"),
+                mode=mode,
+                raw=_jsonable(self.protocol),
+            )
             self.protocol = {}
 
         # Semantic constraints live in validate().
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Validate MicroscopeState semantics.
 
@@ -3443,7 +3528,11 @@ class MicroscopeState:
         mode = as_parse_mode(mode)
 
         if isinstance(d, MicroscopeState):
-            d.validate(mode=mode)
+            try:
+                if is_dataclass(d):
+                    return replace(d, _mode=mode)  # type: ignore[call-arg]
+            except Exception:
+                pass
             return d
         if not isinstance(d, dict):
             return MicroscopeState(_mode=mode)
@@ -3768,9 +3857,6 @@ class SystemInfo:
         self.application_version = parse_optional_str_like(
             self.application_version, name="SystemInfo.application_version", strict=strict, extra=self.extra
         )
-
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
 
@@ -3913,9 +3999,6 @@ class SystemSettings:
             if strict:
                 raise TypeError(f"SystemSettings.info must be SystemInfo/dict, got {type(self.info)}")
             self.info = SystemInfo(_mode=mode)
-
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
 
@@ -3996,9 +4079,6 @@ class MicroscopeSettings:
             if strict:
                 raise TypeError(f"MicroscopeSettings.protocol must be dict, got {type(self.protocol)}")
             self.protocol = {"name": "demo"}
-
-        self.validate(mode=mode)
-
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
 
