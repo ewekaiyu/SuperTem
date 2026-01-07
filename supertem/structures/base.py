@@ -1081,7 +1081,11 @@ class TemImageMetadata:
     # ---- Vendor-specific or unknown stuff ----
     extra: Extras = field(default_factory=Extras)
 
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
+
     def __post_init__(self):
+        mode = as_parse_mode(self._mode)
+        strict = is_strict(mode)
         # ---- extra: be lenient here (metadata should not brick loading) ----
         self.extra = normalize_extra_lenient(self.extra, "TemImageMetadata")
 
@@ -1090,7 +1094,7 @@ class TemImageMetadata:
                 parse_optional_str_like(
                     self.version,
                     name="TemImageMetadata.version",
-                    strict=False,
+                    strict=strict,
                     extra=self.extra,
                 )
                 or str(METADATA_VERSION)
@@ -1114,7 +1118,7 @@ class TemImageMetadata:
                 self.extra.raw["TemImageMetadata.created_at"] = raw_created
                 created_iso = None
         else:
-            s = parse_optional_str_like(raw_created, name="TemImageMetadata.created_at", strict=False, extra=self.extra)
+            s = parse_optional_str_like(raw_created, name="TemImageMetadata.created_at", strict=strict, extra=self.extra)
             if s is not None:
                 ss = s.strip()
                 # ISO first
@@ -1135,33 +1139,36 @@ class TemImageMetadata:
                         self.extra.raw["TemImageMetadata.created_at"] = ss
 
         if not created_iso:
+            # TODO: didn't use noteandraise
+            if strict and raw_created not in (None, ""):
+                raise ValueError(f"TemImageMetadata.created_at is invalid: {raw_created!r}")
             created_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         self.created_at = created_iso
 
         # ---- identity strings ----
-        self.user = parse_optional_str_like(self.user, name="TemImageMetadata.user", strict=False, extra=self.extra)
+        self.user = parse_optional_str_like(self.user, name="TemImageMetadata.user", strict=strict, extra=self.extra)
         self.manufacturer = parse_optional_str_like(self.manufacturer, name="TemImageMetadata.manufacturer",
-                                                    strict=False, extra=self.extra)
-        self.device = parse_optional_str_like(self.device, name="TemImageMetadata.device", strict=False,
+                                                    strict=strict, extra=self.extra)
+        self.device = parse_optional_str_like(self.device, name="TemImageMetadata.device", strict=strict,
                                               extra=self.extra)
-        self.model = parse_optional_str_like(self.model, name="TemImageMetadata.model", strict=False, extra=self.extra)
+        self.model = parse_optional_str_like(self.model, name="TemImageMetadata.model", strict=strict, extra=self.extra)
         self.serial_number = parse_optional_str_like(self.serial_number, name="TemImageMetadata.serial_number",
-                                                     strict=False, extra=self.extra)
+                                                     strict=strict, extra=self.extra)
         self.software_version = parse_optional_str_like(self.software_version, name="TemImageMetadata.software_version",
-                                                        strict=False, extra=self.extra)
+                                                        strict=strict, extra=self.extra)
 
         # ---- imaging summary ----
-        self.mode = parse_optional_str_like(self.mode, name="TemImageMetadata.mode", strict=False, extra=self.extra)
-        self.detector_id = parse_optional_id_like(self.detector_id, name="TemImageMetadata.detector_id", strict=False,
+        self.mode = parse_optional_str_like(self.mode, name="TemImageMetadata.mode", strict=strict, extra=self.extra)
+        self.detector_id = parse_optional_id_like(self.detector_id, name="TemImageMetadata.detector_id", strict=strict,
                                                    extra=self.extra)
         self.detector_name = parse_optional_str_like(self.detector_name, name="TemImageMetadata.detector_name",
-                                                     strict=False, extra=self.extra)
+                                                     strict=strict, extra=self.extra)
 
         self.magnification = parse_optional_float_like(self.magnification, name="TemImageMetadata.magnification",
-                                                       strict=False, extra=self.extra)
+                                                       strict=strict, extra=self.extra)
         self.camera_length_mm = parse_optional_float_like(self.camera_length_mm,
-                                                          name="TemImageMetadata.camera_length_mm", strict=False,
+                                                          name="TemImageMetadata.camera_length_mm", strict=strict,
                                                           extra=self.extra)
 
         # ---- geometry ----
@@ -1169,39 +1176,39 @@ class TemImageMetadata:
             self.pixel_size_nm,
             name="TemImageMetadata.pixel_size_nm",
             sort=False,
-            strict=False,
+            strict=strict,
             extra=self.extra,
         )
         self.image_size_px = parse_optional_pair_int_like(
             self.image_size_px,
             name="TemImageMetadata.image_size_px",
             sort=False,
-            strict=False,
+            strict=strict,
             extra=self.extra,
         )
 
         # ---- acquisition params ----
         self.accelerating_voltage_kv = parse_optional_float_like(
-            self.accelerating_voltage_kv, name="TemImageMetadata.accelerating_voltage_kv", strict=False,
+            self.accelerating_voltage_kv, name="TemImageMetadata.accelerating_voltage_kv", strict=strict,
             extra=self.extra
         )
         self.beam_current_na = parse_optional_float_like(
-            self.beam_current_na, name="TemImageMetadata.beam_current_na", strict=False, extra=self.extra
+            self.beam_current_na, name="TemImageMetadata.beam_current_na", strict=strict, extra=self.extra
         )
         self.exposure_ms = parse_optional_float_like(
-            self.exposure_ms, name="TemImageMetadata.exposure_ms", strict=False, extra=self.extra
+            self.exposure_ms, name="TemImageMetadata.exposure_ms", strict=strict, extra=self.extra
         )
         self.dwell_time_us = parse_optional_float_like(
-            self.dwell_time_us, name="TemImageMetadata.dwell_time_us", strict=False, extra=self.extra
+            self.dwell_time_us, name="TemImageMetadata.dwell_time_us", strict=strict, extra=self.extra
         )
         self.working_distance_mm = parse_optional_float_like(
-            self.working_distance_mm, name="TemImageMetadata.working_distance_mm", strict=False, extra=self.extra
+            self.working_distance_mm, name="TemImageMetadata.working_distance_mm", strict=strict, extra=self.extra
         )
         # ---- nested objects (best-effort; don't raise in metadata) ----
         self.microscope_state = maybe_from_dict(
             MicroscopeState,
             self.microscope_state,
-            mode=ParseMode.LENIENT,
+            mode=mode,
             extra=self.extra,
             key="TemImageMetadata.microscope_state",
             allow_empty_dict=False,
@@ -1210,11 +1217,65 @@ class TemImageMetadata:
         self.acquisition = maybe_from_dict(
             AcquisitionRequest,
             self.acquisition,
-            mode=ParseMode.LENIENT,
+            mode=mode,
             extra=self.extra,
             key="TemImageMetadata.acquisition",
             allow_empty_dict=False,
         )
+
+        self.validate(mode=mode)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode = as_parse_mode(self._mode if mode is None else mode)
+        strict = is_strict(mode)
+
+        # created_at should be ISO; in lenient mode we already backfilled it, but keep it sane.
+        if not isinstance(self.created_at, str) or not self.created_at:
+            note_or_raise(self.extra, "TemImageMetadata.created_at", TypeError("created_at must be a non-empty str"), mode=mode, raw=self.created_at)
+            self.created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        # Nested snapshots: validate (propagate mode).
+        if self.microscope_state is not None:
+            try:
+                self.microscope_state.validate(mode=mode)
+            except Exception as e:
+                note_or_raise(self.extra, "TemImageMetadata.microscope_state", e, mode=mode, raw=self.microscope_state)
+                if not strict:
+                    self.microscope_state = None
+
+        if self.acquisition is not None:
+            try:
+                self.acquisition.validate(mode=mode)
+            except Exception as e:
+                note_or_raise(self.extra, "TemImageMetadata.acquisition", e, mode=mode, raw=self.acquisition)
+                if not strict:
+                    self.acquisition = None
+
+        # Basic sanity for a few numeric summaries (do not over-police; vendors vary).
+        def _pos(name: str, v: Any):
+            if v is None:
+                return
+            try:
+                fv = float(v)
+            except Exception as e:
+                note_or_raise(self.extra, f"TemImageMetadata.{name}", e, mode=mode, raw=v)
+                if not strict:
+                    setattr(self, name, None)
+                return
+            if not math.isfinite(fv) or fv <= 0:
+                note_or_raise(self.extra, f"TemImageMetadata.{name}", ValueError(f"{name} must be finite and > 0"), mode=mode, raw=v)
+                if not strict:
+                    setattr(self, name, None)
+
+        _pos("magnification", self.magnification)
+        _pos("camera_length_mm", self.camera_length_mm)
+        _pos("pixel_size_nm", self.pixel_size_nm)
+        _pos("accelerating_voltage_kv", self.accelerating_voltage_kv)
+        _pos("exposure_ms", self.exposure_ms)
+        _pos("dwell_time_us", self.dwell_time_us)
+
+        return True
+
     def to_dict(self) -> dict:
         d: Dict[str, Any] = {
             "version": self.version,
@@ -1249,11 +1310,17 @@ class TemImageMetadata:
         return _jsonable(drop_none_keys(d))
 
     @staticmethod
-    def from_dict(d: Any) -> "TemImageMetadata":
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "TemImageMetadata":
+        mode = as_parse_mode(mode)
+        strict = is_strict(mode)
+
         if isinstance(d, TemImageMetadata):
+            d.validate(mode=mode)
             return d
         if not isinstance(d, dict):
-            return TemImageMetadata()
+            if strict:
+                raise TypeError(f"TemImageMetadata.from_dict expects a dict, got {type(d)}")
+            return TemImageMetadata(_mode=mode)
 
         known = {
             # schema/provenance
@@ -1300,8 +1367,8 @@ class TemImageMetadata:
 
         def _opt_str(val: Any, name: str) -> Optional[str]:
             if name == "detector_id":
-                return parse_optional_id_like(val, name=f"TemImageMetadata.{name}", strict=False, extra=extra)
-            return parse_optional_str_like(val, name=f"TemImageMetadata.{name}", strict=False, extra=extra)
+                return parse_optional_id_like(val, name=f"TemImageMetadata.{name}", strict=strict, extra=extra)
+            return parse_optional_str_like(val, name=f"TemImageMetadata.{name}", strict=strict, extra=extra)
 
         # version: keep as str (METADATA_VERSION is your canonical default)
         version_raw = d.get("version", d.get("metadata_version", METADATA_VERSION))
@@ -1338,45 +1405,45 @@ class TemImageMetadata:
         detector_id = _opt_str(d.get("detector_id", None), "detector_id")
         detector_name = _opt_str(d.get("detector_name", None), "detector_name")
 
-        magnification = parse_optional_float_like(d.get("magnification", None), name="TemImageMetadata.magnification", strict=False, extra=extra)
+        magnification = parse_optional_float_like(d.get("magnification", None), name="TemImageMetadata.magnification", strict=strict, extra=extra)
         camera_length_mm = parse_optional_float_like(
             d.get("camera_length_mm", d.get("camera_length", None)),
             name="TemImageMetadata.camera_length_mm",
-            strict=False,
+            strict=strict,
             extra=extra,
         )
 
         accelerating_voltage_kv = parse_optional_float_like(
             d.get("accelerating_voltage_kv", d.get("accelerating_voltage", None)),
             name="TemImageMetadata.accelerating_voltage_kv",
-            strict=False,
+            strict=strict,
             extra=extra,
         )
         beam_current_na = parse_optional_float_like(
             d.get("beam_current_na", d.get("beam_current", None)),
             name="TemImageMetadata.beam_current_na",
-            strict=False,
+            strict=strict,
             extra=extra,
         )
-        exposure_ms = parse_optional_float_like(d.get("exposure_ms", None), name="TemImageMetadata.exposure_ms", strict=False, extra=extra)
+        exposure_ms = parse_optional_float_like(d.get("exposure_ms", None), name="TemImageMetadata.exposure_ms", strict=strict, extra=extra)
         dwell_time_us = parse_optional_float_like(
             d.get("dwell_time_us", d.get("dwell_time", None)),
             name="TemImageMetadata.dwell_time_us",
-            strict=False,
+            strict=strict,
             extra=extra,
         )
         working_distance_mm = parse_optional_float_like(
             d.get("working_distance_mm", d.get("working_distance", None)),
             name="TemImageMetadata.working_distance_mm",
-            strict=False,
+            strict=strict,
             extra=extra,
         )
 
         pixel_size_nm = parse_optional_pair_float_like(
-            d.get("pixel_size_nm", None), name="TemImageMetadata.pixel_size_nm", sort=False, strict=False, extra=extra
+            d.get("pixel_size_nm", None), name="TemImageMetadata.pixel_size_nm", sort=False, strict=strict, extra=extra
         )
         image_size_px = parse_optional_pair_int_like(
-            d.get("image_size_px", None), name="TemImageMetadata.image_size_px", sort=False, strict=False, extra=extra
+            d.get("image_size_px", None), name="TemImageMetadata.image_size_px", sort=False, strict=strict, extra=extra
         )
 
         # nested objects
@@ -1384,7 +1451,7 @@ class TemImageMetadata:
         microscope_state = maybe_from_dict(
             MicroscopeState,
             ms_raw,
-            mode=ParseMode.LENIENT,
+            mode=mode,
             extra=extra,
             key="TemImageMetadata.microscope_state",
             allow_empty_dict=False,
@@ -1394,7 +1461,7 @@ class TemImageMetadata:
         acquisition = maybe_from_dict(
             AcquisitionRequest,
             acq_raw,
-            mode=ParseMode.LENIENT,
+            mode=mode,
             extra=extra,
             key="TemImageMetadata.acquisition",
             allow_empty_dict=False,
@@ -1443,18 +1510,33 @@ class TemStagePosition:
     tilt_y: Optional["Quantity"] = None
     coordinate_system: Optional[str] = None
 
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
+
+
     def __post_init__(self):
-        self.name = parse_optional_str_like(self.name, name="TemStagePosition.name", strict=False)
+        mode = as_parse_mode(self._mode)
+        strict = is_strict(mode)
+
+        self.name = parse_optional_str_like(self.name, name="TemStagePosition.name", strict=strict)
         self.coordinate_system = parse_optional_str_like(
-            self.coordinate_system, name="TemStagePosition.coordinate_system", strict=False
+            self.coordinate_system, name="TemStagePosition.coordinate_system", strict=strict
         )
+
+        def coerce_axis(raw: Any, unit: str, field_name: str) -> Optional["Quantity"]:
+            q = ensure_quantity(raw, unit)
+            if strict and (raw is not None) and (q is None):
+                raise ValueError(f"{field_name} must be convertible to {unit}, got {raw!r}")
+            return q
+
         # Normalize individual axes into canonical units.
-        self.x = ensure_quantity(self.x, "nanometer")
-        self.y = ensure_quantity(self.y, "nanometer")
-        self.z = ensure_quantity(self.z, "nanometer")
-        self.r = ensure_quantity(self.r, "degree")
-        self.tilt_x = ensure_quantity(self.tilt_x, "degree")
-        self.tilt_y = ensure_quantity(self.tilt_y, "degree")
+        self.x = coerce_axis(self.x, "nanometer", "TemStagePosition.x")
+        self.y = coerce_axis(self.y, "nanometer", "TemStagePosition.y")
+        self.z = coerce_axis(self.z, "nanometer", "TemStagePosition.z")
+        self.r = coerce_axis(self.r, "degree", "TemStagePosition.r")
+        self.tilt_x = coerce_axis(self.tilt_x, "degree", "TemStagePosition.tilt_x")
+        self.tilt_y = coerce_axis(self.tilt_y, "degree", "TemStagePosition.tilt_y")
+
+        self.validate(mode=mode)
 
     @property
     def stage(self) -> List[Optional["Quantity"]]:
@@ -1474,21 +1556,65 @@ class TemStagePosition:
         return _jsonable(drop_none_keys(d))
 
     @staticmethod
-    def from_dict(d: Any) -> "TemStagePosition":
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "TemStagePosition":
+        mode = as_parse_mode(mode)
+        strict = is_strict(mode)
+
         if isinstance(d, TemStagePosition):
+            d.validate(mode=mode)
             return d
+        if d is None:
+            return TemStagePosition(_mode=mode)
         if not isinstance(d, dict):
-            return TemStagePosition()
+            if strict:
+                raise TypeError(f"TemStagePosition.from_dict expects a dict, got {type(d)}")
+            return TemStagePosition(_mode=mode)
+
         return TemStagePosition(
-            name=parse_optional_str_like(d.get("name", None), name="TemStagePosition.name", strict=False),
-            x=ensure_quantity(d.get("x", None), "nanometer"),
-            y=ensure_quantity(d.get("y", None), "nanometer"),
-            z=ensure_quantity(d.get("z", None), "nanometer"),
-            r=ensure_quantity(d.get("r", None), "degree"),
-            tilt_x=ensure_quantity(d.get("tilt_x", None), "degree"),
-            tilt_y=ensure_quantity(d.get("tilt_y", None), "degree"),
-            coordinate_system=parse_optional_str_like(d.get("coordinate_system", None), name="TemStagePosition.coordinate_system", strict=False),
+            name=d.get("name", None),
+            x=d.get("x", None),
+            y=d.get("y", None),
+            z=d.get("z", None),
+            r=d.get("r", None),
+            tilt_x=d.get("tilt_x", None),
+            tilt_y=d.get("tilt_y", None),
+            coordinate_system=d.get(
+                "coordinate_system",
+                d.get("coord_system", d.get("cs", None)),
+            ),
+            _mode=mode,
         )
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode = as_parse_mode(self._mode if mode is None else mode)
+        strict = is_strict(mode)
+
+        def cleaned(q: Any, unit: str, field_name: str) -> Optional["Quantity"]:
+            qq = ensure_quantity(q, unit)
+            if qq is None:
+                if q is None:
+                    return None
+                note_or_raise(None, field_name, ValueError(f"{field_name} must be convertible to {unit}"), mode=mode, raw=q)
+                return None
+            try:
+                mag = float(qq.to(unit).magnitude)
+            except Exception as e:
+                note_or_raise(None, field_name, e, mode=mode, raw=qq)
+                return None
+            if not math.isfinite(mag):
+                note_or_raise(None, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode, raw=mag)
+                return None
+            return qq
+
+        self.x = cleaned(self.x, "nanometer", "TemStagePosition.x")
+        self.y = cleaned(self.y, "nanometer", "TemStagePosition.y")
+        self.z = cleaned(self.z, "nanometer", "TemStagePosition.z")
+        self.r = cleaned(self.r, "degree", "TemStagePosition.r")
+        self.tilt_x = cleaned(self.tilt_x, "degree", "TemStagePosition.tilt_x")
+        self.tilt_y = cleaned(self.tilt_y, "degree", "TemStagePosition.tilt_y")
+
+        return True
+
 
     def __add__(self, other: "TemStagePosition") -> "TemStagePosition":
         if not isinstance(other, TemStagePosition):
@@ -3116,7 +3242,7 @@ class MicroscopeState:
             self.stage_position = sp
         elif isinstance(sp, dict):
             try:
-                self.stage_position = TemStagePosition.from_dict(sp)
+                self.stage_position = TemStagePosition.from_dict(sp, mode=mode)
             except Exception as e:
                 note_or_raise(self.extra, "MicroscopeState.stage_position", e, mode=mode, raw=sp)
                 self.stage_position = TemStagePosition()
@@ -3587,6 +3713,11 @@ class TemImage:
 
 @dataclass
 class SystemInfo:
+    """Basic microscope/system identity information (mostly informational).
+
+    Default behavior is LENIENT for ingestion; pass mode=STRICT when you want fail-fast.
+    """
+
     name: str = "Unknown"
     ip_address: str = "Unknown"
     manufacturer: str = "Unknown"
@@ -3600,28 +3731,70 @@ class SystemInfo:
 
     extra: Extras = field(default_factory=Extras)
 
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
+
     def __post_init__(self):
-        self.extra = normalize_extra(self.extra)
+        mode = as_parse_mode(self._mode)
+        strict = is_strict(mode)
 
-        self.name = parse_optional_str_like(self.name, name="SystemInfo.name", strict=False, extra=self.extra) or "Unknown"
-        self.ip_address = parse_optional_str_like(self.ip_address, name="SystemInfo.ip_address", strict=False,
-                                                  extra=self.extra) or "Unknown"
-        self.manufacturer = parse_optional_str_like(self.manufacturer, name="SystemInfo.manufacturer", strict=False,
-                                                    extra=self.extra) or "Unknown"
-        self.model = parse_optional_str_like(self.model, name="SystemInfo.model", strict=False, extra=self.extra) or "Unknown"
-        self.serial_number = parse_optional_str_like(self.serial_number, name="SystemInfo.serial_number", strict=False,
-                                                     extra=self.extra) or "Unknown"
-        self.hardware_version = parse_optional_str_like(self.hardware_version, name="SystemInfo.hardware_version", strict=False,
-                                                        extra=self.extra) or "Unknown"
-        self.software_version = parse_optional_str_like(self.software_version, name="SystemInfo.software_version", strict=False,
-                                                        extra=self.extra) or "Unknown"
-        self.supertem_version = parse_optional_str_like(self.supertem_version, name="SystemInfo.supertem_version", strict=False,
-                                                        extra=self.extra) or __version__
+        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "SystemInfo")
 
-        self.application = parse_optional_str_like(self.application, name="SystemInfo.application", strict=False, extra=self.extra)
-        self.application_version = parse_optional_str_like(self.application_version, name="SystemInfo.application_version",
-                                                           strict=False, extra=self.extra)
+        self.name = parse_optional_str_like(self.name, name="SystemInfo.name", strict=strict, extra=self.extra) or "Unknown"
+        self.ip_address = (
+            parse_optional_str_like(self.ip_address, name="SystemInfo.ip_address", strict=strict, extra=self.extra) or "Unknown"
+        )
+        self.manufacturer = (
+            parse_optional_str_like(self.manufacturer, name="SystemInfo.manufacturer", strict=strict, extra=self.extra) or "Unknown"
+        )
+        self.model = parse_optional_str_like(self.model, name="SystemInfo.model", strict=strict, extra=self.extra) or "Unknown"
+        self.serial_number = (
+            parse_optional_str_like(self.serial_number, name="SystemInfo.serial_number", strict=strict, extra=self.extra) or "Unknown"
+        )
+        self.hardware_version = (
+            parse_optional_str_like(self.hardware_version, name="SystemInfo.hardware_version", strict=strict, extra=self.extra)
+            or "Unknown"
+        )
+        self.software_version = (
+            parse_optional_str_like(self.software_version, name="SystemInfo.software_version", strict=strict, extra=self.extra)
+            or "Unknown"
+        )
+        self.supertem_version = (
+            parse_optional_str_like(self.supertem_version, name="SystemInfo.supertem_version", strict=strict, extra=self.extra)
+            or __version__
+        )
+        self.application = parse_optional_str_like(
+            self.application, name="SystemInfo.application", strict=strict, extra=self.extra
+        )
+        self.application_version = parse_optional_str_like(
+            self.application_version, name="SystemInfo.application_version", strict=strict, extra=self.extra
+        )
 
+        self.validate(mode=mode)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode = as_parse_mode(self._mode if mode is None else mode)
+
+        # ip_address: if present and not "Unknown", it should look like an IP.
+        ip = self.ip_address
+        if isinstance(ip, str):
+            ip = ip.strip()
+
+        if ip and ip != "Unknown":
+            try:
+                import ipaddress
+
+                ipaddress.ip_address(ip)
+            except Exception:
+                note_or_raise(
+                    self.extra,
+                    "SystemInfo.ip_address",
+                    ValueError(f"Invalid IP address: {self.ip_address!r}"),
+                    mode=mode,
+                    raw=self.ip_address,
+                )
+                self.ip_address = "Unknown"
+
+        return True
 
     def to_dict(self) -> dict:
         d = {
@@ -3640,18 +3813,30 @@ class SystemInfo:
         return _jsonable(drop_none_keys(d))
 
     @staticmethod
-    def from_dict(settings: Any) -> "SystemInfo":
+    def from_dict(settings: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemInfo":
+        mode = as_parse_mode(mode)
+        strict = is_strict(mode)
+
         if isinstance(settings, SystemInfo):
+            settings.validate(mode=mode)
             return settings
         if not isinstance(settings, dict):
-            return SystemInfo()
+            if strict:
+                raise TypeError(f"SystemInfo.from_dict expects a dict, got {type(settings)}")
+            return SystemInfo(_mode=mode)
 
-        known = (
-            "name","ip_address","manufacturer","model","serial_number",
-            "hardware_version","software_version","supertem_version",
-            "application","application_version",
-            "extra",
-        )
+        known = {
+            "name",
+            "ip_address",
+            "manufacturer",
+            "model",
+            "serial_number",
+            "hardware_version",
+            "software_version",
+            "supertem_version",
+            "application",
+            "application_version",
+        }
         extra = collect_extra(settings, known=known, owner="SystemInfo")
 
         return SystemInfo(
@@ -3666,43 +3851,80 @@ class SystemInfo:
             application=settings.get("application", None),
             application_version=settings.get("application_version", None),
             extra=extra,
+            _mode=mode,
         )
 
 @dataclass
 class SystemSettings:
+    """Microscope system settings (stage/beam/detector + identity info).
+
+    This is a config boundary:
+      - Use STRICT when you are about to *apply* settings to hardware.
+      - Use LENIENT when loading older/partial configs.
+    """
+
     stage: StageSystemSettings = field(default_factory=StageSystemSettings)
     beam: BeamSystemSettings = field(default_factory=BeamSystemSettings)
     detector: DetectorSystemSettings = field(default_factory=DetectorSystemSettings)
     info: SystemInfo = field(default_factory=SystemInfo)
 
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
+
     def __post_init__(self):
+        mode = as_parse_mode(self._mode)
+        strict = is_strict(mode)
+
+        # stage
         if isinstance(self.stage, dict):
-            self.stage = StageSystemSettings.from_dict(self.stage)
+            self.stage = StageSystemSettings.from_dict(self.stage, mode=mode)
         elif self.stage is None:
-            self.stage = StageSystemSettings()
+            self.stage = StageSystemSettings(_mode=mode)
         elif not isinstance(self.stage, StageSystemSettings):
-            self.stage = StageSystemSettings()
+            if strict:
+                raise TypeError(f"SystemSettings.stage must be StageSystemSettings/dict, got {type(self.stage)}")
+            self.stage = StageSystemSettings(_mode=mode)
 
+        # beam
         if isinstance(self.beam, dict):
-            self.beam = BeamSystemSettings.from_dict(self.beam)
+            self.beam = BeamSystemSettings.from_dict(self.beam, mode=mode)
         elif self.beam is None:
-            self.beam = BeamSystemSettings()
+            self.beam = BeamSystemSettings(_mode=mode)
         elif not isinstance(self.beam, BeamSystemSettings):
-            self.beam = BeamSystemSettings()
+            if strict:
+                raise TypeError(f"SystemSettings.beam must be BeamSystemSettings/dict, got {type(self.beam)}")
+            self.beam = BeamSystemSettings(_mode=mode)
 
+        # detector
         if isinstance(self.detector, dict):
-            self.detector = DetectorSystemSettings.from_dict(self.detector)
+            self.detector = DetectorSystemSettings.from_dict(self.detector, mode=mode)
         elif self.detector is None:
-            self.detector = DetectorSystemSettings()
+            self.detector = DetectorSystemSettings(_mode=mode)
         elif not isinstance(self.detector, DetectorSystemSettings):
-            self.detector = DetectorSystemSettings()
+            if strict:
+                raise TypeError(f"SystemSettings.detector must be DetectorSystemSettings/dict, got {type(self.detector)}")
+            self.detector = DetectorSystemSettings(_mode=mode)
 
+        # info
         if isinstance(self.info, dict):
-            self.info = SystemInfo.from_dict(self.info)
+            self.info = SystemInfo.from_dict(self.info, mode=mode)
         elif self.info is None:
-            self.info = SystemInfo()
+            self.info = SystemInfo(_mode=mode)
         elif not isinstance(self.info, SystemInfo):
-            self.info = SystemInfo()
+            if strict:
+                raise TypeError(f"SystemSettings.info must be SystemInfo/dict, got {type(self.info)}")
+            self.info = SystemInfo(_mode=mode)
+
+        self.validate(mode=mode)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode = as_parse_mode(self._mode if mode is None else mode)
+
+        self.stage.validate(mode=mode)
+        self.beam.validate(mode=mode)
+        self.detector.validate(mode=mode)
+        self.info.validate(mode=mode)
+
+        return True
 
     def to_dict(self) -> dict:
         d = {
@@ -3714,71 +3936,107 @@ class SystemSettings:
         return _jsonable(drop_none_keys(d))
 
     @staticmethod
-    def from_dict(settings: Any) -> "SystemSettings":
+    def from_dict(settings: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemSettings":
+        mode = as_parse_mode(mode)
+        strict = is_strict(mode)
+
         if isinstance(settings, SystemSettings):
+            settings.validate(mode=mode)
             return settings
         if not isinstance(settings, dict):
-            return SystemSettings()
+            if strict:
+                raise TypeError(f"SystemSettings.from_dict expects a dict, got {type(settings)}")
+            return SystemSettings(_mode=mode)
 
         return SystemSettings(
-            stage=StageSystemSettings.from_dict(settings.get("stage")),
-            beam=BeamSystemSettings.from_dict(settings.get("beam")),
-            detector=DetectorSystemSettings.from_dict(settings.get("detector")),
-            info=SystemInfo.from_dict(settings.get("info")),
+            stage=settings.get("stage"),
+            beam=settings.get("beam"),
+            detector=settings.get("detector"),
+            info=settings.get("info"),
+            _mode=mode,
         )
 
 @dataclass
 class MicroscopeSettings:
+    """Top-level settings bundle (system + image + protocol blob)."""
 
-    """
-    A data class representing the settings for a microscope system.
-
-    Attributes:
-        system (SystemSettings): An instance of the `SystemSettings` class that holds the system settings.
-        image (ImageOutputSettings): An instance of the `ImageOutputSettings` class that holds the image settings.
-        protocol (dict, optional): A dictionary representing the protocol settings. Defaults to {"name": "demo"}.
-
-    Methods:
-        to_dict(): Returns a dictionary representation of the `MicroscopeSettings` object.
-        from_dict(settings: dict, protocol: dict = None) -> "MicroscopeSettings": Returns an instance of the `MicroscopeSettings` class from a dictionary.
-    """
     system: SystemSettings = field(default_factory=SystemSettings)
     image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
-    protocol: Dict[str, Any] = field(default_factory=lambda: {"name":"demo"})
+
+    # Protocol is intentionally a free-form dict (owned by higher-level logic).
+    protocol: dict = field(default_factory=lambda: {"name": "demo"})
+
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
+        mode = as_parse_mode(self._mode)
+        strict = is_strict(mode)
+
         if isinstance(self.system, dict):
-            self.system = SystemSettings.from_dict(self.system)
+            self.system = SystemSettings.from_dict(self.system, mode=mode)
         elif self.system is None:
-            self.system = SystemSettings()
+            self.system = SystemSettings(_mode=mode)
         elif not isinstance(self.system, SystemSettings):
-            self.system = SystemSettings()
+            if strict:
+                raise TypeError(f"MicroscopeSettings.system must be SystemSettings/dict, got {type(self.system)}")
+            self.system = SystemSettings(_mode=mode)
 
         if isinstance(self.image, dict):
-            self.image = ImageOutputSettings.from_dict(self.image)
+            self.image = ImageOutputSettings.from_dict(self.image, mode=mode)
         elif self.image is None:
-            self.image = ImageOutputSettings()
+            self.image = ImageOutputSettings(_mode=mode)
         elif not isinstance(self.image, ImageOutputSettings):
-            self.image = ImageOutputSettings()
+            if strict:
+                raise TypeError(f"MicroscopeSettings.image must be ImageOutputSettings/dict, got {type(self.image)}")
+            self.image = ImageOutputSettings(_mode=mode)
 
+        if self.protocol is None:
+            self.protocol = {"name": "demo"}
+        elif not isinstance(self.protocol, dict):
+            if strict:
+                raise TypeError(f"MicroscopeSettings.protocol must be dict, got {type(self.protocol)}")
+            self.protocol = {"name": "demo"}
+
+        self.validate(mode=mode)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode = as_parse_mode(self._mode if mode is None else mode)
+
+        self.system.validate(mode=mode)
+        self.image.validate(mode=mode)
+
+        # Protocol is free-form, but must stay JSON-able; `_jsonable` handles conversion.
         if not isinstance(self.protocol, dict):
-            self.protocol = {"name":"demo"}
+            note_or_raise(None, "MicroscopeSettings.protocol", TypeError("protocol must be a dict"), mode=mode, raw=self.protocol)
+            self.protocol = {"name": "demo"}
+
+        return True
 
     def to_dict(self) -> dict:
         d = {
             "system": self.system.to_dict(),
             "image": self.image.to_dict(),
+            "protocol": _jsonable(self.protocol),
         }
-        if self.protocol:
-            d["protocol"] = deepcopy(self.protocol)
         return _jsonable(drop_none_keys(d))
 
     @staticmethod
-    def from_dict(settings: Any, protocol: Optional[dict] = None) -> "MicroscopeSettings":
+    def from_dict(
+        settings: Any,
+        protocol: Optional[dict] = None,
+        *,
+        mode: Union[ParseMode, str, None] = ParseMode.LENIENT,
+    ) -> "MicroscopeSettings":
+        mode = as_parse_mode(mode)
+        strict = is_strict(mode)
+
         if isinstance(settings, MicroscopeSettings):
+            settings.validate(mode=mode)
             return settings
         if not isinstance(settings, dict):
-            return MicroscopeSettings()
+            if strict:
+                raise TypeError(f"MicroscopeSettings.from_dict expects a dict, got {type(settings)}")
+            return MicroscopeSettings(_mode=mode)
 
         settings_proto = settings.get("protocol", None)
         if protocol is None:
@@ -3787,8 +4045,8 @@ class MicroscopeSettings:
             protocol = settings_proto if isinstance(settings_proto, dict) else {"name": "demo"}
 
         return MicroscopeSettings(
-            system=SystemSettings.from_dict(settings.get("system")),
-            image=ImageOutputSettings.from_dict(settings.get("image")),
+            system=settings.get("system"),
+            image=settings.get("image"),
             protocol=protocol,
+            _mode=mode,
         )
-
