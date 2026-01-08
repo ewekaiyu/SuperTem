@@ -767,6 +767,14 @@ def _jsonable(obj: Any) -> Any:
     return str(obj)
 
 
+def _setup_init(obj: Any, mode_input: Any, owner_name: str) -> Tuple[ParseMode, bool, Extras]:
+    """Reduce boilerplate in __post_init__ methods."""
+    mode = as_parse_mode(mode_input)
+    strict = is_strict(mode)
+    extra = normalize_extra(obj.extra) if strict else normalize_extra_lenient(obj.extra, owner_name)
+    return mode, strict, extra
+
+
 # =============================================================================
 # Structures
 # =============================================================================
@@ -828,9 +836,7 @@ class ROI:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "ROI")
+        mode, strict, self.extra = _setup_init(self, self._mode, "ROI")
         self.x = parse_optional_int_like(self.x, name="ROI.x", strict=strict, extra=self.extra) or 0
         self.y = parse_optional_int_like(self.y, name="ROI.y", strict=strict, extra=self.extra) or 0
         self.width = parse_optional_int_like(self.width, name="ROI.width", strict=strict, extra=self.extra) or 512
@@ -907,9 +913,7 @@ class TemStagePosition:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, 'TemStagePosition')
+        mode, strict, self.extra = _setup_init(self, self._mode, "TemStagePosition")
         self.name = parse_optional_str_like(self.name, name="TemStagePosition.name", strict=strict, extra=self.extra)
         self.coordinate_system = parse_optional_str_like(self.coordinate_system, name="TemStagePosition.coordinate_system", strict=strict, extra=self.extra)
 
@@ -1074,9 +1078,7 @@ class StageSystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "StageSystemSettings")
+        mode, strict, self.extra = _setup_init(self, self._mode, "StageSystemSettings")
 
         self.enabled = parse_bool(self.enabled, default=True)
         self.can_x = parse_bool(self.can_x, default=True)
@@ -1210,9 +1212,7 @@ class BeamSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "BeamSettings")
+        mode, strict, self.extra = _setup_init(self, self._mode, "BeamSettings")
 
         def _q(val, unit, name):
             q = ensure_quantity(val, unit)
@@ -1295,9 +1295,7 @@ class BeamSystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "BeamSystemSettings")
+        mode, strict, self.extra = _setup_init(self, self._mode, "BeamSystemSettings")
         self.enabled = parse_bool(self.enabled, default=True)
         self.default_beam = maybe_from_dict(BeamSettings, self.default_beam, mode=mode) or BeamSettings(_mode=mode)
 
@@ -1394,9 +1392,7 @@ class DetectorSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "DetectorSettings")
+        mode, strict, self.extra = _setup_init(self, self._mode, "DetectorSettings")
 
         def _q(val, unit, name):
             q = ensure_quantity(val, unit)
@@ -1503,22 +1499,34 @@ class DetectorCapabilities:
 
     def __post_init__(self):
         self.extra = normalize_extra(self.extra)
+
+        # Pairs
         self.binning_xy_min = parse_optional_pair_int_like(self.binning_xy_min, name="DetectorCapabilities.binning_xy_min", strict=False, extra=self.extra)
         self.binning_xy_max = parse_optional_pair_int_like(self.binning_xy_max, name="DetectorCapabilities.binning_xy_max", strict=False, extra=self.extra)
         self.roi_min = parse_optional_pair_int_like(self.roi_min, name="DetectorCapabilities.roi_min", strict=False, extra=self.extra)
         self.roi_max = parse_optional_pair_int_like(self.roi_max, name="DetectorCapabilities.roi_max", strict=False, extra=self.extra)
 
-        for name in ("binning_index_min", "binning_index_max", "frame_integration_min", "frame_integration_max", "gain_index_min", "gain_index_max", "offset_index_min", "offset_index_max"):
-            v = getattr(self, name)
-            setattr(self, name, parse_optional_int_like(v, name=f"DetectorCapabilities.{name}", strict=False, extra=self.extra))
+        # Ints
+        self.binning_index_min = parse_optional_int_like(self.binning_index_min, name="DetectorCapabilities.binning_index_min", strict=False, extra=self.extra)
+        self.binning_index_max = parse_optional_int_like(self.binning_index_max, name="DetectorCapabilities.binning_index_max", strict=False, extra=self.extra)
+        self.frame_integration_min = parse_optional_int_like(self.frame_integration_min, name="DetectorCapabilities.frame_integration_min", strict=False, extra=self.extra)
+        self.frame_integration_max = parse_optional_int_like(self.frame_integration_max, name="DetectorCapabilities.frame_integration_max", strict=False, extra=self.extra)
+        self.gain_index_min = parse_optional_int_like(self.gain_index_min, name="DetectorCapabilities.gain_index_min", strict=False, extra=self.extra)
+        self.gain_index_max = parse_optional_int_like(self.gain_index_max, name="DetectorCapabilities.gain_index_max", strict=False, extra=self.extra)
+        self.offset_index_min = parse_optional_int_like(self.offset_index_min, name="DetectorCapabilities.offset_index_min", strict=False, extra=self.extra)
+        self.offset_index_max = parse_optional_int_like(self.offset_index_max, name="DetectorCapabilities.offset_index_max", strict=False, extra=self.extra)
 
-        for name in ("exposure_ms_min", "exposure_ms_max", "digital_rotation_deg_min", "digital_rotation_deg_max"):
-            v = getattr(self, name)
-            setattr(self, name, parse_optional_float_like(v, name=f"DetectorCapabilities.{name}", strict=False, extra=self.extra))
+        # Floats
+        self.exposure_ms_min = parse_optional_float_like(self.exposure_ms_min, name="DetectorCapabilities.exposure_ms_min", strict=False, extra=self.extra)
+        self.exposure_ms_max = parse_optional_float_like(self.exposure_ms_max, name="DetectorCapabilities.exposure_ms_max", strict=False, extra=self.extra)
+        self.digital_rotation_deg_min = parse_optional_float_like(self.digital_rotation_deg_min, name="DetectorCapabilities.digital_rotation_deg_min", strict=False, extra=self.extra)
+        self.digital_rotation_deg_max = parse_optional_float_like(self.digital_rotation_deg_max, name="DetectorCapabilities.digital_rotation_deg_max", strict=False, extra=self.extra)
 
-        for name in ("can_binning", "can_gain", "can_offset", "can_digital_rotation"):
-            v = getattr(self, name)
-            setattr(self, name, parse_optional_bool_like(v, name=f"DetectorCapabilities.{name}", strict=False, extra=self.extra))
+        # Bools
+        self.can_binning = parse_optional_bool_like(self.can_binning, name="DetectorCapabilities.can_binning", strict=False, extra=self.extra)
+        self.can_gain = parse_optional_bool_like(self.can_gain, name="DetectorCapabilities.can_gain", strict=False, extra=self.extra)
+        self.can_offset = parse_optional_bool_like(self.can_offset, name="DetectorCapabilities.can_offset", strict=False, extra=self.extra)
+        self.can_digital_rotation = parse_optional_bool_like(self.can_digital_rotation, name="DetectorCapabilities.can_digital_rotation", strict=False, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         # Header: Validate (semantic correctness) happens only when validate() is called.
@@ -1613,9 +1621,7 @@ class DetectorSystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "DetectorSystemSettings")
+        mode, strict, self.extra = _setup_init(self, self._mode, "DetectorSystemSettings")
         self.enabled = parse_bool(self.enabled, default=True)
 
         # Normalize mapping containers
@@ -1818,9 +1824,7 @@ class ImageOutputSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "ImageOutputSettings")
+        mode, strict, self.extra = _setup_init(self, self._mode, "ImageOutputSettings")
         self.file_format = parse_optional_str_like(self.file_format, name="ImageOutputSettings.file_format", strict=strict, extra=self.extra) or "tiff"
         self.file_format = self.file_format.lower()
         self.path = parse_optional_str_like(self.path, name="ImageOutputSettings.path", strict=strict, extra=self.extra)
@@ -1857,9 +1861,7 @@ class AcquisitionRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "AcquisitionRequest")
+        mode, strict, self.extra = _setup_init(self, self._mode, "AcquisitionRequest")
 
         self.detector = maybe_from_dict(DetectorSettings, self.detector, mode=mode) or DetectorSettings(_mode=mode)
         self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
@@ -1924,9 +1926,7 @@ class MicroscopeState:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "MicroscopeState")
+        mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeState")
         self.stage_position = maybe_from_dict(TemStagePosition, self.stage_position, mode=mode) or TemStagePosition()
         self.beam = maybe_from_dict(BeamSettings, self.beam, mode=mode) or BeamSettings()
 
@@ -2018,9 +2018,7 @@ class TemImageMetadata:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "TemImageMetadata")
+        mode, strict, self.extra = _setup_init(self, self._mode, "TemImageMetadata")
         self.microscope_state = maybe_from_dict(MicroscopeState, self.microscope_state, mode=mode)
 
         # Scalar normalizations using parsers
@@ -2211,9 +2209,7 @@ class SystemInfo:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        strict = is_strict(mode)
-        self.extra = normalize_extra(self.extra) if strict else normalize_extra_lenient(self.extra, "SystemInfo")
+        mode, strict, self.extra = _setup_init(self, self._mode, "SystemInfo")
         for f in fields(SystemInfo):
              if f.name == "extra" or f.name.startswith("_"): continue
              v = getattr(self, f.name)
