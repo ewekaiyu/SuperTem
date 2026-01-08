@@ -1314,14 +1314,13 @@ class BeamSettings:
     """Electron beam parameters.
 
     Controls Voltage, Current, Spot Size, and Shifts.
-    Strictness:
-    - STRICT: Raises Error if inputs are unparseable (e.g. "garbage" voltage).
-    - LENIENT: Records error in extras, sets field to None, and proceeds.
     """
     voltage: Optional["Quantity"] = None
     beam_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
     convergence_angle: Optional["Quantity"] = None
+    # NEW: Defocus is critical for TEM/STEM
+    defocus: Optional["Quantity"] = None
     stigmation: Optional[Point] = None
     beam_shift: Optional[Point] = None
     image_shift: Optional[Point] = None
@@ -1335,17 +1334,17 @@ class BeamSettings:
         def _q(val, unit, name):
             q = ensure_quantity(val, unit)
             if val is not None and q is None:
-                # Critical Strictness Check:
-                # If value existed but failed parsing, Strict mode MUST fail.
-                # Lenient mode swallows it (value becomes None).
                 note_or_raise(self.extra, name, ValueError(f"Invalid {name}: {val!r}"), mode=mode, raw=val)
             return q
 
         self.voltage = _q(self.voltage, "kV", "BeamSettings.voltage")
         self.beam_current = _q(self.beam_current, "nA", "BeamSettings.beam_current")
         self.convergence_angle = _q(self.convergence_angle, "mrad", "BeamSettings.convergence_angle")
+        # NEW: Parse defocus
+        self.defocus = _q(self.defocus, "nanometer", "BeamSettings.defocus")
         self.scan_rotation = _q(self.scan_rotation, "degree", "BeamSettings.scan_rotation")
-        self.spot_size = parse_optional_int_like(self.spot_size, name="BeamSettings.spot_size", strict=strict, extra=self.extra)
+        self.spot_size = parse_optional_int_like(self.spot_size, name="BeamSettings.spot_size", strict=strict,
+                                                 extra=self.extra)
 
         self.stigmation = _maybe_point(self.stigmation, extra=self.extra, name="BeamSettings.stigmation", mode=mode)
         self.beam_shift = _maybe_point(self.beam_shift, extra=self.extra, name="BeamSettings.beam_shift", mode=mode)
@@ -1354,19 +1353,15 @@ class BeamSettings:
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
         ok = True
-
         if self.voltage is not None and self.voltage.magnitude <= 0:
             note_or_raise(self.extra, "BeamSettings.voltage", ValueError("Voltage must be > 0"), mode=mode)
             ok = False
-
         if self.beam_current is not None and self.beam_current.magnitude < 0:
             note_or_raise(self.extra, "BeamSettings.beam_current", ValueError("Beam current must be >= 0"), mode=mode)
             ok = False
-
         if self.spot_size is not None and self.spot_size < 0:
             note_or_raise(self.extra, "BeamSettings.spot_size", ValueError("Spot size must be >= 0"), mode=mode)
             ok = False
-
         return ok
 
     def to_dict(self) -> dict:
@@ -1374,6 +1369,8 @@ class BeamSettings:
             "voltage_kv": serialize_quantity(self.voltage, "kV"),
             "beam_current_na": serialize_quantity(self.beam_current, "nA"),
             "convergence_angle_mrad": serialize_quantity(self.convergence_angle, "mrad"),
+            # NEW: Serialize defocus
+            "defocus_nm": serialize_quantity(self.defocus, "nm"),
             "scan_rotation_deg": serialize_quantity(self.scan_rotation, "degree"),
             "spot_size": self.spot_size,
             "stigmation": self.stigmation.to_dict() if self.stigmation else None,
@@ -1389,14 +1386,25 @@ class BeamSettings:
         if isinstance(d, BeamSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return BeamSettings(_mode=mode)
 
-        extra = collect_extra(d, ("voltage", "voltage_kv", "accelerating_voltage_kv", "beam_current", "beam_current_na", "current",
-                                  "spot_size", "spot", "convergence_angle", "convergence_angle_mrad", "convergence_mrad",
-                                  "stigmation", "beam_shift", "image_shift", "scan_rotation", "scan_rotation_deg", "extra"), owner="BeamSettings")
+        # Updated known keys
+        known = {
+            "voltage", "voltage_kv", "accelerating_voltage_kv",
+            "beam_current", "beam_current_na", "current",
+            "spot_size", "spot",
+            "convergence_angle", "convergence_angle_mrad", "convergence_mrad",
+            "defocus", "defocus_nm",  # NEW
+            "stigmation", "beam_shift", "image_shift",
+            "scan_rotation", "scan_rotation_deg", "extra"
+        }
+        extra = collect_extra(d, known, owner="BeamSettings")
+
         return BeamSettings(
             voltage=d.get("voltage", d.get("voltage_kv", d.get("accelerating_voltage_kv"))),
             beam_current=d.get("beam_current", d.get("beam_current_na", d.get("current"))),
             spot_size=d.get("spot_size", d.get("spot")),
             convergence_angle=d.get("convergence_angle", d.get("convergence_angle_mrad", d.get("convergence_mrad"))),
+            # NEW: Parse defocus
+            defocus=d.get("defocus", d.get("defocus_nm")),
             stigmation=d.get("stigmation"),
             beam_shift=d.get("beam_shift"),
             image_shift=d.get("image_shift"),
@@ -2078,17 +2086,58 @@ class AcquisitionRequest:
             extra=extra, _mode=mode
         )
 
+@dataclass
+class Aperture:
+    """State of a specific aperture mechanism (position, insertion, size)."""
+    aperture_id: Optional[str] = None
+    inserted: bool = False
+    size_index: Optional[int] = None
+    position: Optional[Point] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
+
+    def __post_init__(self):
+        mode, strict, self.extra = _setup_init(self, self._mode, "Aperture")
+        self.aperture_id = parse_optional_id_like(self.aperture_id, name="Aperture.aperture_id", strict=strict, extra=self.extra)
+        self.inserted = parse_bool(self.inserted, default=False)
+        self.size_index = parse_optional_int_like(self.size_index, name="Aperture.size_index", strict=strict, extra=self.extra)
+        self.position = _maybe_point(self.position, extra=self.extra, name="Aperture.position", mode=mode)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        return True
+
+    def to_dict(self) -> dict:
+        d = {
+            "aperture_id": self.aperture_id,
+            "inserted": self.inserted,
+            "size_index": self.size_index,
+            "position": self.position.to_dict() if self.position else None
+        }
+        add_extra_if_any(d, self.extra)
+        return _jsonable(drop_none_keys(d))
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Aperture":
+        mode = as_parse_mode(mode)
+        if isinstance(d, Aperture): return replace(d, _mode=mode)
+        if not isinstance(d, dict): return Aperture(_mode=mode)
+        extra = collect_extra(d, ("aperture_id", "name", "id", "inserted", "size_index", "position", "extra"), owner="Aperture")
+        return Aperture(
+            aperture_id=d.get("aperture_id", d.get("name", d.get("id"))),
+            inserted=d.get("inserted", False),
+            size_index=d.get("size_index"),
+            position=d.get("position"),
+            extra=extra, _mode=mode
+        )
 
 @dataclass
 class MicroscopeState:
-    """Snapshot of the microscope status at a specific moment.
-
-    Contains Stage, Beam, and active Detectors.
-    Cross-references 'active_detector_ids' against 'detectors' map to ensure consistency.
-    """
+    """Snapshot of the microscope status at a specific moment."""
     timestamp: float = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp())
+    mode: Optional[str] = None
     stage_position: StagePosition = field(default_factory=StagePosition)
     beam: BeamSettings = field(default_factory=BeamSettings)
+    apertures: Dict[str, Aperture] = field(default_factory=dict)
     detectors: Dict[str, DetectorSettings] = field(default_factory=dict)
     active_detector_ids: List[str] = field(default_factory=list)
     primary_detector_id: Optional[str] = None
@@ -2097,25 +2146,65 @@ class MicroscopeState:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeState")
+        self.mode = parse_optional_str_like(self.mode, name="MicroscopeState.mode", strict=strict, extra=self.extra)
         self.stage_position = maybe_from_dict(StagePosition, self.stage_position, mode=mode) or StagePosition()
         self.beam = maybe_from_dict(BeamSettings, self.beam, mode=mode) or BeamSettings()
+
+        raw_aps = self.apertures or {}
+        self.apertures = {}
+        for k, v in raw_aps.items():
+            ap_key = parse_optional_id_like(k, name="MicroscopeState.apertures.key", strict=strict, extra=self.extra)
+            if ap_key is None:
+                if self.extra:
+                    self.extra.notes[f"MicroscopeState.apertures.{k}_raw_key"] = "Invalid ID"
+                continue
+
+            ap_obj = maybe_from_dict(Aperture, v, mode=mode)
+            if ap_obj is None:
+                ap_obj = Aperture(_mode=mode)
+
+            if ap_obj.aperture_id is None:
+                ap_obj.aperture_id = ap_key
+            elif ap_obj.aperture_id != ap_key:
+                note_or_raise(self.extra, f"MicroscopeState.apertures.{ap_key}.id_mismatch",
+                              ValueError(f"Aperture key '{ap_key}' != internal id '{ap_obj.aperture_id}'"), mode=mode)
+                ap_obj.aperture_id = ap_key
+
+            self.apertures[ap_key] = ap_obj
 
         raw_dets = self.detectors or {}
         self.detectors = {}
         for k, v in raw_dets.items():
-            det_id = parse_optional_id_like(k, name="MicroscopeState.detectors.key", strict=strict, extra=self.extra)
-            if det_id:
-                self.detectors[det_id] = maybe_from_dict(DetectorSettings, v, mode=mode) or DetectorSettings()
+            det_key = parse_optional_id_like(k, name="MicroscopeState.detectors.key", strict=strict, extra=self.extra)
+            if det_key is None:
+                if self.extra:
+                    self.extra.notes[f"MicroscopeState.detectors.{k}_raw_key"] = "Invalid ID"
+                continue
 
-        # Parse active IDs to ensure strings
+            det_obj = maybe_from_dict(DetectorSettings, v, mode=mode)
+            if det_obj is None:
+                det_obj = DetectorSettings(_mode=mode)
+
+            if det_obj.detector_id is None:
+                det_obj.detector_id = det_key
+            elif det_obj.detector_id != det_key:
+                note_or_raise(self.extra, f"MicroscopeState.detectors.{det_key}.id_mismatch",
+                              ValueError(f"Detector key '{det_key}' != internal id '{det_obj.detector_id}'"), mode=mode)
+                det_obj.detector_id = det_key
+
+            self.detectors[det_key] = det_obj
+
         raw_ids = self.active_detector_ids or []
         self.active_detector_ids = []
         for raw_id in raw_ids:
-            norm_id = parse_optional_id_like(raw_id, name="MicroscopeState.active_detector_ids", strict=strict, extra=self.extra)
+            norm_id = parse_optional_id_like(raw_id, name="MicroscopeState.active_detector_ids", strict=strict,
+                                             extra=self.extra)
             if norm_id:
                 self.active_detector_ids.append(norm_id)
 
-        self.primary_detector_id = parse_optional_id_like(self.primary_detector_id, name="MicroscopeState.primary_detector_id", strict=strict, extra=self.extra)
+        self.primary_detector_id = parse_optional_id_like(self.primary_detector_id,
+                                                          name="MicroscopeState.primary_detector_id", strict=strict,
+                                                          extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -2123,10 +2212,14 @@ class MicroscopeState:
         ok = True
         ok = self.stage_position.validate(mode=mode) and ok
         ok = self.beam.validate(mode=mode) and ok
+
+        # Validate Maps
         for ds in self.detectors.values():
             ok = ds.validate(mode=mode) and ok
+        for ap in self.apertures.values():
+            ok = ap.validate(mode=mode) and ok
 
-        # Cross-field check: Active IDs must exist in detectors map
+        # Validate ID References
         valid_ids = []
         for det_id in self.active_detector_ids:
             if det_id not in self.detectors:
@@ -2145,8 +2238,10 @@ class MicroscopeState:
     def to_dict(self) -> dict:
         d = {
             "timestamp": self.timestamp,
+            "mode": self.mode,
             "stage_position": self.stage_position.to_dict(),
             "beam": self.beam.to_dict(),
+            "apertures": {k: v.to_dict() for k, v in self.apertures.items()},
             "detectors": {k: v.to_dict() for k, v in self.detectors.items()},
             "active_detector_ids": self.active_detector_ids,
             "primary_detector_id": self.primary_detector_id
@@ -2161,15 +2256,17 @@ class MicroscopeState:
         if not isinstance(d, dict): return MicroscopeState(_mode=mode)
         return MicroscopeState(
             timestamp=d.get("timestamp"),
+            mode=d.get("mode"),
             stage_position=d.get("stage_position"),
             beam=d.get("beam"),
+            apertures=d.get("apertures"),
             detectors=d.get("detectors") or {},
             active_detector_ids=d.get("active_detector_ids") or [],
             primary_detector_id=d.get("primary_detector_id"),
-            extra=collect_extra(d, ("timestamp", "stage_position", "beam", "detectors", "extra"), owner="MicroscopeState"),
+            extra=collect_extra(d, ("timestamp", "mode", "stage_position", "beam", "apertures", "detectors", "extra"),
+                                owner="MicroscopeState"),
             _mode=mode
         )
-
 
 @dataclass
 class MicroscopeImageMetadata:
