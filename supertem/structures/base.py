@@ -285,8 +285,8 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
     if isinstance(value, (bool, np.bool_)):
         return None
 
-        # OPTIMIZATION: Fast path for plain numbers
-        # Avoids the overhead of the Pint string parser for standard inputs.
+    # OPTIMIZATION: Fast path for plain numbers
+    # Avoids the overhead of the Pint string parser for standard inputs.
     if isinstance(value, (int, float, np.number)):
         # Trust that raw numbers are already in the target base unit
         return Q_(float(value), unit)
@@ -856,6 +856,10 @@ class Point:
     """A simple 3D coordinate with an optional name.
 
     Used for stigmation, beam shifts, and image shifts.
+
+    Note:
+        This class intentionally omits the `extra` container to keep it
+        lightweight, as points are often created in high volumes.
     """
     x: float = 0.0
     y: float = 0.0
@@ -866,7 +870,6 @@ class Point:
     def __post_init__(self):
         mode = as_parse_mode(self._mode)
         strict = is_strict(mode)
-        # Fix: Pass strictness down to validation helper
         self.x = self._parse_val(self.x, "Point.x", strict)
         self.y = self._parse_val(self.y, "Point.y", strict)
         self.z = self._parse_val(self.z, "Point.z", strict)
@@ -880,13 +883,11 @@ class Point:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Point":
-        # Fix: Accept mode argument to propagate strictness
         mode = as_parse_mode(mode)
         if isinstance(d, Point):
             return replace(d, _mode=mode)
 
         def _f(v: Any) -> float:
-            # Fix: Respect strict mode in helper
             out = parse_optional_float_like(v, name="Point", strict=is_strict(mode))
             return 0.0 if out is None else float(out)
 
@@ -910,11 +911,8 @@ class Point:
         return [self.x, self.y, self.z]
 
     def _parse_val(self, v: Any, name: str, strict: bool) -> float:
-        # Fix: Helper now respects strict flag
         out = parse_optional_float_like(v, name=name, strict=strict)
         if out is None:
-            # If we are here in STRICT mode, it means input was explicitly None (allowed).
-            # If input was "garbage", parse_optional_float_like would have ALREADY raised.
             return 0.0
         return float(out)
 
@@ -1002,7 +1000,7 @@ class ROI:
         )
 
 @dataclass
-class TemStagePosition:
+class StagePosition:
     """5-axis microscope stage position.
 
     Stores physical coordinates (x, y, z, tilt, rotation) as Pint Quantities.
@@ -1020,9 +1018,9 @@ class TemStagePosition:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        mode, strict, self.extra = _setup_init(self, self._mode, "TemStagePosition")
-        self.name = parse_optional_str_like(self.name, name="TemStagePosition.name", strict=strict, extra=self.extra)
-        self.coordinate_system = parse_optional_str_like(self.coordinate_system, name="TemStagePosition.coordinate_system", strict=strict, extra=self.extra)
+        mode, strict, self.extra = _setup_init(self, self._mode, "StagePosition")
+        self.name = parse_optional_str_like(self.name, name="StagePosition.name", strict=strict, extra=self.extra)
+        self.coordinate_system = parse_optional_str_like(self.coordinate_system, name="StagePosition.coordinate_system", strict=strict, extra=self.extra)
 
         def coerce_axis(raw: Any, unit: str, field_name: str) -> Optional["Quantity"]:
             q = ensure_quantity(raw, unit)
@@ -1031,12 +1029,12 @@ class TemStagePosition:
                 return None
             return q
 
-        self.x = coerce_axis(self.x, "nanometer", "TemStagePosition.x")
-        self.y = coerce_axis(self.y, "nanometer", "TemStagePosition.y")
-        self.z = coerce_axis(self.z, "nanometer", "TemStagePosition.z")
-        self.r = coerce_axis(self.r, "degree", "TemStagePosition.r")
-        self.tilt_x = coerce_axis(self.tilt_x, "degree", "TemStagePosition.tilt_x")
-        self.tilt_y = coerce_axis(self.tilt_y, "degree", "TemStagePosition.tilt_y")
+        self.x = coerce_axis(self.x, "nanometer", "StagePosition.x")
+        self.y = coerce_axis(self.y, "nanometer", "StagePosition.y")
+        self.z = coerce_axis(self.z, "nanometer", "StagePosition.z")
+        self.r = coerce_axis(self.r, "degree", "StagePosition.r")
+        self.tilt_x = coerce_axis(self.tilt_x, "degree", "StagePosition.tilt_x")
+        self.tilt_y = coerce_axis(self.tilt_y, "degree", "StagePosition.tilt_y")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -1055,12 +1053,12 @@ class TemStagePosition:
                 note_or_raise(self.extra, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode, raw=mag)
                 return None
             return qq
-        self.x = cleaned(self.x, "nanometer", "TemStagePosition.x")
-        self.y = cleaned(self.y, "nanometer", "TemStagePosition.y")
-        self.z = cleaned(self.z, "nanometer", "TemStagePosition.z")
-        self.r = cleaned(self.r, "degree", "TemStagePosition.r")
-        self.tilt_x = cleaned(self.tilt_x, "degree", "TemStagePosition.tilt_x")
-        self.tilt_y = cleaned(self.tilt_y, "degree", "TemStagePosition.tilt_y")
+        self.x = cleaned(self.x, "nanometer", "StagePosition.x")
+        self.y = cleaned(self.y, "nanometer", "StagePosition.y")
+        self.z = cleaned(self.z, "nanometer", "StagePosition.z")
+        self.r = cleaned(self.r, "degree", "StagePosition.r")
+        self.tilt_x = cleaned(self.tilt_x, "degree", "StagePosition.tilt_x")
+        self.tilt_y = cleaned(self.tilt_y, "degree", "StagePosition.tilt_y")
         return True
 
     def to_dict(self) -> dict:
@@ -1078,20 +1076,20 @@ class TemStagePosition:
         return _jsonable(drop_none_keys(d))
 
     @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> 'TemStagePosition':
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> 'StagePosition':
         mode = as_parse_mode(mode)
         strict = is_strict(mode)
-        if isinstance(d, TemStagePosition):
+        if isinstance(d, StagePosition):
             try:
                 if is_dataclass(d): return replace(d, _mode=mode)
             except Exception: pass
             return d
-        if d is None: return TemStagePosition(_mode=mode)
+        if d is None: return StagePosition(_mode=mode)
         if not isinstance(d, dict):
-            if strict: raise TypeError(f"TemStagePosition.from_dict expects a dict, got {type(d)}")
-            return TemStagePosition(_mode=mode)
-        ex = collect_extra(d, known=("name", "x", "y", "z", "r", "tilt_x", "tilt_y", "x_nm", "y_nm", "z_nm", "r_deg", "tilt_x_deg", "tilt_y_deg", "coordinate_system", "coord_system", "cs", "extra"), owner="TemStagePosition")
-        return TemStagePosition(
+            if strict: raise TypeError(f"StagePosition.from_dict expects a dict, got {type(d)}")
+            return StagePosition(_mode=mode)
+        ex = collect_extra(d, known=("name", "x", "y", "z", "r", "tilt_x", "tilt_y", "x_nm", "y_nm", "z_nm", "r_deg", "tilt_x_deg", "tilt_y_deg", "coordinate_system", "coord_system", "cs", "extra"), owner="StagePosition")
+        return StagePosition(
             name=d.get("name", None),
             x=d.get("x", d.get("x_nm")),
             y=d.get("y", d.get("y_nm")),
@@ -1103,9 +1101,9 @@ class TemStagePosition:
             extra=ex, _mode=mode,
         )
 
-    def __add__(self, other: 'TemStagePosition') -> 'TemStagePosition':
+    def __add__(self, other: 'StagePosition') -> 'StagePosition':
         """Enable vector addition for relative movements."""
-        if not isinstance(other, TemStagePosition): return NotImplemented
+        if not isinstance(other, StagePosition): return NotImplemented
         def add_axis(a, b, unit: str):
             qa = ensure_quantity(a, unit)
             qb = ensure_quantity(b, unit)
@@ -1113,7 +1111,7 @@ class TemStagePosition:
             if qa is None: return qb
             if qb is None: return qa
             return qa + qb
-        return TemStagePosition(
+        return StagePosition(
             name=self.name,
             x=add_axis(self.x, other.x, "nanometer"),
             y=add_axis(self.y, other.y, "nanometer"),
@@ -1124,8 +1122,8 @@ class TemStagePosition:
             coordinate_system=self.coordinate_system,
         )
 
-    def __sub__(self, other: 'TemStagePosition') -> 'TemStagePosition':
-        if not isinstance(other, TemStagePosition): return NotImplemented
+    def __sub__(self, other: 'StagePosition') -> 'StagePosition':
+        if not isinstance(other, StagePosition): return NotImplemented
         def sub_axis(a, b, unit: str):
             qa = ensure_quantity(a, unit)
             qb = ensure_quantity(b, unit)
@@ -1133,7 +1131,7 @@ class TemStagePosition:
             if qa is None: return -qb if qb is not None else None
             if qb is None: return qa
             return qa - qb
-        return TemStagePosition(
+        return StagePosition(
             name=self.name,
             x=sub_axis(self.x, other.x, "nanometer"),
             y=sub_axis(self.y, other.y, "nanometer"),
@@ -1144,7 +1142,7 @@ class TemStagePosition:
             coordinate_system=self.coordinate_system,
         )
 
-    def is_close(self, other: 'TemStagePosition', tol_nm: float = 1.0, tol_deg: float = 1e-3, *, compare_only_specified: bool = True) -> bool:
+    def is_close(self, other: 'StagePosition', tol_nm: float = 1.0, tol_deg: float = 1e-3, *, compare_only_specified: bool = True) -> bool:
         def close_axis(a, b, unit: str, tol: float) -> bool:
             if compare_only_specified and (a is None or b is None): return True
             if a is None or b is None: return False
@@ -1758,7 +1756,7 @@ class DetectorSystemSettings:
     defaults_by_id: Dict[str, DetectorSettings] = field(default_factory=dict)
     default_detector_id: Optional[str] = None
     capabilities_by_id: Dict[str, DetectorCapabilities] = field(default_factory=dict)
-    available_detectors: List[str] = field(default_factory=list)
+    available_detector_ids: List[str] = field(default_factory=list)
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
@@ -1791,17 +1789,17 @@ class DetectorSystemSettings:
             )
             self.capabilities_by_id = {}
 
-        if self.available_detectors is None:
-            self.available_detectors = []
-        elif not isinstance(self.available_detectors, list):
+        if self.available_detector_ids is None:
+            self.available_detector_ids = []
+        elif not isinstance(self.available_detector_ids, list):
             note_or_raise(
                 self.extra,
-                "DetectorSystemSettings.available_detectors",
-                TypeError(f"available_detectors must be list, got {type(self.available_detectors)}"),
+                "DetectorSystemSettings.available_detector_ids",
+                TypeError(f"available_detector_ids must be list, got {type(self.available_detector_ids)}"),
                 mode=mode,
-                raw=deepcopy(self.available_detectors),
+                raw=deepcopy(self.available_detector_ids),
             )
-            self.available_detectors = []
+            self.available_detector_ids = []
 
         # default_detector_id: allow missing; parse to optional id-like
         self.default_detector_id = parse_optional_id_like(
@@ -1877,18 +1875,18 @@ class DetectorSystemSettings:
             new_caps[det_id] = v
         self.capabilities_by_id = new_caps
 
-        # Normalize available_detectors entries to str ids (drop invalid ones in lenient)
+        # Normalize available_detector_ids entries to str ids (drop invalid ones in lenient)
         norm_avail: List[str] = []
-        for item in self.available_detectors:
+        for item in self.available_detector_ids:
             det_id = parse_optional_id_like(
-                item, name="DetectorSystemSettings.available_detectors[]", strict=False, extra=self.extra
+                item, name="DetectorSystemSettings.available_detector_ids[]", strict=False, extra=self.extra
             )
             if det_id is None:
-                self.extra.notes.setdefault("DetectorSystemSettings.available_detectors.invalid", []).append(repr(item))
+                self.extra.notes.setdefault("DetectorSystemSettings.available_detector_ids.invalid", []).append(repr(item))
                 continue
             norm_avail.append(det_id)
         seen=set()
-        self.available_detectors = [x for x in norm_avail if not (x in seen or seen.add(x))]
+        self.available_detector_ids = [x for x in norm_avail if not (x in seen or seen.add(x))]
 
         # Semantic constraints live in validate().
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -1900,7 +1898,7 @@ class DetectorSystemSettings:
 
         if self.default_detector_id:
             det_id = str(self.default_detector_id)
-            known = set(self.defaults_by_id.keys()) | set(self.capabilities_by_id.keys()) | set(self.available_detectors)
+            known = set(self.defaults_by_id.keys()) | set(self.capabilities_by_id.keys()) | set(self.available_detector_ids)
             if known and det_id not in known:
                 note_or_raise(
                     self.extra,
@@ -1935,7 +1933,7 @@ class DetectorSystemSettings:
         d = {
             "enabled": self.enabled,
             "default_detector_id": self.default_detector_id,
-            "available_detectors": self.available_detectors,
+            "available_detector_ids": self.available_detector_ids,
             "defaults_by_id": {k: v.to_dict() for k, v in self.defaults_by_id.items()},
             "capabilities_by_id": {k: v.to_dict() for k, v in self.capabilities_by_id.items()},
         }
@@ -1947,11 +1945,11 @@ class DetectorSystemSettings:
         mode = as_parse_mode(mode)
         if isinstance(d, DetectorSystemSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return DetectorSystemSettings(_mode=mode)
-        known = {"enabled", "available_detectors", "default_detector_id", "defaults_by_id", "capabilities_by_id", "extra"}
+        known = {"enabled", "available_detector_ids", "available_detectors", "default_detector_id", "defaults_by_id", "capabilities_by_id", "extra"}
         extra = collect_extra(d, known, owner="DetectorSystemSettings")
         return DetectorSystemSettings(
             enabled=d.get("enabled", True),
-            available_detectors=d.get("available_detectors", []),
+            available_detector_ids=d.get("available_detector_ids", d.get("available_detectors", [])),
             default_detector_id=d.get("default_detector_id"),
             defaults_by_id=d.get("defaults_by_id", {}),
             capabilities_by_id=d.get("capabilities_by_id", {}),
@@ -2089,7 +2087,7 @@ class MicroscopeState:
     Cross-references 'active_detector_ids' against 'detectors' map to ensure consistency.
     """
     timestamp: float = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp())
-    stage_position: TemStagePosition = field(default_factory=TemStagePosition)
+    stage_position: StagePosition = field(default_factory=StagePosition)
     beam: BeamSettings = field(default_factory=BeamSettings)
     detectors: Dict[str, DetectorSettings] = field(default_factory=dict)
     active_detector_ids: List[str] = field(default_factory=list)
@@ -2099,7 +2097,7 @@ class MicroscopeState:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeState")
-        self.stage_position = maybe_from_dict(TemStagePosition, self.stage_position, mode=mode) or TemStagePosition()
+        self.stage_position = maybe_from_dict(StagePosition, self.stage_position, mode=mode) or StagePosition()
         self.beam = maybe_from_dict(BeamSettings, self.beam, mode=mode) or BeamSettings()
 
         raw_dets = self.detectors or {}
@@ -2174,7 +2172,7 @@ class MicroscopeState:
 
 
 @dataclass
-class TemImageMetadata:
+class MicroscopeImageMetadata:
     """Pure data record for image archival.
 
     Contains flat float/int values (no Pint objects) to ensure version-stable
@@ -2194,7 +2192,7 @@ class TemImageMetadata:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        mode, strict, self.extra = _setup_init(self, self._mode, "TemImageMetadata")
+        mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeImageMetadata")
         self.microscope_state = maybe_from_dict(MicroscopeState, self.microscope_state, mode=mode)
 
         # Scalar normalizations using parsers
@@ -2230,14 +2228,14 @@ class TemImageMetadata:
         return _jsonable(drop_none_keys(d))
 
     @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "TemImageMetadata":
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeImageMetadata":
         mode = as_parse_mode(mode)
-        if isinstance(d, TemImageMetadata): return replace(d, _mode=mode)
-        if not isinstance(d, dict): return TemImageMetadata(_mode=mode)
+        if isinstance(d, MicroscopeImageMetadata): return replace(d, _mode=mode)
+        if not isinstance(d, dict): return MicroscopeImageMetadata(_mode=mode)
         extra = collect_extra(d, ("version", "created_at", "magnification", "camera_length_mm", "pixel_size_nm",
                                   "image_size_px", "accelerating_voltage_kv", "beam_current_na", "exposure_ms",
-                                  "microscope_state", "extra"), owner="TemImageMetadata")
-        return TemImageMetadata(
+                                  "microscope_state", "extra"), owner="MicroscopeImageMetadata")
+        return MicroscopeImageMetadata(
             version=d.get("version", str(METADATA_VERSION)),
             created_at=d.get("created_at"),
             magnification=d.get("magnification"),
@@ -2252,21 +2250,21 @@ class TemImageMetadata:
         )
 
 
-class TemImage:
+class MicroscopeImage:
     """High-level wrapper for image data and metadata.
 
     Handles loading/saving logic for various formats (TIFF, JPEG, PNG).
     Implements the 'Sidecar' pattern: metadata is encoded into TIFF tags
     or written to a separate .json file.
     """
-    def __init__(self, data: np.ndarray, metadata: Optional[TemImageMetadata] = None):
+    def __init__(self, data: np.ndarray, metadata: Optional[MicroscopeImageMetadata] = None):
         if not _check_data_format(data):
             if data.ndim == 3 and data.shape[0] == 1: data = data[0]
             elif data.ndim == 3 and data.shape[-1] == 1: data = data[..., 0]
             if not _check_data_format(data):
-                raise ValueError("Invalid data format for TemImage. Must be 2D uint8/uint16.")
+                raise ValueError("Invalid data format for MicroscopeImage. Must be 2D uint8/uint16.")
         self.data = data
-        self.metadata = TemImageMetadata.from_dict(metadata) if isinstance(metadata, dict) else metadata
+        self.metadata = MicroscopeImageMetadata.from_dict(metadata) if isinstance(metadata, dict) else metadata
 
     @staticmethod
     def _decode_description(desc: Any) -> Optional[Dict[str, Any]]:
@@ -2283,7 +2281,7 @@ class TemImage:
         except Exception: return None
 
     @staticmethod
-    def _encode_description(md: Optional[TemImageMetadata]) -> str:
+    def _encode_description(md: Optional[MicroscopeImageMetadata]) -> str:
         if md is None: return ""
         try:
             safe = _jsonable(md.to_dict())
@@ -2305,7 +2303,7 @@ class TemImage:
         return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
 
     @classmethod
-    def load(cls, path: Union[str, Path]) -> "TemImage":
+    def load(cls, path: Union[str, Path]) -> "MicroscopeImage":
         path = Path(path)
         ext = path.suffix.lower().lstrip(".")
         if ext in ("tif", "tiff"):
@@ -2324,7 +2322,7 @@ class TemImage:
                 try:
                     desc = tif.pages[0].tags["ImageDescription"].value
                     d = cls._decode_description(desc)
-                    if d is not None: metadata = TemImageMetadata.from_dict(d)
+                    if d is not None: metadata = MicroscopeImageMetadata.from_dict(d)
                 except Exception: metadata = None
             return cls(data=data, metadata=metadata)
 
@@ -2341,7 +2339,7 @@ class TemImage:
         if sidecar.exists():
             try:
                 d = json.loads(sidecar.read_text(encoding="utf-8"))
-                if isinstance(d, dict): metadata = TemImageMetadata.from_dict(d)
+                if isinstance(d, dict): metadata = MicroscopeImageMetadata.from_dict(d)
             except Exception: metadata = None
         return cls(data=data, metadata=metadata)
 
@@ -2369,7 +2367,6 @@ class TemImage:
         sidecar = path.with_suffix(path.suffix + ".json")
         try:
             if self.metadata is not None:
-                # Optimized: removed double _jsonable call
                 sidecar.write_text(json.dumps(self.metadata.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
             elif sidecar.exists(): sidecar.unlink()
         except Exception: pass
