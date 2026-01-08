@@ -200,11 +200,13 @@ except PackageNotFoundError:
 # -----------------------
 
 class ParseMode(str, Enum):
-    STRICT = "strict"
-    LENIENT = "lenient"
+    """Defines the strictness level for data ingestion."""
+    STRICT = "strict"   # Raise errors on bad data (Control Plane)
+    LENIENT = "lenient" # Salvage bad data into Extras (Data Plane)
 
 
 def as_parse_mode(mode: Union["ParseMode", str, None]) -> "ParseMode":
+    """Normalize a string or enum into a valid ParseMode. Defaults to STRICT."""
     if isinstance(mode, ParseMode):
         return mode
     if isinstance(mode, str):
@@ -217,18 +219,17 @@ def as_parse_mode(mode: Union["ParseMode", str, None]) -> "ParseMode":
 
 
 def is_strict(mode: Union["ParseMode", str, None]) -> bool:
+    """Helper to check if the effective mode is STRICT."""
     return as_parse_mode(mode) == ParseMode.STRICT
 
 
-def note_or_raise(
-    extra: Optional["Extras"],
-    key: str,
-    exc: Exception,
-    *,
-    mode: Union["ParseMode", str, None] = ParseMode.STRICT,
-    raw: Any = None,
-) -> None:
-    """In STRICT mode, raise. In LENIENT mode, record and keep going."""
+def note_or_raise(extra: Optional["Extras"], key: str, exc: Exception, *, mode: Union["ParseMode", str, None] = ParseMode.STRICT, raw: Any = None) -> None:
+    """Handle a validation error according to the ParseMode.
+
+    In STRICT mode: Raises the exception immediately.
+    In LENIENT mode: Catches the exception, records it in `extra.notes`,
+                     and optionally saves the `raw` value in `extra.raw`.
+    """
     if is_strict(mode):
         raise exc
     if extra is None:
@@ -267,7 +268,16 @@ except Exception:
         Quantity = type(Q_(1, "nm"))
 
 def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
-    """Coerce `value` into a Pint Quantity in `default_unit`."""
+    """Coerce arbitrary input into a Pint Quantity with the target unit.
+
+    Handles:
+    - Pint Quantity objects (converts to target unit)
+    - Dicts (e.g. {"magnitude": 10, "unit": "nm"})
+    - Numbers (assumes target unit)
+    - Strings (e.g. "10 nm", "10")
+
+    Returns None if parsing fails or input is None/Empty.
+    """
     if value is None:
         return None
     if isinstance(value, (bool, np.bool_)):
@@ -316,7 +326,10 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
         return None
 
 def serialize_quantity(q: Optional["Quantity"], target_unit: str) -> Optional[float]:
-    """Extract magnitude in `target_unit` as a plain float for JSON."""
+    """Convert a Quantity to a plain float magnitude in the target unit.
+
+    Used for creating JSON-safe representations (e.g. 'voltage_kv': 300.0).
+    """
     if q is None:
         return None
     try:
@@ -328,11 +341,12 @@ def serialize_quantity(q: Optional["Quantity"], target_unit: str) -> Optional[fl
         return None
 
 def magnitude(value: Any, unit: str) -> Optional[float]:
-    """Legacy helper: get float magnitude in `unit` immediately."""
+    """Legacy helper: parse and immediately extract magnitude."""
     q = ensure_quantity(value, unit)
     return serialize_quantity(q, unit)
 
 def _check_data_format(data: np.ndarray) -> bool:
+    """Validate if numpy array is a valid 2D image (uint8/uint16)."""
     if data.ndim == 3:
         if data.shape[0] == 1:
             data = data[0]
@@ -438,6 +452,7 @@ def _extra_put_raw(extra: Any, key: str, value: Any) -> None:
         extra[f"{key}_raw"] = value
 
 def collect_extra(d: Optional[Dict[str, Any]], known: Iterable[str], *, owner: str = "unknown") -> Extras:
+    """Harvest unknown keys from a dict into an Extras object."""
     if not isinstance(d, dict):
         return Extras()
     known_set = set(known)
@@ -454,6 +469,7 @@ def collect_extra(d: Optional[Dict[str, Any]], known: Iterable[str], *, owner: s
 
 
 def add_extra_if_any(out: Dict[str, Any], extra: Any) -> Dict[str, Any]:
+    """Append serialized extras to the output dict if not empty."""
     if extra is None:
         return out
     if isinstance(extra, Extras):
@@ -471,6 +487,7 @@ def drop_none_keys(out: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def normalize_extra(extra: Any) -> Extras:
+    """Strictly convert dict/None to Extras."""
     if extra is None:
         return Extras()
     if isinstance(extra, Extras):
@@ -481,6 +498,7 @@ def normalize_extra(extra: Any) -> Extras:
 
 
 def normalize_extra_lenient(extra: Any, owner: str) -> Extras:
+    """Safely convert anything to Extras, capturing garbage in 'raw'."""
     try:
         return normalize_extra(extra)
     except Exception:
@@ -515,6 +533,12 @@ def merge_extras(dst: Extras, src: Any, *, owner: str) -> Extras:
 # -----------------------
 
 def parse_bool(value: Any, default: bool = False, *, strict: bool = False) -> bool:
+    """Strictly or leniently parse a boolean value.
+
+    Handles strings like 'on', 'yes', '1', 'true'.
+    Strict mode raises TypeError/ValueError on invalid input.
+    Lenient mode returns the default.
+    """
     if value is None:
         return default
     if isinstance(value, bool):
@@ -535,6 +559,11 @@ def parse_bool(value: Any, default: bool = False, *, strict: bool = False) -> bo
     return bool(value)
 
 def parse_optional_int_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[int]:
+    """Parse a value into an integer, or return None.
+
+    Rejects bools (True != 1). Accepts integer-floats (1.0 -> 1).
+    Captures raw value in extra if lenient parsing fails.
+    """
     if value is None:
         return None
     if isinstance(value, bool):
@@ -569,6 +598,7 @@ def parse_optional_int_like(value: Any, *, name: str, strict: bool = False, extr
 
 
 def parse_optional_float_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[float]:
+    """Parse a value into a float, or return None."""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -595,6 +625,7 @@ def parse_optional_float_like(value: Any, *, name: str, strict: bool = False, ex
 
 
 def parse_optional_bool_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[bool]:
+    """Parse a value into a bool or None (tristate logic)."""
     if value is None:
         return None
     if isinstance(value, str) and value.strip() == "":
@@ -610,6 +641,7 @@ def parse_optional_bool_like(value: Any, *, name: str, strict: bool = False, ext
 
 
 def parse_optional_str_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[str]:
+    """Parse a value into a non-empty string or None."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -631,6 +663,7 @@ def parse_optional_str_like(value: Any, *, name: str, strict: bool = False, extr
     return s or None
 
 def parse_optional_pair_int_like(value: Any, *, name: str, sort: bool = False, strict: bool = False, extra: Any = None) -> Optional[Tuple[int, int]]:
+    """Parse a 2-element sequence into a tuple of ints."""
     if value is None:
         return None
     try:
@@ -651,6 +684,7 @@ def parse_optional_pair_int_like(value: Any, *, name: str, sort: bool = False, s
         return None
 
 def parse_optional_pair_float_like(value: Any, *, name: str, sort: bool = False, strict: bool = False, extra: Any = None,) -> Optional[Tuple[float, float]]:
+    """Parse a 2-element sequence into a tuple of floats."""
     if value is None:
         return None
     try:
@@ -671,6 +705,7 @@ def parse_optional_pair_float_like(value: Any, *, name: str, sort: bool = False,
         return None
 
 def parse_optional_id_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[str]:
+    """Parse a value into a safe string ID. Logs warning if ID is empty string."""
     if value is None:
         return None
     if isinstance(value, str) and value.strip() == "":
@@ -705,6 +740,10 @@ def maybe_from_dict(
     key: str = "",
     allow_empty_dict: bool = False,
 ) -> Optional[T]:
+    """Generic helper to instantiate a Dataclass from a dict safely.
+
+    Handles ParseMode propagation and exception catching.
+    """
     mode = as_parse_mode(mode)
     if raw is None:
         return None
@@ -743,6 +782,7 @@ def maybe_from_dict(
 
 
 def _jsonable(obj: Any) -> Any:
+    """Recursively convert object to JSON-safe primitives."""
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
     try:
