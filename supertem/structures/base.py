@@ -349,12 +349,16 @@ def _check_data_format(data: np.ndarray) -> bool:
 
 @dataclass
 class Extras:
-    """Structured extras bucket.
+    """Structured container for non-standard data.
 
-    - vendor: vendor-specific extension payloads (namespaced by vendor key)
-    - unknown: unknown top-level keys swept during from_dict (forward compatibility)
-    - raw: raw values replaced/rejected during normalization
-    - notes: non-fatal validation / normalization notes
+    This class supports the 'Lenient Parsing' philosophy. Instead of crashing on
+    unexpected or malformed data, we move it here for later inspection.
+
+    Attributes:
+        vendor: Namespaced storage for vendor-specific extensions.
+        unknown: Storage for JSON keys not recognized by the schema.
+        raw: Original raw values that failed type coercion/validation.
+        notes: Error messages or warnings generated during parsing.
     """
 
     vendor: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -781,6 +785,11 @@ def _setup_init(obj: Any, mode_input: Any, owner_name: str) -> Tuple[ParseMode, 
 
 @dataclass
 class Point:
+    """A simple 3D coordinate with an optional name.
+
+    Used for stigmation, beam shifts, and image shifts.
+    Normalizes inputs to safe float values (default 0.0) to prevent crashes.
+    """
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
@@ -828,6 +837,14 @@ class Point:
 
 @dataclass
 class ROI:
+    """Region of Interest (ROI) on a detector.
+
+    Defines a rectangular region (x, y, width, height).
+
+    Strictness Behavior:
+    - STRICT: Raises validation error if dimensions are non-positive.
+    - LENIENT: Auto-heals invalid dimensions (resets to 512) to ensure continuity.
+    """
     x: int = 0
     y: int = 0
     width: int = 512
@@ -901,6 +918,11 @@ class ROI:
 
 @dataclass
 class TemStagePosition:
+    """5-axis microscope stage position.
+
+    Stores physical coordinates (x, y, z, tilt, rotation) as Pint Quantities.
+    Supports arithmetic operations (+, -) for calculating relative movements.
+    """
     name: Optional[str] = None
     x: Optional["Quantity"] = None
     y: Optional["Quantity"] = None
@@ -1054,6 +1076,11 @@ class TemStagePosition:
 
 @dataclass
 class StageSystemSettings:
+    """Stage hardware configuration.
+
+    Defines enabled axes, physical movement limits, and step sizes.
+    Validates invariants like 'min limit < max limit' and 'eucentric height inside Z limits'.
+    """
     enabled: bool = True
     can_x: bool = True
     can_y: bool = True
@@ -1200,6 +1227,13 @@ class StageSystemSettings:
 
 @dataclass
 class BeamSettings:
+    """Electron beam parameters.
+
+    Controls Voltage, Current, Spot Size, and Shifts.
+    Strictness:
+    - STRICT: Raises Error if inputs are unparseable (e.g. "garbage" voltage).
+    - LENIENT: Records error in extras, sets field to None, and proceeds.
+    """
     voltage: Optional["Quantity"] = None
     beam_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
@@ -1285,6 +1319,11 @@ class BeamSettings:
 
 @dataclass
 class BeamSystemSettings:
+    """Wrapper for beam configuration validation.
+
+    Defines allowed operating ranges (e.g., Voltage 80-300kV) and the default beam state.
+    Used to prevent unsafe configurations before applying them to hardware.
+    """
     enabled: bool = True
     default_beam: BeamSettings = field(default_factory=BeamSettings)
     voltage_range: Optional[Tuple["Quantity", "Quantity"]] = None
@@ -1379,6 +1418,11 @@ class BeamSystemSettings:
 
 @dataclass
 class DetectorSettings:
+    """Parameters for a single image acquisition.
+
+    Includes Exposure, Binning, and ROI.
+    Strictly validates that exposure is positive and binning/ROI dimensions are safe.
+    """
     detector_id: Optional[str] = None
     exposure: Optional["Quantity"] = None  # ms
     binning_index: Optional[int] = None
@@ -1473,7 +1517,11 @@ class DetectorSettings:
 
 @dataclass
 class DetectorCapabilities:
-    """Static capability description for a detector."""
+    """Read-only capability description for a detector.
+
+    Describes hardware limits (Min/Max Exposure, supported Binning) read from drivers.
+    Permanently lenient: assumes internal driver data is trusted but possibly messy.
+    """
     can_binning: Optional[bool] = None
     binning_index_min: Optional[int] = None
     binning_index_max: Optional[int] = None
@@ -1612,6 +1660,11 @@ class DetectorCapabilities:
 
 @dataclass
 class DetectorSystemSettings:
+    """Manager for all detectors on the microscope.
+
+    Maps detector IDs to their specific settings and capabilities.
+    Validates that the default detector ID points to a valid, available detector.
+    """
     enabled: bool = True
     defaults_by_id: Dict[str, DetectorSettings] = field(default_factory=dict)
     default_detector_id: Optional[str] = None
@@ -1818,6 +1871,10 @@ class DetectorSystemSettings:
 
 @dataclass
 class ImageOutputSettings:
+    """Configuration for saving image files.
+
+    Controls format (TIFF, PNG, JPEG) and save path.
+    """
     file_format: str = "tiff"
     path: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
@@ -1854,6 +1911,11 @@ class ImageOutputSettings:
 
 @dataclass
 class AcquisitionRequest:
+    """Executable command object for taking an image.
+
+    This is a control-plane object that strictly enforces the presence of a
+    valid 'detector_id' before execution.
+    """
     detector_id: Optional[str] = None
     detector: DetectorSettings = field(default_factory=DetectorSettings)
     image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
@@ -1916,6 +1978,11 @@ class AcquisitionRequest:
 
 @dataclass
 class MicroscopeState:
+    """Snapshot of the microscope status at a specific moment.
+
+    Contains Stage, Beam, and active Detectors.
+    Cross-references 'active_detector_ids' against 'detectors' map to ensure consistency.
+    """
     timestamp: float = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp())
     stage_position: TemStagePosition = field(default_factory=TemStagePosition)
     beam: BeamSettings = field(default_factory=BeamSettings)
@@ -2003,7 +2070,11 @@ class MicroscopeState:
 
 @dataclass
 class TemImageMetadata:
-    """Pure data record (no Quantities) for archival compatibility."""
+    """Pure data record for image archival.
+
+    Contains flat float/int values (no Pint objects) to ensure version-stable
+    JSON serialization for sidecar files.
+    """
     version: str = str(METADATA_VERSION)
     created_at: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
     magnification: Optional[float] = None
@@ -2077,6 +2148,12 @@ class TemImageMetadata:
 
 
 class TemImage:
+    """High-level wrapper for image data and metadata.
+
+    Handles loading/saving logic for various formats (TIFF, JPEG, PNG).
+    Implements the 'Sidecar' pattern: metadata is encoded into TIFF tags
+    or written to a separate .json file.
+    """
     def __init__(self, data: np.ndarray, metadata: Optional[TemImageMetadata] = None):
         if not _check_data_format(data):
             if data.ndim == 3 and data.shape[0] == 1: data = data[0]
@@ -2195,6 +2272,11 @@ class TemImage:
 
 @dataclass
 class SystemInfo:
+    """Hardware and software identity metadata.
+
+    Defaults to 'Unknown' to prevent logging crashes.
+    Includes validation for IP address strings.
+    """
     name: str = "Unknown"
     ip_address: str = "Unknown"
     manufacturer: str = "Unknown"
@@ -2242,6 +2324,11 @@ class SystemInfo:
 
 @dataclass
 class SystemSettings:
+    """Root container for all hardware settings.
+
+    Aggregates Stage, Beam, and Detector settings into a single structure.
+    Does not store 'Extras'; acts only as a hierarchy organizer.
+    """
     stage: StageSystemSettings = field(default_factory=StageSystemSettings)
     beam: BeamSystemSettings = field(default_factory=BeamSystemSettings)
     detector: DetectorSystemSettings = field(default_factory=DetectorSystemSettings)
@@ -2285,6 +2372,11 @@ class SystemSettings:
 
 @dataclass
 class MicroscopeSettings:
+    """Top-level application configuration.
+
+    Contains hardware settings (SystemSettings), output preferences (ImageOutputSettings),
+    and protocol metadata.
+    """
     system: SystemSettings = field(default_factory=SystemSettings)
     image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
     protocol: dict = field(default_factory=lambda: {"name": "demo"})
