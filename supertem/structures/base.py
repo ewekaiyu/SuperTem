@@ -853,13 +853,19 @@ def _setup_init(obj: Any, mode_input: Any, owner_name: str) -> Tuple[ParseMode, 
 
 @dataclass
 class Point:
-    """A simple 3D coordinate with an optional name.
+    """
+    A 3D coordinate vector with an optional label.
 
-    Used for stigmation, beam shifts, and image shifts.
+    Used to represent beam shifts, stigmation vectors, and logical coordinates.
 
-    Note:
-        This class intentionally omits the `extra` container to keep it
-        lightweight, as points are often created in high volumes.
+    Attributes:
+        x: X-axis component.
+        y: Y-axis component.
+        z: Z-axis component (defaults to 0.0 for 2D vectors).
+        name: Optional label (e.g., "center", "stigmator_a").
+
+    Notes:
+        This class is lightweight and does not include the `Extras` container.
     """
     x: float = 0.0
     y: float = 0.0
@@ -919,13 +925,20 @@ class Point:
 
 @dataclass
 class ROI:
-    """Region of Interest (ROI) on a detector.
+    """
+    Defines a rectangular Region of Interest on a detector.
 
-    Defines a rectangular region (x, y, width, height).
+    Specifies the offset and dimensions for image acquisition relative to the full sensor.
 
-    Strictness Behavior:
-    - STRICT: Raises validation error if dimensions are non-positive.
-    - LENIENT: Auto-heals invalid dimensions (resets to 512) to ensure continuity.
+    Attributes:
+        x: Horizontal offset from the left edge (0-indexed).
+        y: Vertical offset from the top edge (0-indexed).
+        width: Width of the region in pixels.
+        height: Height of the region in pixels.
+
+    Notes:
+        In `STRICT` mode, non-positive dimensions raise specific validation errors.
+        In `LENIENT` mode, invalid dimensions are auto-corrected to defaults to ensure continuity.
     """
     x: int = 0
     y: int = 0
@@ -1001,10 +1014,21 @@ class ROI:
 
 @dataclass
 class StagePosition:
-    """5-axis microscope stage position.
+    """
+    Represents a 5-axis microscope stage position with physical units.
 
-    Stores physical coordinates (x, y, z, tilt, rotation) as Pint Quantities.
-    Supports arithmetic operations (+, -) for calculating relative movements.
+    Stores coordinates as Pint Quantities to ensure unit safety (e.g., meters vs nanometers).
+    Supports vector arithmetic for calculating relative movements.
+
+    Attributes:
+        name: Optional label for this position (e.g., "Sample Center").
+        x: Physical X-axis position (Length).
+        y: Physical Y-axis position (Length).
+        z: Physical Z-axis height (Length).
+        r: Stage rotation (Angle).
+        tilt_x: Alpha tilt (Angle).
+        tilt_y: Beta tilt (Angle).
+        coordinate_system: Label for the reference frame (e.g., "Raw", "Cartesian").
     """
     name: Optional[str] = None
     x: Optional["Quantity"] = None
@@ -1160,10 +1184,20 @@ class StagePosition:
 
 @dataclass
 class StageSystemSettings:
-    """Stage hardware configuration.
+    """
+    Configuration and safety limits for the microscope stage.
 
-    Defines enabled axes, physical movement limits, and step sizes.
-    Validates invariants like 'min limit < max limit' and 'eucentric height inside Z limits'.
+    Defines enabled axes, movement boundaries, and step size limits to ensure hardware safety.
+
+    Attributes:
+        enabled: Master switch to enable/disable stage control.
+        can_*: Capability flags for specific axes (x, y, z, r, tilt).
+        *_limits: Tuple of (min, max) Quantities defining the allowable range for each axis.
+        max_step_distance: Safety limit for the largest single lateral move allowed.
+        max_step_angle: Safety limit for the largest single tilt/rotation move allowed.
+        eucentric_z: The calibrated Z-height where the sample is at the eucentric plane.
+        settle_time_s: Time to wait for stabilization after movement.
+        timeout_s: Maximum duration to wait for a movement command.
     """
     enabled: bool = True
     can_x: bool = True
@@ -1311,15 +1345,26 @@ class StageSystemSettings:
 
 @dataclass
 class BeamSettings:
-    """Electron beam parameters.
+    """
+    Parameters controlling the electron beam and electromagnetic lenses.
 
-    Controls Voltage, Current, Spot Size, and Shifts.
+    Encapsulates optical settings including accelerating voltage, current, and lens deflections.
+
+    Attributes:
+        voltage: Accelerating voltage (High Tension).
+        beam_current: Probe current measured at the specimen or screen.
+        spot_size: Discrete index representing the condenser lens combination.
+        convergence_angle: Semi-convergence angle of the probe in STEM mode.
+        defocus: Deviation from the focal plane (positive usually implies overfocus).
+        stigmation: 2D vector controlling stigmator coils.
+        beam_shift: 2D vector controlling beam tilt/shift coils.
+        image_shift: 2D vector controlling image shift coils.
+        scan_rotation: Rotation of the scanning raster.
     """
     voltage: Optional["Quantity"] = None
     beam_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
     convergence_angle: Optional["Quantity"] = None
-    # NEW: Defocus is critical for TEM/STEM
     defocus: Optional["Quantity"] = None
     stigmation: Optional[Point] = None
     beam_shift: Optional[Point] = None
@@ -1414,10 +1459,18 @@ class BeamSettings:
 
 @dataclass
 class BeamSystemSettings:
-    """Wrapper for beam configuration validation.
+    """
+    Operational constraints and defaults for the electron beam.
 
-    Defines allowed operating ranges (e.g., Voltage 80-300kV) and the default beam state.
-    Used to prevent unsafe configurations before applying them to hardware.
+    Defines safe operating ranges for voltage and current to prevent invalid hardware states.
+
+    Attributes:
+        enabled: Master switch to enable/disable beam control.
+        default_beam: A safe, default configuration to fallback to.
+        voltage_range: Allowable range (min, max) for accelerating voltage.
+        beam_current_range: Allowable range (min, max) for beam current.
+        spot_size_range: Min/Max valid indices for spot size.
+        convergence_angle_range: Allowable range (min, max) for convergence angle.
     """
     enabled: bool = True
     default_beam: BeamSettings = field(default_factory=BeamSettings)
@@ -1513,10 +1566,24 @@ class BeamSystemSettings:
 
 @dataclass
 class DetectorSettings:
-    """Parameters for a single image acquisition.
+    """
+    Configuration for a single image acquisition.
 
-    Includes Exposure, Binning, and ROI.
-    Strictly validates that exposure is positive and binning/ROI dimensions are safe.
+    Specifies which detector to use and how the image should be captured (exposure, binning, ROI).
+
+    Attributes:
+        detector_id: Unique identifier for the camera.
+        exposure: Integration time (Time quantity).
+        binning_index: Discrete binning level index.
+        binning_xy: Explicit (x, y) binning factors.
+        roi: Region of Interest to read from the sensor.
+        frame_integration: Number of internal frames to accumulate.
+        gain_index: Index for hardware gain setting.
+        offset_index: Index for hardware offset/black-level setting.
+        digital_rotation_deg: Rotation applied to the image.
+
+    Notes:
+        Strictly validates that exposure is positive and ROI dimensions are safe.
     """
     detector_id: Optional[str] = None
     exposure: Optional["Quantity"] = None  # ms
@@ -1612,10 +1679,17 @@ class DetectorSettings:
 
 @dataclass
 class DetectorCapabilities:
-    """Read-only capability description for a detector.
+    """
+    Read-only hardware capabilities of a specific detector.
 
-    Describes hardware limits (Min/Max Exposure, supported Binning) read from drivers.
-    Permanently lenient: assumes internal driver data is trusted but possibly messy.
+    Describes supported ranges (e.g., min/max exposure) and features (e.g., binning) reported by drivers.
+
+    Attributes:
+        can_*: Capability flags (binning, gain, offset, rotation).
+        *_min/max: Supported ranges for binning, exposure, ROI, gain, and offset.
+
+    Notes:
+        This class is permanently `LENIENT` to safely ingest driver reports without validation errors.
     """
     can_binning: Optional[bool] = None
     binning_index_min: Optional[int] = None
@@ -1755,10 +1829,20 @@ class DetectorCapabilities:
 
 @dataclass
 class DetectorSystemSettings:
-    """Manager for all detectors on the microscope.
+    """
+    Registry for all available detectors and their configurations.
 
-    Maps detector IDs to their specific settings and capabilities.
-    Validates that the default detector ID points to a valid, available detector.
+    Maps detector IDs to their specific settings and hardware capabilities.
+
+    Attributes:
+        enabled: Master switch to enable/disable detector control.
+        defaults_by_id: Mapping of detector IDs to their default startup settings.
+        default_detector_id: The ID of the primary detector to use if none is specified.
+        capabilities_by_id: Mapping of detector IDs to their read-only hardware capabilities.
+        available_detector_ids: List of all valid detector IDs currently recognized.
+
+    Notes:
+        Validates that `default_detector_id` exists within the available detectors.
     """
     enabled: bool = True
     defaults_by_id: Dict[str, DetectorSettings] = field(default_factory=dict)
@@ -1966,9 +2050,14 @@ class DetectorSystemSettings:
 
 @dataclass
 class ImageOutputSettings:
-    """Configuration for saving image files.
+    """
+    Configuration for image file persistence.
 
-    Controls format (TIFF, PNG, JPEG) and save path.
+    Controls the file format and destination path for saving acquired images.
+
+    Attributes:
+        file_format: The file extension/format (e.g., "tiff", "png", "jpg").
+        path: The target directory or full file path for saving.
     """
     file_format: str = "tiff"
     path: Optional[str] = None
@@ -2006,10 +2095,19 @@ class ImageOutputSettings:
 
 @dataclass
 class AcquisitionRequest:
-    """Executable command object for taking an image.
+    """
+    An executable command to acquire an image.
 
-    This is a control-plane object that strictly enforces the presence of a
-    valid 'detector_id' before execution.
+    A control-plane object that combines detector settings with output preferences.
+
+    Attributes:
+        detector_id: The ID of the detector to use (Required).
+        detector: Specific settings for this acquisition.
+        image: Output settings (format, path).
+
+    Notes:
+        In `STRICT` mode, this object requires a valid `detector_id` to be instantiated.
+        It enforces consistency between the outer `detector_id` and the inner `detector.detector_id`.
     """
     detector_id: Optional[str] = None
     detector: DetectorSettings = field(default_factory=DetectorSettings)
@@ -2088,7 +2186,17 @@ class AcquisitionRequest:
 
 @dataclass
 class Aperture:
-    """State of a specific aperture mechanism (position, insertion, size)."""
+    """
+    State of a specific beam-limiting aperture mechanism.
+
+    Tracks insertion status, selected size, and mechanical alignment.
+
+    Attributes:
+        aperture_id: Unique ID of the mechanism (e.g., "condenser", "objective").
+        inserted: True if the aperture is currently inserted in the beam path.
+        size_index: The selected aperture strip index.
+        position: The physical alignment of the aperture mechanism.
+    """
     aperture_id: Optional[str] = None
     inserted: bool = False
     size_index: Optional[int] = None
@@ -2132,7 +2240,24 @@ class Aperture:
 
 @dataclass
 class MicroscopeState:
-    """Snapshot of the microscope status at a specific moment."""
+    """
+    A comprehensive snapshot of the microscope hardware state.
+
+    Aggregates the status of the stage, beam, apertures, and detectors at a specific timestamp.
+
+    Attributes:
+        timestamp: UTC timestamp of the snapshot.
+        mode: The optical mode (e.g., "TEM", "STEM").
+        stage_position: Current coordinates of the stage.
+        beam: Current state of the electron beam.
+        apertures: Dictionary of aperture states.
+        detectors: Dictionary of detector settings.
+        active_detector_ids: List of detectors currently marked as active.
+        primary_detector_id: The ID of the currently selected main detector.
+
+    Notes:
+        Typically instantiated in `LENIENT` mode for logging/telemetry to preserve data despite partial failures.
+    """
     timestamp: float = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp())
     mode: Optional[str] = None
     stage_position: StagePosition = field(default_factory=StagePosition)
@@ -2270,10 +2395,22 @@ class MicroscopeState:
 
 @dataclass
 class MicroscopeImageMetadata:
-    """Pure data record for image archival.
+    """
+    Archival metadata associated with an acquired image.
 
-    Contains flat float/int values (no Pint objects) to ensure version-stable
-    JSON serialization for sidecar files.
+    Contains flat, JSON-serializable acquisition parameters and the microscope state snapshot.
+
+    Attributes:
+        version: Metadata schema version.
+        created_at: ISO8601 creation timestamp.
+        magnification: The indicated magnification.
+        camera_length_mm: The indicated camera length (Diffraction mode).
+        pixel_size_nm: Tuple of (x, y) pixel size.
+        image_size_px: Tuple of (width, height).
+        accelerating_voltage_kv: High tension.
+        beam_current_na: Beam current.
+        exposure_ms: Exposure time.
+        microscope_state: Full snapshot of the microscope state.
     """
     version: str = str(METADATA_VERSION)
     created_at: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -2348,11 +2485,17 @@ class MicroscopeImageMetadata:
 
 
 class MicroscopeImage:
-    """High-level wrapper for image data and metadata.
+    """
+    Container for image data and associated metadata.
 
-    Handles loading/saving logic for various formats (TIFF, JPEG, PNG).
-    Implements the 'Sidecar' pattern: metadata is encoded into TIFF tags
-    or written to a separate .json file.
+    Handles I/O operations (Load/Save) and manages the "sidecar" metadata relationship.
+
+    Attributes:
+        data: The raw 2D image data (numpy array).
+        metadata: The associated acquisition parameters and state.
+
+    Notes:
+        Supports TIFF (with embedded metadata), PNG, and JPEG formats.
     """
     def __init__(self, data: np.ndarray, metadata: Optional[MicroscopeImageMetadata] = None):
         if not _check_data_format(data):
@@ -2471,10 +2614,23 @@ class MicroscopeImage:
 
 @dataclass
 class SystemInfo:
-    """Hardware and software identity metadata.
+    """
+    Static identity and version information for the system.
 
-    Defaults to 'Unknown' to prevent logging crashes.
-    Includes validation for IP address strings.
+    Identifies hardware (Model, Serial) and software versions.
+
+    Attributes:
+        name: Human-readable name for this microscope instance.
+        ip_address: Network address of the control PC.
+        manufacturer: Vendor name.
+        model: Model name.
+        serial_number: Unique hardware serial number.
+        hardware_version: Vendor hardware revision.
+        software_version: Vendor control software version.
+        application: Connected application name.
+
+    Notes:
+        Defaults to "Unknown" to prevent logging crashes on missing data.
     """
     name: str = "Unknown"
     ip_address: str = "Unknown"
@@ -2523,10 +2679,16 @@ class SystemInfo:
 
 @dataclass
 class SystemSettings:
-    """Root container for all hardware settings.
+    """
+    Root configuration object for the microscope hardware.
 
-    Aggregates Stage, Beam, and Detector settings into a single structure.
-    Does not store 'Extras'; acts only as a hierarchy organizer.
+    Hierarchically aggregates settings for Stage, Beam, and Detectors.
+
+    Attributes:
+        stage: Settings and limits for the stage.
+        beam: Settings and limits for the electron column.
+        detector: Settings and capabilities for all detectors.
+        info: Static system identity metadata.
     """
     stage: StageSystemSettings = field(default_factory=StageSystemSettings)
     beam: BeamSystemSettings = field(default_factory=BeamSystemSettings)
@@ -2572,10 +2734,15 @@ class SystemSettings:
 
 @dataclass
 class MicroscopeSettings:
-    """Top-level application configuration.
+    """
+    Top-level application configuration.
 
-    Contains hardware settings (SystemSettings), output preferences (ImageOutputSettings),
-    and protocol metadata.
+    Combines hardware system settings with global application preferences and protocols.
+
+    Attributes:
+        system: Hardware configuration (Stage, Beam, Detectors).
+        image: Global defaults for image output (Format, Path).
+        protocol: Dictionary for experimental protocol parameters.
     """
     system: SystemSettings = field(default_factory=SystemSettings)
     image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
