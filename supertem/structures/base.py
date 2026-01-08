@@ -195,14 +195,14 @@ except PackageNotFoundError:
         __version__ = "unknown"
 
 
-# -----------------------
-# Parsing modes
-# -----------------------
+# =============================================================================
+# Parsing & Validation Helpers
+# =============================================================================
 
 class ParseMode(str, Enum):
     """Defines the strictness level for data ingestion."""
-    STRICT = "strict"   # Raise errors on bad data (Control Plane)
-    LENIENT = "lenient" # Salvage bad data into Extras (Data Plane)
+    STRICT = "strict"   # Raise errors immediately (Control Plane / Execution)
+    LENIENT = "lenient" # Log errors to Extras and continue (Data Plane / Logging)
 
 
 def as_parse_mode(mode: Union["ParseMode", str, None]) -> "ParseMode":
@@ -226,9 +226,9 @@ def is_strict(mode: Union["ParseMode", str, None]) -> bool:
 def note_or_raise(extra: Optional["Extras"], key: str, exc: Exception, *, mode: Union["ParseMode", str, None] = ParseMode.STRICT, raw: Any = None) -> None:
     """Handle a validation error according to the ParseMode.
 
-    In STRICT mode: Raises the exception immediately.
+    In STRICT mode: Raises the exception immediately to prevent unsafe execution.
     In LENIENT mode: Catches the exception, records it in `extra.notes`,
-                     and optionally saves the `raw` value in `extra.raw`.
+                     and optionally saves the `raw` value in `extra.raw` for debugging.
     """
     if is_strict(mode):
         raise exc
@@ -242,9 +242,9 @@ def note_or_raise(extra: Optional["Extras"], key: str, exc: Exception, *, mode: 
         pass
 
 
-# -----------------------
-# Quantity
-# -----------------------
+# =============================================================================
+# Unit Handling (Pint Integration)
+# =============================================================================
 
 try:
     from pint import UnitRegistry
@@ -270,13 +270,15 @@ except Exception:
 def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
     """Coerce arbitrary input into a Pint Quantity with the target unit.
 
-    Handles:
-    - Pint Quantity objects (converts to target unit)
-    - Dicts (e.g. {"magnitude": 10, "unit": "nm"})
-    - Numbers (assumes target unit)
-    - Strings (e.g. "10 nm", "10")
+    This function acts as a firewall against ambiguous units.
+    It handles:
+    - Pint Objects: Converts them to the target unit (e.g. 1000V -> 1kV).
+    - Dicts: Parses {"value": 1, "unit": "nm"} structures.
+    - Strings: Parses "10 nm" or "5 degree".
+    - Numbers: Assumes the target unit (legacy behavior).
 
-    Returns None if parsing fails or input is None/Empty.
+    Returns None if parsing fails, allowing the caller to decide whether to raise
+    an error (Strict) or ignore it (Lenient).
     """
     if value is None:
         return None
@@ -284,12 +286,12 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
         return None
 
     try:
-        # Already a Pint Quantity (possibly from another registry)
+        # 1. Handle existing Pint Quantities (safe conversion)
         if isinstance(value, Quantity):
             q = Q_(value.magnitude, str(value.units))
             return q.to(unit)
 
-        # Dict forms
+        # 2. Handle Dictionary representations (e.g. from JSON)
         if isinstance(value, dict):
             mag = value.get("magnitude", value.get("value", None))
             u = value.get("unit", value.get("units", None))
@@ -298,27 +300,27 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
             q = Q_(mag, u) if u else Q_(mag, unit)
             return q.to(unit)
 
-        # Plain numbers
+        # 3. Handle Plain Numbers (assume target unit)
         if isinstance(value, (int, float, np.number)):
             q = Q_(float(value), unit)
             return q.to(unit)
 
-        # Strings: "5", "5 nm", "5degree"
+        # 4. Handle Strings (parse unit if present)
         if isinstance(value, str):
             s = value.strip()
             if not s:
                 return None
-            # try numeric first (supports 1e-3)
+            # Fast path: try numeric parsing first to avoid Pint parser overhead
             try:
                 q = Q_(float(s), unit)
                 return q.to(unit)
             except Exception:
                 pass
-            # then try quantity string like "12 nm"
+            # Slow path: full string parsing (e.g., "5.2 nm")
             q = Q_(s)
             return q.to(unit)
 
-        # Last resort: try numeric cast
+        # Fallback: try numeric cast
         q = Q_(float(value), unit)
         return q.to(unit)
 
@@ -328,22 +330,18 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
 def serialize_quantity(q: Optional["Quantity"], target_unit: str) -> Optional[float]:
     """Convert a Quantity to a plain float magnitude in the target unit.
 
-    Used for creating JSON-safe representations (e.g. 'voltage_kv': 300.0).
+    This strips the unit information for safe JSON serialization.
+    Example: serialize_quantity(Q_(300, 'kV'), 'V') -> 300000.0
     """
     if q is None:
         return None
     try:
         if not isinstance(q, Quantity):
-            # Fallback if somehow a float got in
+            # Fallback if a float crept in somehow
             return float(q)
         return float(q.to(target_unit).magnitude)
     except Exception:
         return None
-
-def magnitude(value: Any, unit: str) -> Optional[float]:
-    """Legacy helper: parse and immediately extract magnitude."""
-    q = ensure_quantity(value, unit)
-    return serialize_quantity(q, unit)
 
 def _check_data_format(data: np.ndarray) -> bool:
     """Validate if numpy array is a valid 2D image (uint8/uint16)."""
@@ -357,16 +355,16 @@ def _check_data_format(data: np.ndarray) -> bool:
     return (data.dtype.kind == "u") and (data.dtype.itemsize in (1, 2))
 
 
-# -----------------------
-# Extras
-# -----------------------
+# =============================================================================
+# Extras Container
+# =============================================================================
 
 @dataclass
 class Extras:
     """Structured container for non-standard data.
 
-    This class supports the 'Lenient Parsing' philosophy. Instead of crashing on
-    unexpected or malformed data, we move it here for later inspection.
+    This class supports the 'Lenient Parsing' philosophy. Any data that doesn't
+    fit the strict schema ends up here for later inspection instead of causing a crash.
 
     Attributes:
         vendor: Namespaced storage for vendor-specific extensions.
@@ -374,7 +372,6 @@ class Extras:
         raw: Original raw values that failed type coercion/validation.
         notes: Error messages or warnings generated during parsing.
     """
-
     vendor: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     unknown: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
@@ -402,12 +399,13 @@ class Extras:
 
     @staticmethod
     def from_any(value: Any, *, owner: str = "unknown") -> "Extras":
+        """Intelligently parse 'extra' fields from various inputs."""
         if value is None:
             return Extras()
         if isinstance(value, Extras):
             return value
         if isinstance(value, dict):
-            # Heuristic: Check if this looks like a bucketed Extras dict
+            # Check if this is already a structured Extras dict (has keys like 'vendor', 'notes')
             known_buckets = {"vendor", "unknown", "raw", "notes"}
             keys = set(value.keys())
             if keys and keys.issubset(known_buckets):
@@ -424,6 +422,7 @@ class Extras:
                 if "notes" in value: ex.notes = deepcopy(value["notes"]) if isinstance(value["notes"], dict) else {}
                 return ex
             elif "vendor" in keys or "unknown" in keys:
+                # Partial match logic
                 ex = Extras()
                 ex.vendor = deepcopy(value.get("vendor", {}))
                 ex.unknown = deepcopy(value.get("unknown", {}))
@@ -431,12 +430,13 @@ class Extras:
                 ex.notes = deepcopy(value.get("notes", {}))
                 return ex
 
-            # Treat as flat dict -> move to unknown
+            # If it's just a flat dict, treat the whole thing as 'unknown' properties
             ex = Extras()
             try: ex.unknown = deepcopy(value)
             except Exception: ex.raw[f"{owner}.extra"] = repr(value)
             return ex
 
+        # Fallback: treat scalar values as raw garbage
         ex = Extras()
         ex.raw[f"{owner}.extra"] = repr(value)
         return ex
@@ -452,7 +452,11 @@ def _extra_put_raw(extra: Any, key: str, value: Any) -> None:
         extra[f"{key}_raw"] = value
 
 def collect_extra(d: Optional[Dict[str, Any]], known: Iterable[str], *, owner: str = "unknown") -> Extras:
-    """Harvest unknown keys from a dict into an Extras object."""
+    """Harvest unknown keys from a source dict into an Extras object.
+
+    This ensures forward compatibility: if the hardware sends new fields we don't
+    recognize yet, we preserve them in 'unknown' rather than discarding them.
+    """
     if not isinstance(d, dict):
         return Extras()
     known_set = set(known)
@@ -528,9 +532,9 @@ def merge_extras(dst: Extras, src: Any, *, owner: str) -> Extras:
     return dst
 
 
-# -----------------------
-# Parsers
-# -----------------------
+# =============================================================================
+# Type Parsers
+# =============================================================================
 
 def parse_bool(value: Any, default: bool = False, *, strict: bool = False) -> bool:
     """Strictly or leniently parse a boolean value.
@@ -625,7 +629,10 @@ def parse_optional_float_like(value: Any, *, name: str, strict: bool = False, ex
 
 
 def parse_optional_bool_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[bool]:
-    """Parse a value into a bool or None (tristate logic)."""
+    """Parse a value into a bool or None (tristate logic).
+
+    Used for capabilities where 'None' implies "Unknown/Not Reported".
+    """
     if value is None:
         return None
     if isinstance(value, str) and value.strip() == "":
@@ -705,7 +712,11 @@ def parse_optional_pair_float_like(value: Any, *, name: str, sort: bool = False,
         return None
 
 def parse_optional_id_like(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[str]:
-    """Parse a value into a safe string ID. Logs warning if ID is empty string."""
+    """Parse a value into a safe string ID.
+
+    Logs a warning note if the resulting ID is an empty string, as this usually
+    indicates a misconfiguration in the source.
+    """
     if value is None:
         return None
     if isinstance(value, str) and value.strip() == "":
@@ -742,7 +753,10 @@ def maybe_from_dict(
 ) -> Optional[T]:
     """Generic helper to instantiate a Dataclass from a dict safely.
 
-    Handles ParseMode propagation and exception catching.
+    This function handles the 'Maybe' pattern common in parsing:
+    - If input is None -> return None.
+    - If input is wrong type -> Raise (Strict) or Log (Lenient).
+    - If input is valid -> Recursively parse.
     """
     mode = as_parse_mode(mode)
     if raw is None:
@@ -782,7 +796,7 @@ def maybe_from_dict(
 
 
 def _jsonable(obj: Any) -> Any:
-    """Recursively convert object to JSON-safe primitives."""
+    """Recursively convert object to JSON-safe primitives (dicts/lists/floats)."""
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
     try:
@@ -801,6 +815,7 @@ def _jsonable(obj: Any) -> Any:
         pass
     try:
         if isinstance(obj, Quantity):
+            # Pint objects become explicit dicts for serialization
             return {"magnitude": float(obj.magnitude), "unit": str(obj.units)}
     except Exception:
         pass
@@ -812,7 +827,13 @@ def _jsonable(obj: Any) -> Any:
 
 
 def _setup_init(obj: Any, mode_input: Any, owner_name: str) -> Tuple[ParseMode, bool, Extras]:
-    """Reduce boilerplate in __post_init__ methods."""
+    """Reduce boilerplate in __post_init__ methods.
+
+    Returns:
+        mode: The resolved ParseMode (Strict/Lenient).
+        strict: Boolean flag for convenience (True if mode is Strict).
+        extra: The normalized Extras container.
+    """
     mode = as_parse_mode(mode_input)
     strict = is_strict(mode)
     extra = normalize_extra(obj.extra) if strict else normalize_extra_lenient(obj.extra, owner_name)
@@ -820,7 +841,7 @@ def _setup_init(obj: Any, mode_input: Any, owner_name: str) -> Tuple[ParseMode, 
 
 
 # =============================================================================
-# Structures
+# Structures (Dataclasses)
 # =============================================================================
 
 @dataclass
@@ -919,6 +940,7 @@ class ROI:
                 mode=mode, raw={"width": self.width, "height": self.height},
             )
             if not strict:
+                # Auto-heal: reset to default if invalid in lenient mode
                 self.width = 512 if self.width <= 0 else self.width
                 self.height = 512 if self.height <= 0 else self.height
         return was_valid
@@ -1059,6 +1081,7 @@ class TemStagePosition:
         )
 
     def __add__(self, other: 'TemStagePosition') -> 'TemStagePosition':
+        """Enable vector addition for relative movements."""
         if not isinstance(other, TemStagePosition): return NotImplemented
         def add_axis(a, b, unit: str):
             qa = ensure_quantity(a, unit)
@@ -1291,6 +1314,9 @@ class BeamSettings:
         def _q(val, unit, name):
             q = ensure_quantity(val, unit)
             if val is not None and q is None:
+                # Critical Strictness Check:
+                # If value existed but failed parsing, Strict mode MUST fail.
+                # Lenient mode swallows it (value becomes None).
                 note_or_raise(self.extra, name, ValueError(f"Invalid {name}: {val!r}"), mode=mode, raw=val)
             return q
 
@@ -1617,7 +1643,6 @@ class DetectorCapabilities:
         self.can_digital_rotation = parse_optional_bool_like(self.can_digital_rotation, name="DetectorCapabilities.can_digital_rotation", strict=False, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        # Header: Validate (semantic correctness) happens only when validate() is called.
         mode = as_parse_mode(self._mode if mode is None else mode)
         strict = is_strict(mode)
         ok = True
@@ -1629,6 +1654,7 @@ class DetectorCapabilities:
                 note_or_raise(self.extra, f"DetectorCapabilities.{min_name}_gt_{max_name}",
                               ValueError(f"{min_name} > {max_name}"), mode=mode, raw=(v_min, v_max))
                 if not strict:
+                    # In lenient mode, assume the driver swapped them accidentally
                     setattr(self, min_name, v_max)
                     setattr(self, max_name, v_min)
                 return False
@@ -2376,6 +2402,7 @@ class SystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
+        # Optim: No local mode/strict needed here as it delegates
         mode = as_parse_mode(self._mode)
         self.stage = maybe_from_dict(StageSystemSettings, self.stage, mode=mode) or StageSystemSettings(_mode=mode)
         self.beam = maybe_from_dict(BeamSystemSettings, self.beam, mode=mode) or BeamSystemSettings(_mode=mode)
