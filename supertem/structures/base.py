@@ -285,6 +285,12 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
     if isinstance(value, (bool, np.bool_)):
         return None
 
+        # OPTIMIZATION: Fast path for plain numbers
+        # Avoids the overhead of the Pint string parser for standard inputs.
+    if isinstance(value, (int, float, np.number)):
+        # Trust that raw numbers are already in the target base unit
+        return Q_(float(value), unit)
+
     try:
         # 1. Handle existing Pint Quantities (safe conversion)
         if isinstance(value, Quantity):
@@ -300,17 +306,12 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
             q = Q_(mag, u) if u else Q_(mag, unit)
             return q.to(unit)
 
-        # 3. Handle Plain Numbers (assume target unit)
-        if isinstance(value, (int, float, np.number)):
-            q = Q_(float(value), unit)
-            return q.to(unit)
-
-        # 4. Handle Strings (parse unit if present)
+        # 3. Handle Strings (parse unit if present)
         if isinstance(value, str):
             s = value.strip()
             if not s:
                 return None
-            # Fast path: try numeric parsing first to avoid Pint parser overhead
+            # Try numeric parsing first (e.g. "100")
             try:
                 q = Q_(float(s), unit)
                 return q.to(unit)
@@ -320,7 +321,7 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
             q = Q_(s)
             return q.to(unit)
 
-        # Fallback: try numeric cast
+        # Fallback
         q = Q_(float(value), unit)
         return q.to(unit)
 
@@ -729,13 +730,19 @@ def parse_optional_id_like(value: Any, *, name: str, strict: bool = False, extra
         return None
     return parse_optional_str_like(value, name=name, strict=strict, extra=extra)
 
-def _maybe_point(v: Any, *, extra: Any = None, name: str = "point") -> Optional["Point"]:
+
+def _maybe_point(v: Any, *, extra: Any = None, name: str = "point", mode: ParseMode = ParseMode.LENIENT) -> Optional[
+    "Point"]:
     if v is None:
         return None
-    if isinstance(v, Point):
-        return v
-    if isinstance(v, (dict, list, tuple)):
-        return Point.from_dict(v)
+    try:
+        if isinstance(v, Point):
+            return replace(v, _mode=mode)
+        if isinstance(v, (dict, list, tuple)):
+            return Point.from_dict(v, mode=mode)
+    except Exception as e:
+        note_or_raise(extra, name, e, mode=mode, raw=v)
+
     if extra is not None:
         _extra_put_raw(extra, name, v)
     return None
@@ -849,20 +856,20 @@ class Point:
     """A simple 3D coordinate with an optional name.
 
     Used for stigmation, beam shifts, and image shifts.
-    Normalizes inputs to safe float values (default 0.0) to prevent crashes.
     """
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
     name: Optional[str] = None
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        vx = parse_optional_float_like(self.x, name="Point.x", strict=False)
-        vy = parse_optional_float_like(self.y, name="Point.y", strict=False)
-        vz = parse_optional_float_like(self.z, name="Point.z", strict=False)
-        self.x = 0.0 if vx is None else float(vx)
-        self.y = 0.0 if vy is None else float(vy)
-        self.z = 0.0 if vz is None else float(vz)
+        mode = as_parse_mode(self._mode)
+        strict = is_strict(mode)
+        # Fix: Pass strictness down to validation helper
+        self.x = self._parse_val(self.x, "Point.x", strict)
+        self.y = self._parse_val(self.y, "Point.y", strict)
+        self.z = self._parse_val(self.z, "Point.z", strict)
         self.name = parse_optional_str_like(self.name, name="Point.name", strict=False)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -872,28 +879,44 @@ class Point:
         return _jsonable(drop_none_keys({"x": self.x, "y": self.y, "z": self.z, "name": self.name}))
 
     @staticmethod
-    def from_dict(d: Any) -> "Point":
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Point":
+        # Fix: Accept mode argument to propagate strictness
+        mode = as_parse_mode(mode)
         if isinstance(d, Point):
-            return d
-        def _f(v: Any, default: float = 0.0) -> float:
-            out = parse_optional_float_like(v, name="Point", strict=False)
-            return default if out is None else float(out)
+            return replace(d, _mode=mode)
+
+        def _f(v: Any) -> float:
+            # Fix: Respect strict mode in helper
+            out = parse_optional_float_like(v, name="Point", strict=is_strict(mode))
+            return 0.0 if out is None else float(out)
+
         if isinstance(d, dict):
             return Point(
                 x=_f(d.get("x", 0.0)),
                 y=_f(d.get("y", 0.0)),
                 z=_f(d.get("z", 0.0)),
-                name=parse_optional_str_like(d.get("name", None), name="Point.name", strict=False)
+                name=parse_optional_str_like(d.get("name", None), name="Point.name", strict=False),
+                _mode=mode
             )
         if isinstance(d, (list, tuple)) and len(d) in (2, 3):
-            x = _f(d[0], 0.0)
-            y = _f(d[1], 0.0)
-            z = _f(d[2], 0.0) if len(d) == 3 else 0.0
-            return Point(x=x, y=y, z=z)
-        return Point()
+            x = _f(d[0])
+            y = _f(d[1])
+            z = _f(d[2]) if len(d) == 3 else 0.0
+            return Point(x=x, y=y, z=z, _mode=mode)
+
+        return Point(_mode=mode)
 
     def to_list(self) -> list:
         return [self.x, self.y, self.z]
+
+    def _parse_val(self, v: Any, name: str, strict: bool) -> float:
+        # Fix: Helper now respects strict flag
+        out = parse_optional_float_like(v, name=name, strict=strict)
+        if out is None:
+            # If we are here in STRICT mode, it means input was explicitly None (allowed).
+            # If input was "garbage", parse_optional_float_like would have ALREADY raised.
+            return 0.0
+        return float(out)
 
 
 @dataclass
@@ -1326,9 +1349,9 @@ class BeamSettings:
         self.scan_rotation = _q(self.scan_rotation, "degree", "BeamSettings.scan_rotation")
         self.spot_size = parse_optional_int_like(self.spot_size, name="BeamSettings.spot_size", strict=strict, extra=self.extra)
 
-        self.stigmation = _maybe_point(self.stigmation, extra=self.extra, name="BeamSettings.stigmation")
-        self.beam_shift = _maybe_point(self.beam_shift, extra=self.extra, name="BeamSettings.beam_shift")
-        self.image_shift = _maybe_point(self.image_shift, extra=self.extra, name="BeamSettings.image_shift")
+        self.stigmation = _maybe_point(self.stigmation, extra=self.extra, name="BeamSettings.stigmation", mode=mode)
+        self.beam_shift = _maybe_point(self.beam_shift, extra=self.extra, name="BeamSettings.beam_shift", mode=mode)
+        self.image_shift = _maybe_point(self.image_shift, extra=self.extra, name="BeamSettings.image_shift", mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -1994,8 +2017,24 @@ class AcquisitionRequest:
         self.detector = maybe_from_dict(DetectorSettings, self.detector, mode=mode) or DetectorSettings(_mode=mode)
         self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
         self.detector_id = parse_optional_id_like(self.detector_id, name="id", strict=strict, extra=self.extra)
+
+        # 1. If outer ID is missing but inner exists, pull inner -> outer
         if not self.detector_id and self.detector.detector_id:
             self.detector_id = self.detector.detector_id
+
+        # 2. If outer ID exists (either originally or pulled from inner),
+        #    FORCE the inner ID to match it.
+        if self.detector_id:
+            # If strict, we can still warn/error if they were explicitly different
+            if self.detector.detector_id and self.detector.detector_id != self.detector_id:
+                note_or_raise(
+                    self.extra,
+                    "AcquisitionRequest.id_mismatch",
+                    ValueError(f"Ambiguous IDs: outer={self.detector_id}, inner={self.detector.detector_id}"),
+                    mode=mode
+                )
+            # Always sync inner to outer
+            self.detector.detector_id = self.detector_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
