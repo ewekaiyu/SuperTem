@@ -74,11 +74,11 @@ ParseMode.STRICT (control-plane default)
     - objects leaving STRICT validation are safe to execute
 
 ===============================================================================
-III. The Normalization vs. Validation Rulebook
+III. The Normalization, Validation, and Gatekeeping Rulebook
 ===============================================================================
 
 To maintain safety without sacrificing robustness, this module enforces a strict
-separation of concerns between `__post_init__` and `validate()`.
+separation of concerns across three distinct lifecycles:
 
 1. Normalization (__post_init__)
 -------------------------------------------------------------------------------
@@ -92,8 +92,8 @@ separation of concerns between `__post_init__` and `validate()`.
       (e.g., "128" -> 128, "10 nm" -> Quantity(10, 'nm'))
 
    B. Structural Defaults are Normalization.
-      If a field is `None` but the system requires a value to function (to avoid
-      AttributeError/TypeError later), set a safe default here.
+      If a field is `None` but required for the object to exist (e.g., to prevent
+      AttributeError later), set a safe default here.
       (e.g., `width=None` -> `width=512`)
 
    C. Structural Patching is Normalization.
@@ -108,37 +108,56 @@ separation of concerns between `__post_init__` and `validate()`.
 
 2. Validation (validate)
 -------------------------------------------------------------------------------
-   GOAL:    Integrity of Meaning (Domain Safety & Logic)
+   GOAL:    Integrity of Meaning (Internal Logic & Self-Consistency)
    INPUT:   "Clean" data (guaranteed types from step 1)
    OUTPUT:  Boolean success flag (and populated Extras.notes)
 
    Rules:
-   A. Domain Constraints are Validation.
-      Check physical and logical bounds.
-      (e.g., `width > 0`, `voltage < max_limit`, `isfinite(position)`)
+   A. Trust the Types.
+      Do not check `isinstance` or try/except AttributeErrors. If `__post_init__`
+      did its job, variables have the correct type. Focus on *values*.
 
-   B. Cross-Field Consistency is Validation.
-      Check if two fields contradict each other.
-      (e.g., `outer_id != inner_id`)
+   B. Domain Constraints are Validation.
+      Check physical and logical bounds of the object itself.
+      (e.g., `width > 0`, `min_limit <= max_limit`).
 
-   C. Healing is Validation (Lenient Mode Only).
-      If a value is structurally sound (correct type) but logically invalid
-      (e.g., `width=-50`):
+   C. Internal Cross-Field Consistency.
+      Check if two fields within the *same* object or hierarchy contradict each other.
+      - "If axis is enabled (`can_tilt=True`), limits MUST be defined (`tilt_limits!=None`)."
+      - "If `default_id` is set, it MUST exist in `available_ids`."
+
+   D. Healing is Validation (Lenient Mode Only).
+      If a value is structurally sound but logically invalid (e.g., `width=-50`):
         - STRICT Mode: Raise an Exception.
         - LENIENT Mode: "Heal" it to a safe value or disable the feature.
 
+3. Gatekeeping (is_safe_... / is_supported)
+-------------------------------------------------------------------------------
+   GOAL:    Integrity of Action (Runtime Safety & Hardware Compatibility)
+   INPUT:   An external "Request" object (e.g., StagePosition, BeamSettings)
+   OUTPUT:  Boolean allowed/rejected flag.
+
+   Rules:
+   A. Configs are Guardrails, Requests are Intent.
+      The SystemSettings object acts as the Gatekeeper. It validates *external*
+      requests against its *internal* limits.
+
+   B. Specificity over Genericity.
+      Use specific method names that describe the risk:
+      - `is_safe_move(target)`: Checks collision/travel limits (Stage).
+      - `is_safe_beam(target)`: Checks voltage/optical limits (Beam).
+      - `is_supported(settings)`: Checks driver capabilities (Detector).
+
    Summary Table:
-   +---------------------+-----------------------+------------------+
-   | Scenario            | Action                | Responsibility   |
-   +=====================+=======================+==================+
-   | Input is None       | Set Default (512)     | __post_init__    |
-   | Input is "128"      | Convert (int)         | __post_init__    |
-   | Missing Outer ID    | Copy Inner ID         | __post_init__    |
-   +---------------------+-----------------------+------------------+
-   | Input is -100       | Check > 0             | validate()       |
-   | Input is NaN        | Check isfinite()      | validate()       |
-   | ID Mismatch         | Check A == B          | validate()       |
-   +---------------------+-----------------------+------------------+
+   +------------------+-----------------------+-----------------------------+
+   | Phase            | Question Asked        | Example                     |
+   +==================+=======================+=============================+
+   | Normalization    | "Is it the right type?"| "10" -> 10 (int)           |
+   | Validation       | "Is it logical?"      | min_limit < max_limit       |
+   |                  | "Is it complete?"     | enabled=True -> limits!=None|
+   +------------------+-----------------------+-----------------------------+
+   | Gatekeeping      | "Is it safe/allowed?" | target_x < x_limit          |
+   +------------------+-----------------------+-----------------------------+
 
 ===============================================================================
 IV. Extras: Preservation and Diagnostics
@@ -1253,6 +1272,7 @@ class StageSystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
+        # NORMALIZATION: Integrity of Structure
         mode, strict, self.extra = _setup_init(self, self._mode, "StageSystemSettings")
 
         self.enabled = parse_bool_like(self.enabled, default=True)
@@ -1280,22 +1300,33 @@ class StageSystemSettings:
         self.max_step_angle = ensure_quantity(self.max_step_angle, "degree") or Q_(1.0, "degree")
         self.eucentric_z = ensure_quantity(self.eucentric_z, "nm")
 
-        self.settle_time_s = parse_optional_float_like(self.settle_time_s, name="settle_time_s", strict=strict, extra=self.extra) or 0.2
-        self.timeout_s = parse_optional_float_like(self.timeout_s, name="timeout_s", strict=strict, extra=self.extra) or 10.0
+        self.settle_time_s = parse_optional_float_like(self.settle_time_s, name="settle_time_s", strict=strict,
+                                                       extra=self.extra) or 0.2
+        self.timeout_s = parse_optional_float_like(self.timeout_s, name="timeout_s", strict=strict,
+                                                   extra=self.extra) or 10.0
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        """
+        VALIDATION: Integrity of Meaning (Self-Consistency).
+        Checks if the configuration itself is logical and complete.
+        """
         mode = as_parse_mode(self._mode if mode is None else mode)
         strict = is_strict(mode)
         ok = True
 
+        # 1. Logical Range Checks (Min <= Max)
         def _check_range(lims, name):
             if lims:
                 mn, mx = lims
                 if mn > mx:
-                    note_or_raise(self.extra, f"StageSystemSettings.{name}_limits", ValueError(f"{name} limits invalid: min > max ({mn} > {mx})"), mode=mode)
+                    note_or_raise(self.extra, f"StageSystemSettings.{name}_limits",
+                                  ValueError(f"{name} limits invalid: min > max ({mn} > {mx})"), mode=mode)
                     if not strict:
-                        try: setattr(self, f"{name}_limits", (mx, mn))
-                        except Exception: pass
+                        # Heal swapped limits
+                        try:
+                            setattr(self, f"{name}_limits", (mx, mn))
+                        except Exception:
+                            pass
                     return False
             return True
 
@@ -1306,30 +1337,102 @@ class StageSystemSettings:
         ok = _check_range(self.tilt_x_limits, "tilt_x") and ok
         ok = _check_range(self.tilt_y_limits, "tilt_y") and ok
 
+        # 2. Cross-Field Consistency (Rule 2B)
+        # If an axis is enabled, it SHOULD have limits defined to be safe.
+        def _check_completeness(enabled: bool, limits: Any, name: str):
+            if enabled and limits is None:
+                note_or_raise(self.extra, f"StageSystemSettings.{name}_safety",
+                              ValueError(f"Axis {name} is enabled but has no safety limits defined."), mode=mode)
+                return False
+            return True
+
+        ok = _check_completeness(self.can_x, self.x_limits, "x") and ok
+        ok = _check_completeness(self.can_y, self.y_limits, "y") and ok
+        ok = _check_completeness(self.can_z, self.z_limits, "z") and ok
+        ok = _check_completeness(self.can_r, self.r_limits, "r") and ok
+        ok = _check_completeness(self.can_tilt_x, self.tilt_x_limits, "tilt_x") and ok
+        ok = _check_completeness(self.can_tilt_y, self.tilt_y_limits, "tilt_y") and ok
+
+        # 3. Parameter Safety
         if self.max_step_distance.magnitude <= 0:
-            note_or_raise(self.extra, "StageSystemSettings.max_step_distance", ValueError("max_step_distance must be > 0"), mode=mode)
+            note_or_raise(self.extra, "StageSystemSettings.max_step_distance",
+                          ValueError("max_step_distance must be > 0"), mode=mode)
             ok = False
 
         if self.eucentric_z is not None and self.z_limits:
             z_min, z_max = self.z_limits
             if not (z_min <= self.eucentric_z <= z_max):
-                note_or_raise(self.extra, "StageSystemSettings.eucentric_z", ValueError(f"eucentric_z ({self.eucentric_z}) outside z_limits"), mode=mode)
+                note_or_raise(self.extra, "StageSystemSettings.eucentric_z",
+                              ValueError(f"eucentric_z ({self.eucentric_z}) outside z_limits"), mode=mode)
                 ok = False
 
         if self.settle_time_s < 0:
-            note_or_raise(self.extra, "StageSystemSettings.settle_time_s",
-                          ValueError("Settle time must be >= 0"), mode=mode)
+            note_or_raise(self.extra, "StageSystemSettings.settle_time_s", ValueError("Settle time must be >= 0"),
+                          mode=mode)
             ok = False
 
-        if self.timeout_s <= 0:
-            note_or_raise(self.extra, "StageSystemSettings.timeout_s",
-                          ValueError("Timeout must be > 0"), mode=mode)
-            ok = False
+        return ok
+
+    def is_safe_move(self, target: StagePosition, current: Optional[StagePosition] = None) -> bool:
+        """
+        RUNTIME CHECK: External Safety.
+        Checks if a specific request complies with the validated limits.
+        """
+        mode = as_parse_mode(self._mode)
+
+        # 1. Absolute Limit Checks (Guardrails)
+        def _check_limit(val_q, limit_tuple, name):
+            # If request doesn't touch this axis (None), it's safe.
+            if val_q is None: return True
+
+            # If settings have no limit for this axis, strictly speaking it's unsafe
+            # if we are in STRICT mode, or maybe we allow it (infinite bounds).
+            # Based on validate() completeness check, we assume limits exist if enabled.
+            if limit_tuple is None: return True
+
+            min_lim, max_lim = limit_tuple
+            if not (min_lim <= val_q <= max_lim):
+                note_or_raise(self.extra, f"Safety.limit_{name}",
+                              ValueError(f"{name} target {val_q} outside limits {limit_tuple}"), mode=mode)
+                return False
+            return True
+
+        ok = True
+        ok = _check_limit(target.x, self.x_limits, "x") and ok
+        ok = _check_limit(target.y, self.y_limits, "y") and ok
+        ok = _check_limit(target.z, self.z_limits, "z") and ok
+        ok = _check_limit(target.r, self.r_limits, "r") and ok
+        ok = _check_limit(target.tilt_x, self.tilt_x_limits, "tilt_x") and ok
+        ok = _check_limit(target.tilt_y, self.tilt_y_limits, "tilt_y") and ok
+
+        # 2. Relative Step Size Checks (Dynamics)
+        if current is not None:
+            # Euclidean distance for XY stage movement
+            dx = (target.x - current.x) if (target.x is not None and current.x is not None) else Q_(0, 'nm')
+            dy = (target.y - current.y) if (target.y is not None and current.y is not None) else Q_(0, 'nm')
+
+            # Simple magnitude check without sqrt optimization for clarity/units
+            distance = (dx ** 2 + dy ** 2) ** 0.5
+
+            if distance > self.max_step_distance:
+                note_or_raise(self.extra, "Safety.max_step_distance",
+                              ValueError(f"XY move distance {distance} exceeds limit {self.max_step_distance}"),
+                              mode=mode)
+                ok = False
+
+            # Check tilt step
+            if target.tilt_x is not None and current.tilt_x is not None:
+                d_tilt = abs(target.tilt_x - current.tilt_x)
+                if d_tilt > self.max_step_angle:
+                    note_or_raise(self.extra, "Safety.max_step_angle",
+                                  ValueError(f"Tilt X step {d_tilt} exceeds limit {self.max_step_angle}"), mode=mode)
+                    ok = False
 
         return ok
 
     def to_dict(self) -> dict:
         def _s_lim(val, u): return [serialize_quantity(v, u) for v in val] if val else None
+
         d = {
             "enabled": self.enabled,
             "can_x": self.can_x,
@@ -1358,7 +1461,10 @@ class StageSystemSettings:
         mode = as_parse_mode(mode)
         if isinstance(d, StageSystemSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return StageSystemSettings(_mode=mode)
-        def _get(key, suffix_key, default=None): return d.get(key, d.get(suffix_key, default))
+
+        def _get(key, suffix_key, default=None):
+            return d.get(key, d.get(suffix_key, default))
+
         return StageSystemSettings(
             enabled=d.get("enabled", True),
             can_x=d.get("can_x", True),
@@ -1567,6 +1673,37 @@ class BeamSystemSettings:
         ok = _check(self.beam_current_limits, "beam_current_limits") and ok
         ok = _check(self.convergence_angle_limits, "convergence_angle_limits") and ok
         ok = _check(self.spot_size_limits, "spot_size_limits") and ok
+
+        return ok
+
+    def is_safe_beam(self, target: BeamSettings) -> bool:
+        """
+        Runtime Gatekeeper: Checks if a target beam configuration respects system limits.
+        """
+        mode = as_parse_mode(self._mode)
+
+        # Helper for limit checking
+        def _check(val, limit_tuple, name):
+            if val is None or limit_tuple is None: return True
+            min_lim, max_lim = limit_tuple
+            if not (min_lim <= val <= max_lim):
+                note_or_raise(self.extra, f"Safety.beam_{name}",
+                              ValueError(f"{name} {val} outside limits {limit_tuple}"), mode=mode)
+                return False
+            return True
+
+        ok = True
+        ok = _check(target.voltage, self.voltage_limits, "voltage") and ok
+        ok = _check(target.beam_current, self.beam_current_limits, "current") and ok
+        ok = _check(target.convergence_angle, self.convergence_angle_limits, "convergence") and ok
+
+        # Discrete checks
+        if target.spot_size is not None and self.spot_size_limits:
+            min_s, max_s = self.spot_size_limits
+            if not (min_s <= target.spot_size <= max_s):
+                note_or_raise(self.extra, "Safety.beam_spot",
+                              ValueError(f"Spot size {target.spot_size} outside {self.spot_size_limits}"), mode=mode)
+                ok = False
 
         return ok
 
@@ -1848,6 +1985,26 @@ class DetectorCapabilities:
 
         return ok
 
+    def supports(self, settings: DetectorSettings) -> bool:
+        # We assume 'settings' is already internally validated (Integrity of Meaning)
+        # We check 'Integrity of Compatibility'
+
+        if settings.binning_xy:
+            bx, by = settings.binning_xy
+            # Check if this binning level is allowed
+            if self.binning_xy_max:
+                max_x, max_y = self.binning_xy_max
+                if bx > max_x or by > max_y: return False
+            # Check if binning is enabled at all
+            if self.can_binning is False and (bx > 1 or by > 1): return False
+
+        if settings.exposure:
+            # Check min/max exposure
+            if self.exposure_ms_min and settings.exposure < Q_(self.exposure_ms_min, 'ms'): return False
+            if self.exposure_ms_max and settings.exposure > Q_(self.exposure_ms_max, 'ms'): return False
+
+        return True
+
     def to_dict(self) -> dict:
         d: Dict[str, Any] = {}
         for f in fields(DetectorCapabilities):
@@ -2034,6 +2191,20 @@ class DetectorSystemSettings:
             ok = cap.validate(mode=mode) and ok
 
         return ok
+
+    def is_supported(self, settings: DetectorSettings) -> bool:
+        """
+        Runtime Gatekeeper: Checks if settings are supported by the specific detector hardware.
+        """
+        if not settings.detector_id: return False  # Can't check if we don't know who it is
+
+        caps = self.capabilities_by_id.get(settings.detector_id)
+        if not caps:
+            # Policy decision: If we have no info, do we block it?
+            # Safe default is usually to allow (lenient) or block (strict).
+            return True
+
+        return caps.supports(settings)
 
     def to_dict(self) -> dict:
         d = {
