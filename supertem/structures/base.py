@@ -897,14 +897,21 @@ class Point:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
+        # NORMALIZATION: Strict type coercion (float). Defaults None -> 0.0.
         mode = as_parse_mode(self._mode)
         strict = is_strict(mode)
-        self.x = self._parse_val(self.x, "Point.x", strict)
-        self.y = self._parse_val(self.y, "Point.y", strict)
-        self.z = self._parse_val(self.z, "Point.z", strict)
+
+        def _norm(v, name):
+            out = parse_optional_float_like(v, name=name, strict=strict)
+            return float(out) if out is not None else 0.0
+
+        self.x = _norm(self.x, "Point.x")
+        self.y = _norm(self.y, "Point.y")
+        self.z = _norm(self.z, "Point.z")
         self.name = parse_optional_str_like(self.name, name="Point.name", strict=False)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        # VALIDATION: Semantic check (Finiteness).
         mode = as_parse_mode(self._mode if mode is None else mode)
         if not (math.isfinite(self.x) and math.isfinite(self.y) and math.isfinite(self.z)):
             note_or_raise(
@@ -923,35 +930,18 @@ class Point:
         mode = as_parse_mode(mode)
         if isinstance(d, Point):
             return replace(d, _mode=mode)
-
-        def _f(v: Any) -> float:
-            out = parse_optional_float_like(v, name="Point", strict=is_strict(mode))
-            return 0.0 if out is None else float(out)
-
         if isinstance(d, dict):
             return Point(
-                x=_f(d.get("x", 0.0)),
-                y=_f(d.get("y", 0.0)),
-                z=_f(d.get("z", 0.0)),
-                name=parse_optional_str_like(d.get("name", None), name="Point.name", strict=False),
-                _mode=mode
+                x=d.get("x"), y=d.get("y"), z=d.get("z"),
+                name=d.get("name"), _mode=mode
             )
         if isinstance(d, (list, tuple)) and len(d) in (2, 3):
-            x = _f(d[0])
-            y = _f(d[1])
-            z = _f(d[2]) if len(d) == 3 else 0.0
-            return Point(x=x, y=y, z=z, _mode=mode)
-
+            return Point(x=d[0], y=d[1], z=d[2] if len(d) == 3 else 0.0, _mode=mode)
         return Point(_mode=mode)
 
     def to_list(self) -> list:
         return [self.x, self.y, self.z]
 
-    def _parse_val(self, v: Any, name: str, strict: bool) -> float:
-        out = parse_optional_float_like(v, name=name, strict=strict)
-        if out is None:
-            return 0.0
-        return float(out)
 
 @dataclass
 class ROI:
@@ -978,16 +968,26 @@ class ROI:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
+        # NORMALIZATION: Type coercion and Default Injection.
+        # CRITICAL: We must distinguish between None (missing) and 0 (invalid value).
         mode, strict, self.extra = _setup_init(self, self._mode, "ROI")
-        self.x = parse_optional_int_like(self.x, name="ROI.x", strict=strict, extra=self.extra) or 0
-        self.y = parse_optional_int_like(self.y, name="ROI.y", strict=strict, extra=self.extra) or 0
-        self.width = parse_optional_int_like(self.width, name="ROI.width", strict=strict, extra=self.extra) or 512
-        self.height = parse_optional_int_like(self.height, name="ROI.height", strict=strict, extra=self.extra) or 512
+
+        def _norm(val, name, default):
+            v = parse_optional_int_like(val, name=name, strict=strict, extra=self.extra)
+            return v if v is not None else default
+
+        self.x = _norm(self.x, "ROI.x", 0)
+        self.y = _norm(self.y, "ROI.y", 0)
+        self.width = _norm(self.width, "ROI.width", 512)
+        self.height = _norm(self.height, "ROI.height", 512)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        # VALIDATION: Semantic bounds check and Healing.
         mode = as_parse_mode(self._mode if mode is None else mode)
         strict = is_strict(mode)
         was_valid = True
+
+        # Rule 1: Origin must be non-negative
         if self.x < 0 or self.y < 0:
             was_valid = False
             note_or_raise(
@@ -997,6 +997,8 @@ class ROI:
             if not strict:
                 self.x = max(self.x, 0)
                 self.y = max(self.y, 0)
+
+        # Rule 2: Dimensions must be positive
         if (self.width <= 0) or (self.height <= 0):
             was_valid = False
             note_or_raise(
@@ -1004,7 +1006,7 @@ class ROI:
                 mode=mode, raw={"width": self.width, "height": self.height},
             )
             if not strict:
-                # Auto-heal: reset to default if invalid in lenient mode
+                # Heal to safe defaults
                 self.width = 512 if self.width <= 0 else self.width
                 self.height = 512 if self.height <= 0 else self.height
         return was_valid
@@ -1035,10 +1037,9 @@ class ROI:
             return ROI(extra=ex, _mode=mode)
         ex = collect_extra(d, known=("x", "y", "width", "height", "w", "h"), owner="ROI")
         return ROI(
-            x=d.get("x", 0),
-            y=d.get("y", 0),
-            width=d.get("width", d.get("w", 512)),
-            height=d.get("height", d.get("h", 512)),
+            x=d.get("x"), y=d.get("y"),
+            width=d.get("width", d.get("w")),
+            height=d.get("height", d.get("h")),
             extra=ex, _mode=mode,
         )
 
@@ -1072,6 +1073,7 @@ class StagePosition:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
+        # NORMALIZATION: Parse strings/dicts into Pint Quantities.
         mode, strict, self.extra = _setup_init(self, self._mode, "StagePosition")
         self.name = parse_optional_str_like(self.name, name="StagePosition.name", strict=strict, extra=self.extra)
         self.coordinate_system = parse_optional_str_like(self.coordinate_system, name="StagePosition.coordinate_system", strict=strict, extra=self.extra)
@@ -1091,37 +1093,32 @@ class StagePosition:
         self.tilt_y = coerce_axis(self.tilt_y, "degree", "StagePosition.tilt_y")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        # VALIDATION: Check finiteness. Trust types from post_init.
         mode = as_parse_mode(self._mode if mode is None else mode)
         is_valid = True
 
-        def cleaned(q: Any, unit: str, field_name: str) -> Optional["Quantity"]:
-            nonlocal is_valid
-            qq = ensure_quantity(q, unit)
-            if qq is None:
-                if q is None: return None
-                note_or_raise(self.extra, field_name, ValueError(f"{field_name} must be convertible to {unit}"),
-                              mode=mode, raw=q)
-                is_valid = False
-                return None
+        def check_axis(q: Any, field_name: str) -> bool:
+            if q is None: return True
+            if not isinstance(q, Quantity):
+                 # Structural defensive check
+                 note_or_raise(self.extra, field_name, TypeError(f"{field_name} is not a valid Quantity"), mode=mode)
+                 return False
             try:
-                mag = float(qq.to(unit).magnitude)
+                mag = float(q.magnitude)
+                if not math.isfinite(mag):
+                    note_or_raise(self.extra, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode, raw=mag)
+                    return False
             except Exception as e:
-                note_or_raise(self.extra, field_name, e, mode=mode, raw=qq)
-                is_valid = False
-                return None
-            if not math.isfinite(mag):
-                note_or_raise(self.extra, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode,
-                              raw=mag)
-                is_valid = False
-                return None
-            return qq
+                note_or_raise(self.extra, field_name, e, mode=mode)
+                return False
+            return True
 
-        self.x = cleaned(self.x, "nanometer", "StagePosition.x")
-        self.y = cleaned(self.y, "nanometer", "StagePosition.y")
-        self.z = cleaned(self.z, "nanometer", "StagePosition.z")
-        self.r = cleaned(self.r, "degree", "StagePosition.r")
-        self.tilt_x = cleaned(self.tilt_x, "degree", "StagePosition.tilt_x")
-        self.tilt_y = cleaned(self.tilt_y, "degree", "StagePosition.tilt_y")
+        is_valid = check_axis(self.x, "StagePosition.x") and is_valid
+        is_valid = check_axis(self.y, "StagePosition.y") and is_valid
+        is_valid = check_axis(self.z, "StagePosition.z") and is_valid
+        is_valid = check_axis(self.r, "StagePosition.r") and is_valid
+        is_valid = check_axis(self.tilt_x, "StagePosition.tilt_x") and is_valid
+        is_valid = check_axis(self.tilt_y, "StagePosition.tilt_y") and is_valid
 
         return is_valid
 
@@ -1637,6 +1634,7 @@ class DetectorSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
+        # NORMALIZATION
         mode, strict, self.extra = _setup_init(self, self._mode, "DetectorSettings")
 
         def _q(val, unit, name):
@@ -1647,6 +1645,8 @@ class DetectorSettings:
 
         self.exposure = _q(self.exposure, "ms", "DetectorSettings.exposure")
         self.detector_id = parse_optional_id_like(self.detector_id, name="DetectorSettings.detector_id", strict=False, extra=self.extra)
+
+        # Structure normalization: Dict -> Dataclass
         self.roi = maybe_from_dict(ROI, self.roi, mode=mode, extra=self.extra, key="DetectorSettings.roi")
 
         self.binning_index = parse_optional_int_like(self.binning_index, name="DetectorSettings.binning_index", strict=strict, extra=self.extra)
@@ -1657,16 +1657,24 @@ class DetectorSettings:
         self.digital_rotation_deg = parse_optional_float_like(self.digital_rotation_deg, name="DetectorSettings.digital_rotation_deg", strict=strict, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        # VALIDATION: Semantic logic
         mode = as_parse_mode(self._mode if mode is None else mode)
+        strict = is_strict(mode)
         ok = True
-        if self.exposure is not None and self.exposure.magnitude <= 0:
-             note_or_raise(self.extra, "DetectorSettings.exposure", ValueError("Exposure must be > 0"), mode=mode)
-             ok = False
 
-        if self.binning_xy and (self.binning_xy[0] <= 0 or self.binning_xy[1] <= 0):
-             note_or_raise(self.extra, "DetectorSettings.binning_xy", ValueError("binning_xy must be >= 0"), mode=mode, raw=self.binning_xy)
-             self.binning_xy = None
-             ok = False
+        if self.exposure is not None:
+             if self.exposure.magnitude <= 0:
+                 note_or_raise(self.extra, "DetectorSettings.exposure", ValueError("Exposure must be > 0"), mode=mode)
+                 ok = False
+
+        if self.binning_xy:
+             # Semantic check: Binning must be positive integers
+             if self.binning_xy[0] <= 0 or self.binning_xy[1] <= 0:
+                 note_or_raise(self.extra, "DetectorSettings.binning_xy", ValueError("binning_xy must be >= 0"), mode=mode, raw=self.binning_xy)
+                 ok = False
+                 if not strict:
+                     # Repair: Disable explicit binning if invalid
+                     self.binning_xy = None
 
         if self.roi:
             if not self.roi.validate(mode=mode):
@@ -2160,51 +2168,44 @@ class AcquisitionRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
+        # NORMALIZATION:
+        # 1. Structure Coercion (Dict -> Dataclass)
+        # 2. Patch missing holes (Copy IDs if one is missing)
         mode, strict, self.extra = _setup_init(self, self._mode, "AcquisitionRequest")
 
         self.detector = maybe_from_dict(DetectorSettings, self.detector, mode=mode) or DetectorSettings(_mode=mode)
         self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
         self.detector_id = parse_optional_id_like(self.detector_id, name="id", strict=strict, extra=self.extra)
 
-        # 1. If outer ID is missing but inner exists, pull inner -> outer
-        if not self.detector_id and self.detector.detector_id:
+        # Logic: Patching holes.
+        # DO NOT overwrite if both exist. That hides conflicts.
+        if self.detector_id is None and self.detector.detector_id is not None:
             self.detector_id = self.detector.detector_id
-
-        # 2. If outer ID exists (either originally or pulled from inner),
-        #    FORCE the inner ID to match it.
-        if self.detector_id:
-            # If strict, we can still warn/error if they were explicitly different
-            if self.detector.detector_id and self.detector.detector_id != self.detector_id:
-                note_or_raise(
-                    self.extra,
-                    "AcquisitionRequest.id_mismatch",
-                    ValueError(f"Ambiguous IDs: outer={self.detector_id}, inner={self.detector.detector_id}"),
-                    mode=mode
-                )
-            # Always sync inner to outer
-            if self.detector.detector_id != self.detector_id:
-                self.detector = replace(self.detector, detector_id=self.detector_id)
+        elif self.detector.detector_id is None and self.detector_id is not None:
+            self.detector.detector_id = self.detector_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        # VALIDATION: Consistency & Readiness
         mode = as_parse_mode(self._mode if mode is None else mode)
         strict = is_strict(mode)
         ok = True
 
+        # Rule 1: Must have an ID to execute
         if not self.detector_id:
-            if strict:
-                note_or_raise(self.extra, "AcquisitionRequest.detector_id", ValueError("detector_id is required"),
-                              mode=mode)
+            note_or_raise(self.extra, "AcquisitionRequest.detector_id", ValueError("detector_id is required"), mode=mode)
             ok = False
 
+        # Rule 2: Sub-objects must be valid
         ok = self.detector.validate(mode=mode) and ok
         ok = self.image.validate(mode=mode) and ok
 
+        # Rule 3: Cross-field consistency (The Conflict Case)
         if self.detector.detector_id and self.detector_id and self.detector.detector_id != self.detector_id:
             note_or_raise(self.extra, "AcquisitionRequest.id_mismatch", ValueError(
                 f"Ambiguous detector IDs: outer={self.detector_id}, inner={self.detector.detector_id}"), mode=mode)
             ok = False
+            # Healing (Lenient only)
             if not strict:
-                # Auto-repair
                 self.detector.detector_id = self.detector_id
 
         return ok
