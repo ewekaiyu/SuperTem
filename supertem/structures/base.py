@@ -20,40 +20,36 @@ The intended lifecycle for objects in this module is:
   1) Ingest (untrusted input)
      - Source: vendor SDK returns, JSON logs, user configs, network payloads
      - Entry:  Class.from_dict(payload, mode=LENIENT or STRICT)
-     - Goal:   interpret the payload without losing information
+     - Goal:   Capture data without crashing, even if imperfect.
 
-  2) Normalize (structural correctness)
-     - Happens during __post_init__ (and helper parsers)
-     - Goal: produce a well-typed internal representation
-     - Examples:
-         * dict -> dataclass
-         * "128" -> 128
-         * unknown keys -> Extras.unknown_keys
-         * unparseable values -> Extras.raw + Extras.notes
+  2) Normalize (Integrity of Structure)
+     - Happens during __post_init__ (via helper parsers)
+     - Goal:   Produce a well-typed internal representation (Type Safety).
+     - Action: Coerce types (str->int), populate structural defaults (None->[]),
+               and park unparseable garbage in Extras.raw.
+     - Note:   Does NOT check logic. Invalid values (e.g., width=-100) are
+               preserved here to ensure data fidelity during ingestion.
 
-  3) Validate (semantic correctness)
+  3) Validate (Integrity of Meaning)
      - Happens in validate(mode=...)
-     - Goal: enforce domain constraints and invariants
-     - Examples:
-         * ROI width/height must be >= 0
-         * required fields for executable requests must exist
-         * cross-field consistency (e.g., detector_id alignment)
-     - Mode behavior:
-         * LENIENT: record issue and repair-to-safe / disable unsafe fields
-         * STRICT: raise via note_or_raise(...)
+     - Goal:   Enforce domain constraints and logical invariants (Logic Safety).
+     - Action (STRICT): Raise note_or_raise(...) on any violation.
+     - Action (LENIENT): Record violation in Extras.notes and "Heal" the object
+               (e.g., reset width=-100 -> 512, or disable the specific feature).
+     - Result: The object is now guaranteed to be logically consistent.
 
   4) Serialize (JSON-capable representation)
      - Happens in to_dict()
-     - Goal: produce JSON-serializable output for logging/storage/transport
+     - Goal:   Produce JSON-serializable output for logging/storage/transport.
 
-  5) Execute (control boundary)
-     - Only applicable to control-plane objects (requests/settings)
-     - Policy: validate STRICTLY immediately before hardware interaction
-     - Goal: ensure commands applied to the microscope are safe and consistent
+  5) Execute (Gatekeeping)
+     - Only applicable to control-plane objects (requests/settings).
+     - Policy: Validate STRICTLY immediately before hardware interaction.
+     - Goal:   Ensure commands applied to the microscope are within hardware limits.
 
 A key rule:
-  Objects created under LENIENT mode may be stored and inspected, but MUST NOT be
-  executed unless re-validated under STRICT mode at the control boundary.
+  Objects created via from_dict() are "Type-Safe" but "Logically Unverified."
+  They MUST NOT be executed until validate() has been called and passed.
 
 ===============================================================================
 II. ParseMode and Context
@@ -61,17 +57,26 @@ II. ParseMode and Context
 
 ParseMode.LENIENT (data-plane default)
   Intended for metadata/state/log ingestion where completeness is not guaranteed.
-  Guarantees:
-    - construction should not fail due to malformed/missing fields
-    - issues are recorded in Extras.notes; raw inputs may be preserved in Extras.raw
-    - unsafe subfields may be set to None or replaced by safe defaults
+
+  Behavior at Construction (__post_init__):
+    - Prioritizes survival: construction will not fail due to malformed types.
+    - Captures unparseable data in Extras.raw / Extras.notes.
+    - Result: Object is type-safe but may contain logically unsafe values (e.g. exposure=-5).
+
+  Behavior at Validation (.validate()):
+    - "Heals" invalid logic: unsafe values are reset to defaults or None.
+    - Records the intervention in Extras.notes.
+    - Result: Object becomes safe for use.
 
 ParseMode.STRICT (control-plane default)
   Intended for objects that will be applied to hardware (requests/settings).
-  Guarantees:
-    - semantic constraints are enforced
-    - invalid values raise via note_or_raise(...)
-    - objects leaving STRICT validation are safe to execute
+
+  Behavior at Construction (__post_init__):
+    - Prioritizes correctness: raises immediately on malformed types or missing structure.
+
+  Behavior at Validation (.validate()):
+    - Enforces constraints: raises note_or_raise(...) on any logical violation.
+    - Result: Guaranteed safe to execute, or raises Exception.
 
 ===============================================================================
 III. The Normalization, Validation, and Gatekeeping Rulebook
@@ -191,7 +196,6 @@ Extras.raw and record a diagnostic note.
 VI. Implementation Conventions
 ===============================================================================
 
-- If a class stores `_mode`, it SHOULD provide validate() (even if minimal).
 - __post_init__ should:
     1) normalize types and nested objects
     2) normalize Extras
@@ -211,7 +215,6 @@ provides a consistent lifecycle to be both robust (LENIENT ingestion/storage)
 and safe (STRICT validation/execution).
 
 """
-
 import datetime
 import json
 import math
