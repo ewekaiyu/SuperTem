@@ -1991,7 +1991,8 @@ class DetectorCapabilities:
     digital_rotation_deg_min: Optional[float] = None
     digital_rotation_deg_max: Optional[float] = None
     extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
+    # FIX: compare=False ensures objects with same data but different mode are equal
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "DetectorCapabilities")
@@ -2025,8 +2026,6 @@ class DetectorCapabilities:
         self.can_digital_rotation = parse_optional_bool_like(self.can_digital_rotation, name="DetectorCapabilities.can_digital_rotation", strict=False, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        # VALIDATION: Check consistency (min <= max) and non-negativity.
-        # We trust types are correct because __post_init__ guaranteed it.
         mode = as_parse_mode(self._mode if mode is None else mode)
         ok = True
 
@@ -2063,32 +2062,45 @@ class DetectorCapabilities:
 
     def supports(self, settings: DetectorSettings) -> bool:
         if settings.detector_id:
-             # Can't check if we don't know who it is, but logically capabilities are usually
-             # tied to a specific ID already.
              pass
 
         if settings.binning_xy:
             bx, by = settings.binning_xy
-            # Check if this binning level is allowed
             if self.binning_xy_max:
                 max_x, max_y = self.binning_xy_max
                 if bx > max_x or by > max_y: return False
-            # Check if binning is enabled at all
             if self.can_binning is False and (bx > 1 or by > 1): return False
 
         if settings.exposure:
-            # Check min/max exposure
             if self.exposure_ms_min and settings.exposure < Q_(self.exposure_ms_min, 'ms'): return False
             if self.exposure_ms_max and settings.exposure > Q_(self.exposure_ms_max, 'ms'): return False
 
         return True
 
     def to_dict(self) -> dict:
-        d: Dict[str, Any] = {}
-        for f in fields(DetectorCapabilities):
-            if f.name == "extra": continue
-            v = getattr(self, f.name)
-            if v is not None: d[f.name] = v
+        # FIX: Explicit listing instead of dynamic iteration
+        d = {
+            "can_binning": self.can_binning,
+            "binning_index_min": self.binning_index_min,
+            "binning_index_max": self.binning_index_max,
+            "binning_xy_min": list(self.binning_xy_min) if self.binning_xy_min else None,
+            "binning_xy_max": list(self.binning_xy_max) if self.binning_xy_max else None,
+            "exposure_ms_min": self.exposure_ms_min,
+            "exposure_ms_max": self.exposure_ms_max,
+            "frame_integration_min": self.frame_integration_min,
+            "frame_integration_max": self.frame_integration_max,
+            "roi_size_min": list(self.roi_size_min) if self.roi_size_min else None,
+            "roi_size_max": list(self.roi_size_max) if self.roi_size_max else None,
+            "can_gain": self.can_gain,
+            "gain_index_min": self.gain_index_min,
+            "gain_index_max": self.gain_index_max,
+            "can_offset": self.can_offset,
+            "offset_index_min": self.offset_index_min,
+            "offset_index_max": self.offset_index_max,
+            "can_digital_rotation": self.can_digital_rotation,
+            "digital_rotation_deg_min": self.digital_rotation_deg_min,
+            "digital_rotation_deg_max": self.digital_rotation_deg_max,
+        }
         return _finish_to_dict(d, self.extra)
 
     @staticmethod
@@ -2097,26 +2109,34 @@ class DetectorCapabilities:
         if isinstance(d, DetectorCapabilities): return replace(d, _mode=mode)
         if not isinstance(d, dict): return DetectorCapabilities(_mode=mode)
 
-        known = {f.name for f in fields(DetectorCapabilities)} | {"roi_min", "roi_max", "extra"}
+        # FIX: Explicit extraction to match pattern and collect extras
+        field_names = {f.name for f in fields(DetectorCapabilities)}
+        known = field_names | {"roi_min", "roi_max", "extra"}
         extra = collect_extra(d, known, owner="DetectorCapabilities")
 
-        # Helper to extract kwargs manually since this is a complex mix of types
-        kwargs: Dict[str, Any] = {}
-        pair_fields = {"binning_xy_min", "binning_xy_max", "roi_size_min", "roi_size_max"}
-        int_fields = {"binning_index_min", "binning_index_max", "frame_integration_min", "frame_integration_max", "gain_index_min", "gain_index_max", "offset_index_min", "offset_index_max"}
-        float_fields = {"exposure_ms_min", "exposure_ms_max", "digital_rotation_deg_min", "digital_rotation_deg_max"}
-        bool_fields = {"can_binning", "can_gain", "can_offset", "can_digital_rotation"}
-
-        for f in fields(DetectorCapabilities):
-            if f.name == "extra" or f.name not in d: continue
-            v = d.get(f.name)
-            if f.name in pair_fields: kwargs[f.name] = parse_optional_pair_int_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
-            elif f.name in int_fields: kwargs[f.name] = parse_optional_int_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
-            elif f.name in float_fields: kwargs[f.name] = parse_optional_float_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
-            elif f.name in bool_fields: kwargs[f.name] = parse_optional_bool_like(v, name=f"DetectorCapabilities.{f.name}", strict=False, extra=extra)
-            else: kwargs[f.name] = v
-
-        return DetectorCapabilities(**kwargs, extra=extra, _mode=mode)
+        return DetectorCapabilities(
+            can_binning=d.get("can_binning"),
+            binning_index_min=d.get("binning_index_min"),
+            binning_index_max=d.get("binning_index_max"),
+            binning_xy_min=d.get("binning_xy_min"),
+            binning_xy_max=d.get("binning_xy_max"),
+            exposure_ms_min=d.get("exposure_ms_min"),
+            exposure_ms_max=d.get("exposure_ms_max"),
+            frame_integration_min=d.get("frame_integration_min"),
+            frame_integration_max=d.get("frame_integration_max"),
+            roi_size_min=d.get("roi_size_min", d.get("roi_min")),
+            roi_size_max=d.get("roi_size_max", d.get("roi_max")),
+            can_gain=d.get("can_gain"),
+            gain_index_min=d.get("gain_index_min"),
+            gain_index_max=d.get("gain_index_max"),
+            can_offset=d.get("can_offset"),
+            offset_index_min=d.get("offset_index_min"),
+            offset_index_max=d.get("offset_index_max"),
+            can_digital_rotation=d.get("can_digital_rotation"),
+            digital_rotation_deg_min=d.get("digital_rotation_deg_min"),
+            digital_rotation_deg_max=d.get("digital_rotation_deg_max"),
+            extra=extra, _mode=mode
+        )
 
 @dataclass
 class DetectorSystemSettings:
@@ -2318,7 +2338,7 @@ class ImageOutputSettings:
     file_format: str = "tiff"
     path: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "ImageOutputSettings")
@@ -2326,7 +2346,8 @@ class ImageOutputSettings:
         self.file_format = self.file_format.lower()
         self.path = parse_optional_str_like(self.path, name="ImageOutputSettings.path", strict=strict, extra=self.extra)
 
-    def validate(self, *, mode=None):
+    # FIX: Added correct type hints and signature
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
 
         if self.file_format not in {"tiff", "tif", "png", "jpg", "jpeg", "bmp"}:
@@ -2336,12 +2357,12 @@ class ImageOutputSettings:
             self.file_format = "tiff"
         return True
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
         d = {"file_format": self.file_format, "path": self.path}
         return _finish_to_dict(d, self.extra)
 
     @staticmethod
-    def from_dict(d, *, mode=ParseMode.STRICT):
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ImageOutputSettings":
         if isinstance(d, ImageOutputSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return ImageOutputSettings(_mode=mode)
         return ImageOutputSettings(
@@ -2882,7 +2903,7 @@ class SystemInfo:
     application: Optional[str] = None
     application_version: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "SystemInfo")
@@ -2906,7 +2927,19 @@ class SystemInfo:
         return True
 
     def to_dict(self) -> dict:
-        d = {f.name: getattr(self, f.name) for f in fields(SystemInfo) if f.name not in ("extra", "_mode")}
+        # FIX: Explicit listing
+        d = {
+            "name": self.name,
+            "ip_address": self.ip_address,
+            "manufacturer": self.manufacturer,
+            "model": self.model,
+            "serial_number": self.serial_number,
+            "hardware_version": self.hardware_version,
+            "software_version": self.software_version,
+            "supertem_version": self.supertem_version,
+            "application": self.application,
+            "application_version": self.application_version,
+        }
         return _finish_to_dict(d, self.extra)
 
     @staticmethod
@@ -2935,14 +2968,22 @@ class SystemSettings:
     beam_system: BeamSystemSettings = field(default_factory=BeamSystemSettings)
     detector_system: DetectorSystemSettings = field(default_factory=DetectorSystemSettings)
     info: SystemInfo = field(default_factory=SystemInfo)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+    # FIX: Added Extras container
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        # Optim: No local mode/strict needed here as it delegates
         mode = as_parse_mode(self._mode)
-        self.stage_system = maybe_from_dict(StageSystemSettings, self.stage_system, mode=mode) or StageSystemSettings(_mode=mode)
-        self.beam_system = maybe_from_dict(BeamSystemSettings, self.beam_system, mode=mode) or BeamSystemSettings(_mode=mode)
-        self.detector_system = maybe_from_dict(DetectorSystemSettings, self.detector_system, mode=mode) or DetectorSystemSettings(_mode=mode)
+        # FIX: Normalize extra
+        self.extra = normalize_extra(self.extra) if is_strict(mode) else normalize_extra_lenient(self.extra,
+                                                                                                 "SystemSettings")
+
+        self.stage_system = maybe_from_dict(StageSystemSettings, self.stage_system, mode=mode) or StageSystemSettings(
+            _mode=mode)
+        self.beam_system = maybe_from_dict(BeamSystemSettings, self.beam_system, mode=mode) or BeamSystemSettings(
+            _mode=mode)
+        self.detector_system = maybe_from_dict(DetectorSystemSettings, self.detector_system,
+                                               mode=mode) or DetectorSystemSettings(_mode=mode)
         self.info = maybe_from_dict(SystemInfo, self.info, mode=mode) or SystemInfo(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -2953,24 +2994,31 @@ class SystemSettings:
                 self.info.validate(mode=mode))
 
     def to_dict(self) -> dict:
-        return _jsonable({
+        d = {
             "stage_system": self.stage_system.to_dict(),
             "beam_system": self.beam_system.to_dict(),
             "detector_system": self.detector_system.to_dict(),
             "info": self.info.to_dict(),
-        })
+        }
+        # FIX: Include extras
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemSettings":
         mode = as_parse_mode(mode)
         if isinstance(d, SystemSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return SystemSettings(_mode=mode)
+
+        # FIX: Collect extras
+        known = {"stage_system", "stage", "beam_system", "beam", "detector_system", "detector", "info", "extra"}
+        extra = collect_extra(d, known, owner="SystemSettings")
+
         return SystemSettings(
             stage_system=d.get("stage_system", d.get("stage")),
             beam_system=d.get("beam_system", d.get("beam")),
             detector_system=d.get("detector_system", d.get("detector")),
             info=d.get("info"),
-            _mode=mode,
+            extra=extra, _mode=mode,
         )
 
 @dataclass
@@ -2988,10 +3036,16 @@ class MicroscopeSettings:
     system: SystemSettings = field(default_factory=SystemSettings)
     image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
     protocol: dict = field(default_factory=lambda: {"name": "demo"})
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+    # FIX: Added Extras container
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
         mode = as_parse_mode(self._mode)
+        # FIX: Normalize extra
+        self.extra = normalize_extra(self.extra) if is_strict(mode) else normalize_extra_lenient(self.extra,
+                                                                                                 "MicroscopeSettings")
+
         self.system = maybe_from_dict(SystemSettings, self.system, mode=mode) or SystemSettings(_mode=mode)
         self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
         if not isinstance(self.protocol, dict): self.protocol = {"name": "demo"}
@@ -3001,20 +3055,27 @@ class MicroscopeSettings:
         return self.system.validate(mode=mode) and self.image.validate(mode=mode)
 
     def to_dict(self) -> dict:
-        return _jsonable({
+        d = {
             "system": self.system.to_dict(),
             "image": self.image.to_dict(),
             "protocol": self.protocol,
-        })
+        }
+        # FIX: Include extras
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeSettings":
         mode = as_parse_mode(mode)
         if isinstance(d, MicroscopeSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return MicroscopeSettings(_mode=mode)
+
+        # FIX: Collect extras
+        known = {"system", "image", "protocol", "extra"}
+        extra = collect_extra(d, known, owner="MicroscopeSettings")
+
         return MicroscopeSettings(
             system=d.get("system"),
             image=d.get("image"),
             protocol=d.get("protocol", {"name": "demo"}),
-            _mode=mode,
+            extra=extra, _mode=mode,
         )
