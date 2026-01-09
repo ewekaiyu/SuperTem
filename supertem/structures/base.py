@@ -1319,6 +1319,16 @@ class StageSystemSettings:
                 note_or_raise(self.extra, "StageSystemSettings.eucentric_z", ValueError(f"eucentric_z ({self.eucentric_z}) outside z_limits"), mode=mode)
                 ok = False
 
+        if self.settle_time_s < 0:
+            note_or_raise(self.extra, "StageSystemSettings.settle_time_s",
+                          ValueError("Settle time must be >= 0"), mode=mode)
+            ok = False
+
+        if self.timeout_s <= 0:
+            note_or_raise(self.extra, "StageSystemSettings.timeout_s",
+                          ValueError("Timeout must be > 0"), mode=mode)
+            ok = False
+
         return ok
 
     def to_dict(self) -> dict:
@@ -1432,6 +1442,10 @@ class BeamSettings:
         if self.stigmation: ok = self.stigmation.validate(mode=mode) and ok
         if self.beam_shift: ok = self.beam_shift.validate(mode=mode) and ok
         if self.image_shift: ok = self.image_shift.validate(mode=mode) and ok
+        if self.convergence_angle is not None and self.convergence_angle.magnitude < 0:
+            note_or_raise(self.extra, "BeamSettings.convergence_angle",
+                          ValueError("Convergence angle must be >= 0"), mode=mode)
+            ok = False
         if self.voltage is not None and self.voltage.magnitude <= 0:
             note_or_raise(self.extra, "BeamSettings.voltage", ValueError("Voltage must be > 0"), mode=mode)
             ok = False
@@ -1670,6 +1684,16 @@ class DetectorSettings:
                      # Repair: Disable explicit binning if invalid
                      self.binning_xy = None
 
+        if self.frame_integration is not None and self.frame_integration < 1:
+            note_or_raise(self.extra, "DetectorSettings.frame_integration",
+                          ValueError(f"Frame integration must be >= 1, got {self.frame_integration}"), mode=mode)
+            ok = False
+
+        if self.gain_index is not None and self.gain_index < 0:
+            note_or_raise(self.extra, "DetectorSettings.gain_index",
+                          ValueError("Gain index must be >= 0"), mode=mode)
+            ok = False
+
         if self.roi:
             if not self.roi.validate(mode=mode):
                 ok = False
@@ -1792,47 +1816,57 @@ class DetectorCapabilities:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
         ok = True
 
-        def _repair_minmax(min_name: str, max_name: str) -> bool:
-            v_min = getattr(self, min_name)
-            v_max = getattr(self, max_name)
-            if v_min is not None and v_max is not None and v_min > v_max:
-                note_or_raise(self.extra, f"DetectorCapabilities.{min_name}_gt_{max_name}",
-                              ValueError(f"{min_name} > {max_name}"), mode=mode, raw=(v_min, v_max))
-                if not strict:
-                    # In lenient mode, assume the driver swapped them accidentally
-                    setattr(self, min_name, v_max)
-                    setattr(self, max_name, v_min)
-                return False
-            return True
+        # 1. Validate the snapshot object
+        if self.microscope_state:
+            ok = self.microscope_state.validate(mode=mode) and ok
 
-        def _repair_pair_minmax(min_name: str, max_name: str) -> bool:
-            v_min = getattr(self, min_name)
-            v_max = getattr(self, max_name)
-            if v_min is not None and v_max is not None:
-                min_w, min_h = v_min
-                max_w, max_h = v_max
-                if min_w > max_w or min_h > max_h:
-                    note_or_raise(self.extra, f"DetectorCapabilities.{min_name}_gt_{max_name}",
-                                  ValueError(f"{min_name} > {max_name}"), mode=mode, raw=(v_min, v_max))
-                    if not strict:
-                        min_w, max_w = sorted((min_w, max_w))
-                        min_h, max_h = sorted((min_h, max_h))
-                        setattr(self, min_name, (min_w, min_h))
-                        setattr(self, max_name, (max_w, max_h))
+        # 2. Validate physical scalars (Must be non-negative)
+        def _check_pos(val: Optional[float], name: str, strictly_positive: bool = False) -> bool:
+            if val is not None:
+                # Check for finiteness (NaN/Inf)
+                if not math.isfinite(val):
+                    note_or_raise(self.extra, name, ValueError(f"{name} must be finite"), mode=mode, raw=val)
+                    return False
+
+                # Check for sign
+                limit = 0.0 if not strictly_positive else 1e-9
+                if val < limit:
+                    err_msg = f"{name} must be > 0" if strictly_positive else f"{name} must be >= 0"
+                    note_or_raise(self.extra, name, ValueError(err_msg), mode=mode, raw=val)
                     return False
             return True
 
-        ok = _repair_minmax("binning_index_min", "binning_index_max") and ok
-        ok = _repair_pair_minmax("binning_xy_min", "binning_xy_max") and ok
-        ok = _repair_minmax("exposure_ms_min", "exposure_ms_max") and ok
-        ok = _repair_minmax("frame_integration_min", "frame_integration_max") and ok
-        ok = _repair_pair_minmax("roi_size_min", "roi_size_max") and ok
-        ok = _repair_minmax("gain_index_min", "gain_index_max") and ok
-        ok = _repair_minmax("offset_index_min", "offset_index_max") and ok
-        ok = _repair_minmax("digital_rotation_deg_min", "digital_rotation_deg_max") and ok
+        # Magnification: strictly positive (0 usually implies error or uncalibrated)
+        ok = _check_pos(self.magnification, "MicroscopeImageMetadata.magnification", strictly_positive=True) and ok
+
+        # Camera Length: non-negative (0 is unlikely but physically 'infinite' focus, negative is wrong)
+        ok = _check_pos(self.camera_length_mm, "MicroscopeImageMetadata.camera_length_mm",
+                        strictly_positive=False) and ok
+
+        # Voltage: strictly positive
+        ok = _check_pos(self.accelerating_voltage_kv, "MicroscopeImageMetadata.accelerating_voltage_kv",
+                        strictly_positive=True) and ok
+
+        # Current: non-negative
+        ok = _check_pos(self.beam_current_na, "MicroscopeImageMetadata.beam_current_na", strictly_positive=False) and ok
+
+        # Exposure: strictly positive
+        ok = _check_pos(self.exposure_ms, "MicroscopeImageMetadata.exposure_ms", strictly_positive=True) and ok
+
+        # 3. Validate tuples
+        if self.pixel_size_nm:
+            if self.pixel_size_nm[0] <= 0 or self.pixel_size_nm[1] <= 0:
+                note_or_raise(self.extra, "MicroscopeImageMetadata.pixel_size_nm",
+                              ValueError("pixel_size_nm components must be > 0"), mode=mode, raw=self.pixel_size_nm)
+                ok = False
+
+        if self.image_size_px:
+            if self.image_size_px[0] <= 0 or self.image_size_px[1] <= 0:
+                note_or_raise(self.extra, "MicroscopeImageMetadata.image_size_px",
+                              ValueError("image_size_px dimensions must be > 0"), mode=mode, raw=self.image_size_px)
+                ok = False
 
         return ok
 
@@ -2496,6 +2530,16 @@ class MicroscopeImageMetadata:
         ok = True
         if self.microscope_state:
             ok = self.microscope_state.validate(mode=mode) and ok
+
+        def _check_pos(val, name):
+            if val is not None and val < 0:
+                note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
+                return False
+            return True
+
+        ok = _check_pos(self.magnification, "magnification") and ok
+        ok = _check_pos(self.exposure_ms, "exposure_ms") and ok
+        ok = _check_pos(self.accelerating_voltage_kv, "accelerating_voltage_kv") and ok
         return ok
 
     def to_dict(self) -> dict:
