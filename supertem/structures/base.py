@@ -999,14 +999,20 @@ class Point:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         # VALIDATION: Semantic check (Finiteness).
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         if not (math.isfinite(self.x) and math.isfinite(self.y) and math.isfinite(self.z)):
             note_or_raise(
                 None, "Point.coordinates",
                 ValueError(f"Coordinates must be finite: x={self.x}, y={self.y}, z={self.z}"),
                 mode=mode, raw={"x": self.x, "y": self.y, "z": self.z}
             )
-            return False
+            if strict:
+                return False
+            # Heal: Reset unstable coordinates to origin
+            self.x = 0.0 if not math.isfinite(self.x) else self.x
+            self.y = 0.0 if not math.isfinite(self.y) else self.y
+            self.z = 0.0 if not math.isfinite(self.z) else self.z
+
         return True
 
     def to_dict(self) -> dict:
@@ -1069,7 +1075,6 @@ class ROI:
         self.height = _norm(self.height, "ROI.height", 512)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        # VALIDATION: Semantic bounds check and Healing.
         mode, strict = _setup_validate(self._mode, mode)
         is_valid = True
 
@@ -1082,6 +1087,7 @@ class ROI:
             if strict:
                 is_valid = False
             else:
+                # Heal: Clamp to 0 to prevent driver crashes
                 self.x = max(self.x, 0)
                 self.y = max(self.y, 0)
 
@@ -1094,6 +1100,7 @@ class ROI:
             if strict:
                 is_valid = False
             else:
+                # Heal: Reset to default 512 to ensure a valid image request exists
                 self.width = 512 if self.width <= 0 else self.width
                 self.height = 512 if self.height <= 0 else self.height
 
@@ -1388,7 +1395,7 @@ class StageSystemSettings:
                                   ValueError(f"{name} limits invalid: min > max ({mn} > {mx})"), mode=mode)
                     if strict:
                         return False
-                    # Heal: Swap limits
+                    # Heal: Swap limits to make range valid
                     try:
                         setattr(self, f"{name}_limits", (mx, mn))
                     except Exception:
@@ -1426,19 +1433,31 @@ class StageSystemSettings:
         if self.max_step_distance.magnitude <= 0:
             note_or_raise(self.extra, "StageSystemSettings.max_step_distance",
                           ValueError("max_step_distance must be > 0"), mode=mode)
-            ok = False
+            if strict:
+                ok = False
+            else:
+                # Heal: Reset to default safe step (50um)
+                self.max_step_distance = Q_(50000.0, "nm")
 
         if self.eucentric_z is not None and self.z_limits:
             z_min, z_max = self.z_limits
             if not (z_min <= self.eucentric_z <= z_max):
                 note_or_raise(self.extra, "StageSystemSettings.eucentric_z",
                               ValueError(f"eucentric_z ({self.eucentric_z}) outside z_limits"), mode=mode)
-                ok = False
+                if strict:
+                    ok = False
+                else:
+                    # Heal: Mark as unknown/unsafe to use
+                    self.eucentric_z = None
 
         if self.settle_time_s < 0:
             note_or_raise(self.extra, "StageSystemSettings.settle_time_s", ValueError("Settle time must be >= 0"),
                           mode=mode)
-            ok = False
+            if strict:
+                ok = False
+            else:
+                # Heal: Reset to safe default
+                self.settle_time_s = 0.2
 
         return ok
 
@@ -2029,34 +2048,54 @@ class DetectorCapabilities:
         mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
-        def _check_range(min_val, max_val, name):
+        def _check_range(min_val, max_val, name, min_attr, max_attr):
             if min_val is not None and max_val is not None:
                 if min_val > max_val:
                     note_or_raise(self.extra, name, ValueError(f"{name} invalid: min > max ({min_val} > {max_val})"), mode=mode)
-                    return False
+                    if strict:
+                        return False
+                    # Heal: Swap limits
+                    try:
+                        setattr(self, min_attr, max_val)
+                        setattr(self, max_attr, min_val)
+                    except Exception:
+                        pass
             return True
 
-        def _check_pos(val, name):
+        def _check_pos(val, name, attr_name):
             if val is not None and val < 0:
                 note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
-                return False
+                if strict:
+                    return False
+                # Heal: Clamp to 0
+                setattr(self, attr_name, 0.0)
             return True
 
         # 1. Range Consistency
-        ok = _check_range(self.binning_index_min, self.binning_index_max, "DetectorCapabilities.binning_index") and ok
-        ok = _check_range(self.frame_integration_min, self.frame_integration_max, "DetectorCapabilities.frame_integration") and ok
-        ok = _check_range(self.gain_index_min, self.gain_index_max, "DetectorCapabilities.gain_index") and ok
-        ok = _check_range(self.offset_index_min, self.offset_index_max, "DetectorCapabilities.offset_index") and ok
-        ok = _check_range(self.exposure_ms_min, self.exposure_ms_max, "DetectorCapabilities.exposure_ms") and ok
+        # Note: We pass attribute names to allow swapping in _check_range
+        ok = _check_range(self.binning_index_min, self.binning_index_max, "DetectorCapabilities.binning_index", "binning_index_min", "binning_index_max") and ok
+        ok = _check_range(self.frame_integration_min, self.frame_integration_max, "DetectorCapabilities.frame_integration", "frame_integration_min", "frame_integration_max") and ok
+        ok = _check_range(self.gain_index_min, self.gain_index_max, "DetectorCapabilities.gain_index", "gain_index_min", "gain_index_max") and ok
+        ok = _check_range(self.offset_index_min, self.offset_index_max, "DetectorCapabilities.offset_index", "offset_index_min", "offset_index_max") and ok
+        ok = _check_range(self.exposure_ms_min, self.exposure_ms_max, "DetectorCapabilities.exposure_ms", "exposure_ms_min", "exposure_ms_max") and ok
 
         # 2. Physical Non-negativity
-        ok = _check_pos(self.exposure_ms_min, "DetectorCapabilities.exposure_ms_min") and ok
+        ok = _check_pos(self.exposure_ms_min, "DetectorCapabilities.exposure_ms_min", "exposure_ms_min") and ok
 
         # 3. Tuple consistency (ROI/Binning)
         if self.roi_size_min and self.roi_size_max:
              if self.roi_size_min[0] > self.roi_size_max[0] or self.roi_size_min[1] > self.roi_size_max[1]:
                  note_or_raise(self.extra, "DetectorCapabilities.roi_size", ValueError("ROI size min > max"), mode=mode)
-                 ok = False
+                 if strict:
+                     ok = False
+                 else:
+                     # Heal: Swap X and Y components individually
+                     new_min_x = min(self.roi_size_min[0], self.roi_size_max[0])
+                     new_max_x = max(self.roi_size_min[0], self.roi_size_max[0])
+                     new_min_y = min(self.roi_size_min[1], self.roi_size_max[1])
+                     new_max_y = max(self.roi_size_min[1], self.roi_size_max[1])
+                     self.roi_size_min = (new_min_x, new_min_y)
+                     self.roi_size_max = (new_max_x, new_max_y)
 
         return ok
 
@@ -2485,13 +2524,19 @@ class Aperture:
             if strict:
                 ok = False
             else:
-                self.size_index = None # Heal: Unknown size
+                self.size_index = None  # Heal: Unknown size
 
         if self.position is not None:
+            # Check if the nested object is valid
             if not self.position.validate(mode=mode):
                 note_or_raise(self.extra, "Aperture.position", ValueError("Invalid aperture position coordinates"),
                               mode=mode)
-                ok = False
+                if strict:
+                    ok = False
+                else:
+                    # Heal: Discard the invalid position data, keep the aperture info
+                    self.position = None
+
         return ok
 
     def to_dict(self) -> dict:
