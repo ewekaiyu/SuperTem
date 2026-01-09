@@ -1423,15 +1423,18 @@ class BeamSettings:
         if isinstance(d, BeamSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return BeamSettings(_mode=mode)
 
-        known = {
-            "voltage", "voltage_kv", "accelerating_voltage_kv",
-            "beam_current", "beam_current_na", "current",
-            "spot_size", "spot",
-            "convergence_angle", "convergence_angle_mrad", "convergence_mrad",
-            "defocus", "defocus_nm",
-            "stigmation", "beam_shift", "image_shift",
-            "scan_rotation", "scan_rotation_deg", "extra"
+        field_names = {f.name for f in fields(BeamSettings)}
+        aliases = {
+            "voltage_kv", "accelerating_voltage_kv",
+            "beam_current_na", "current",
+            "spot",
+            "convergence_mrad", "convergence_angle_mrad",
+            "defocus_nm",
+            "scan_rotation_deg",
+            "extra"
         }
+        known = field_names | aliases
+
         extra = collect_extra(d, known, owner="BeamSettings")
 
         return BeamSettings(
@@ -1548,10 +1551,10 @@ class BeamSystemSettings:
         return BeamSystemSettings(
             enabled=d.get("enabled", True),
             default_beam=d.get("default_beam"),
-            voltage_limits=_g(["voltage_limits", "voltage_limits_kv", "voltage_range", "voltage_range_kv"]),
-            beam_current_limits=_g(["beam_current_limits", "beam_current_limits_na", "beam_current_range", "beam_current_range_na"]),
-            spot_size_limits=_g(["spot_size_limits", "spot_size_range"]),
-            convergence_angle_limits=_g(["convergence_angle_limits", "convergence_angle_limits_mrad", "convergence_angle_range", "convergence_angle_range_mrad"]),
+            voltage_limits=d.get("voltage_limits"),
+            beam_current_limits=d.get("beam_current_limits"),
+            spot_size_limits=d.get("spot_size_limits"),
+            convergence_angle_limits=d.get("convergence_angle_limits"),
             extra=extra, _mode=mode
         )
 
@@ -1615,14 +1618,14 @@ class DetectorSettings:
              note_or_raise(self.extra, "DetectorSettings.exposure", ValueError("Exposure must be > 0"), mode=mode)
              ok = False
 
-        if self.binning_xy and (self.binning_xy[0] < 0 or self.binning_xy[1] < 0):
+        if self.binning_xy and (self.binning_xy[0] <= 0 or self.binning_xy[1] <= 0):
              note_or_raise(self.extra, "DetectorSettings.binning_xy", ValueError("binning_xy must be >= 0"), mode=mode, raw=self.binning_xy)
              self.binning_xy = None
+             ok = False
 
         if self.roi:
-            if not self.roi.validate(mode=mode) or self.roi.width <= 0 or self.roi.height <= 0:
-                note_or_raise(self.extra, "DetectorSettings.roi_invalid_or_empty", ValueError("ROI width/height must be > 0"), mode=mode, raw=self.roi.to_dict())
-                self.roi = None
+            if not self.roi.validate(mode=mode):
+                ok = False
         return ok
 
     def to_dict(self) -> dict:
@@ -1646,7 +1649,11 @@ class DetectorSettings:
         if isinstance(d, DetectorSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return DetectorSettings(_mode=mode)
 
-        extra = collect_extra(d, ("detector_id", "exposure", "exposure_ms", "binning_index", "binning_xy", "frame_integration", "roi", "gain_index", "offset_index", "digital_rotation_deg", "detector_roi", "imaging_area", "extra"), owner="DetectorSettings")
+        field_names = {f.name for f in fields(DetectorSettings)}
+        aliases = {"exposure_ms", "detector_roi", "imaging_area", "extra"}
+        known = field_names | aliases
+
+        extra = collect_extra(d, known, owner="DetectorSettings")
 
         roi_raw = d.get("roi")
         if roi_raw is None:
@@ -1706,7 +1713,7 @@ class DetectorCapabilities:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        self.extra = normalize_extra(self.extra)
+        mode, strict, self.extra = _setup_init(self, self._mode, "DetectorCapabilities")
 
         # Pairs
         self.binning_xy_min = parse_optional_pair_int_like(self.binning_xy_min, name="DetectorCapabilities.binning_xy_min", strict=False, extra=self.extra)
@@ -2129,7 +2136,8 @@ class AcquisitionRequest:
                     mode=mode
                 )
             # Always sync inner to outer
-            self.detector.detector_id = self.detector_id
+            if self.detector.detector_id != self.detector_id:
+                self.detector = replace(self.detector, detector_id=self.detector_id)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -2249,7 +2257,7 @@ class MicroscopeState:
     Notes:
         Typically instantiated in `LENIENT` mode for logging/telemetry to preserve data despite partial failures.
     """
-    timestamp: float = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp())
+    timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp())
     mode: Optional[str] = None
     stage_position: StagePosition = field(default_factory=StagePosition)
     beam: BeamSettings = field(default_factory=BeamSettings)
@@ -2262,6 +2270,12 @@ class MicroscopeState:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeState")
+        if isinstance(self.timestamp, (int, float)):
+            try:
+                self.timestamp = datetime.datetime.fromtimestamp(self.timestamp, datetime.timezone.utc).isoformat()
+            except Exception:
+                pass
+        self.timestamp = str(self.timestamp)
         self.mode = parse_optional_str_like(self.mode, name="MicroscopeState.mode", strict=strict, extra=self.extra)
         self.stage_position = maybe_from_dict(StagePosition, self.stage_position, mode=mode) or StagePosition()
         self.beam = maybe_from_dict(BeamSettings, self.beam, mode=mode) or BeamSettings()
@@ -2370,6 +2384,8 @@ class MicroscopeState:
         mode = as_parse_mode(mode)
         if isinstance(d, MicroscopeState): return replace(d, _mode=mode)
         if not isinstance(d, dict): return MicroscopeState(_mode=mode)
+        known = {f.name for f in fields(MicroscopeState)} | {"extra"}
+
         return MicroscopeState(
             timestamp=d.get("timestamp"),
             mode=d.get("mode"),
@@ -2379,8 +2395,7 @@ class MicroscopeState:
             detectors=d.get("detectors") or {},
             active_detector_ids=d.get("active_detector_ids") or [],
             primary_detector_id=d.get("primary_detector_id"),
-            extra=collect_extra(d, ("timestamp", "mode", "stage_position", "beam", "apertures", "detectors", "extra"),
-                                owner="MicroscopeState"),
+            extra=collect_extra(d, known, owner="MicroscopeState"),
             _mode=mode
         )
 
@@ -2529,8 +2544,10 @@ class MicroscopeImage:
         finite = af[np.isfinite(af)]
         if finite.size == 0: return np.zeros_like(a, dtype=np.uint8)
         lo, hi = np.percentile(finite, [p_low, p_high])
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo: return np.zeros_like(a, dtype=np.uint8)
-        scaled = (af - lo) * (255.0 / (hi - lo))
+        rng = hi - lo
+        if not np.isfinite(rng) or rng <= 1e-9:
+            return np.zeros_like(a, dtype=np.uint8)
+        scaled = (af - lo) * (255.0 / rng)
         return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
 
     @classmethod
