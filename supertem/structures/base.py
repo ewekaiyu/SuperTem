@@ -876,6 +876,14 @@ class Point:
         self.name = parse_optional_str_like(self.name, name="Point.name", strict=False)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode = as_parse_mode(self._mode if mode is None else mode)
+        if not (math.isfinite(self.x) and math.isfinite(self.y) and math.isfinite(self.z)):
+            note_or_raise(
+                None, "Point.coordinates",
+                ValueError(f"Coordinates must be finite: x={self.x}, y={self.y}, z={self.z}"),
+                mode=mode, raw={"x": self.x, "y": self.y, "z": self.z}
+            )
+            return False
         return True
 
     def to_dict(self) -> dict:
@@ -2224,7 +2232,23 @@ class Aperture:
         self.position = maybe_from_dict(Point, self.position, extra=self.extra, key="Aperture.position", mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        return True
+        mode = as_parse_mode(self._mode if mode is None else mode)
+        ok = True
+
+        if self.size_index is not None and self.size_index < 0:
+            note_or_raise(
+                self.extra, "Aperture.size_index",
+                ValueError(f"size_index must be >= 0, got {self.size_index}"),
+                mode=mode, raw=self.size_index
+            )
+            ok = False
+
+        if self.position is not None:
+            if not self.position.validate(mode=mode):
+                note_or_raise(self.extra, "Aperture.position", ValueError("Invalid aperture position coordinates"),
+                              mode=mode)
+                ok = False
+        return ok
 
     def to_dict(self) -> dict:
         d = {
