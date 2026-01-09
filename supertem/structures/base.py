@@ -1181,7 +1181,7 @@ class StagePosition:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         # VALIDATION: Check finiteness. Trust types from post_init.
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         is_valid = True
 
         def check_axis(q: Any, field_name: str) -> bool:
@@ -2026,7 +2026,7 @@ class DetectorCapabilities:
         self.can_digital_rotation = parse_optional_bool_like(self.can_digital_rotation, name="DetectorCapabilities.can_digital_rotation", strict=False, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         def _check_range(min_val, max_val, name):
@@ -2346,7 +2346,6 @@ class ImageOutputSettings:
         self.file_format = self.file_format.lower()
         self.path = parse_optional_str_like(self.path, name="ImageOutputSettings.path", strict=strict, extra=self.extra)
 
-    # FIX: Added correct type hints and signature
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
 
@@ -2947,9 +2946,24 @@ class SystemInfo:
         mode = as_parse_mode(mode)
         if isinstance(d, SystemInfo): return replace(d, _mode=mode)
         if not isinstance(d, dict): return SystemInfo(_mode=mode)
+
         known = {f.name for f in fields(SystemInfo)} | {"extra"}
         extra = collect_extra(d, known, owner="SystemInfo")
-        return SystemInfo(**{k: d.get(k) for k in known if k != "extra"}, extra=extra, _mode=mode)
+
+        return SystemInfo(
+            name=d.get("name"),
+            ip_address=d.get("ip_address"),
+            manufacturer=d.get("manufacturer"),
+            model=d.get("model"),
+            serial_number=d.get("serial_number"),
+            hardware_version=d.get("hardware_version"),
+            software_version=d.get("software_version"),
+            supertem_version=d.get("supertem_version", __version__),
+            application=d.get("application"),
+            application_version=d.get("application_version"),
+            extra=extra,
+            _mode=mode
+        )
 
 @dataclass
 class SystemSettings:
@@ -2973,10 +2987,7 @@ class SystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        # FIX: Normalize extra
-        self.extra = normalize_extra(self.extra) if is_strict(mode) else normalize_extra_lenient(self.extra,
-                                                                                                 "SystemSettings")
+        mode, strict, self.extra = _setup_init(self, self._mode, "SystemSettings")
 
         self.stage_system = maybe_from_dict(StageSystemSettings, self.stage_system, mode=mode) or StageSystemSettings(
             _mode=mode)
@@ -2987,7 +2998,7 @@ class SystemSettings:
         self.info = maybe_from_dict(SystemInfo, self.info, mode=mode) or SystemInfo(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         return (self.stage_system.validate(mode=mode) and
                 self.beam_system.validate(mode=mode) and
                 self.detector_system.validate(mode=mode) and
@@ -3041,17 +3052,14 @@ class MicroscopeSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        mode = as_parse_mode(self._mode)
-        # FIX: Normalize extra
-        self.extra = normalize_extra(self.extra) if is_strict(mode) else normalize_extra_lenient(self.extra,
-                                                                                                 "MicroscopeSettings")
+        mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeSettings")
 
         self.system = maybe_from_dict(SystemSettings, self.system, mode=mode) or SystemSettings(_mode=mode)
         self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
         if not isinstance(self.protocol, dict): self.protocol = {"name": "demo"}
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
+        mode, strict = _setup_validate(self._mode, mode)
         return self.system.validate(mode=mode) and self.image.validate(mode=mode)
 
     def to_dict(self) -> dict:
