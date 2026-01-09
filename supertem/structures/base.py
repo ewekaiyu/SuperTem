@@ -537,8 +537,8 @@ def merge_extras(dst: Extras, src: Any, *, owner: str) -> Extras:
 # Type Parsers
 # =============================================================================
 
-def parse_bool(value: Any, default: bool = False, *, strict: bool = False) -> bool:
-    """Strictly or leniently parse a boolean value.
+def parse_bool_like(value: Any, default: bool = False, *, strict: bool = False) -> bool:
+    """Strictly or leniently parse a boolean-like value.
 
     Handles strings like 'on', 'yes', '1', 'true'.
     Strict mode raises TypeError/ValueError on invalid input.
@@ -639,7 +639,7 @@ def parse_optional_bool_like(value: Any, *, name: str, strict: bool = False, ext
     if isinstance(value, str) and value.strip() == "":
         return None
     try:
-        return parse_bool(value, default=False, strict=True)
+        return parse_bool_like(value, default=False, strict=True)
     except Exception:
         if extra is not None:
             _extra_put_raw(extra, name, value)
@@ -730,23 +730,6 @@ def parse_optional_id_like(value: Any, *, name: str, strict: bool = False, extra
         return None
     return parse_optional_str_like(value, name=name, strict=strict, extra=extra)
 
-
-def _maybe_point(v: Any, *, extra: Any = None, name: str = "point", mode: ParseMode = ParseMode.LENIENT) -> Optional[
-    "Point"]:
-    if v is None:
-        return None
-    try:
-        if isinstance(v, Point):
-            return replace(v, _mode=mode)
-        if isinstance(v, (dict, list, tuple)):
-            return Point.from_dict(v, mode=mode)
-    except Exception as e:
-        note_or_raise(extra, name, e, mode=mode, raw=v)
-
-    if extra is not None:
-        _extra_put_raw(extra, name, v)
-    return None
-
 T = TypeVar("T")
 
 def maybe_from_dict(
@@ -758,7 +741,7 @@ def maybe_from_dict(
     key: str = "",
     allow_empty_dict: bool = False,
 ) -> Optional[T]:
-    """Generic helper to instantiate a Dataclass from a dict safely.
+    """Generic helper to instantiate a Dataclass from a dict (or list/tuple) safely.
 
     This function handles the 'Maybe' pattern common in parsing:
     - If input is None -> return None.
@@ -780,18 +763,29 @@ def maybe_from_dict(
             return raw
     except TypeError:
         pass
-    if not isinstance(raw, dict):
-        note_or_raise(
+
+    # Expanded type check to allow lists/tuples if the target class can handle them
+    if not isinstance(raw, (dict, list, tuple)):
+         note_or_raise(
             extra,
             key or f"{getattr(cls, '__name__', 'object')}",
-            TypeError(f"expected dict for {getattr(cls, '__name__', 'object')}, got {type(raw)}"),
+            TypeError(f"expected dict/list/tuple for {getattr(cls, '__name__', 'object')}, got {type(raw)}"),
             mode=mode,
             raw=raw,
         )
-        return None
+         return None
+
     from_dict = getattr(cls, "from_dict", None)
     if not callable(from_dict):
+        # Fallback: if it's a dict and the class is a basic dataclass without from_dict
+        if is_dataclass(cls) and isinstance(raw, dict):
+             try:
+                 return cls(**raw) # type: ignore
+             except Exception as e:
+                 note_or_raise(extra, key or f"{getattr(cls, '__name__', 'object')}", e, mode=mode, raw=raw)
+                 return None
         return None
+
     try:
         try:
             return from_dict(raw, mode=mode)  # type: ignore[misc]
@@ -1225,13 +1219,13 @@ class StageSystemSettings:
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "StageSystemSettings")
 
-        self.enabled = parse_bool(self.enabled, default=True)
-        self.can_x = parse_bool(self.can_x, default=True)
-        self.can_y = parse_bool(self.can_y, default=True)
-        self.can_z = parse_bool(self.can_z, default=True)
-        self.can_r = parse_bool(self.can_r, default=False)
-        self.can_tilt_x = parse_bool(self.can_tilt_x, default=False)
-        self.can_tilt_y = parse_bool(self.can_tilt_y, default=False)
+        self.enabled = parse_bool_like(self.enabled, default=True)
+        self.can_x = parse_bool_like(self.can_x, default=True)
+        self.can_y = parse_bool_like(self.can_y, default=True)
+        self.can_z = parse_bool_like(self.can_z, default=True)
+        self.can_r = parse_bool_like(self.can_r, default=False)
+        self.can_tilt_x = parse_bool_like(self.can_tilt_x, default=False)
+        self.can_tilt_y = parse_bool_like(self.can_tilt_y, default=False)
 
         def _lim(val, unit):
             if val is None: return None
@@ -1385,15 +1379,14 @@ class BeamSettings:
         self.voltage = _q(self.voltage, "kV", "BeamSettings.voltage")
         self.beam_current = _q(self.beam_current, "nA", "BeamSettings.beam_current")
         self.convergence_angle = _q(self.convergence_angle, "mrad", "BeamSettings.convergence_angle")
-        # NEW: Parse defocus
         self.defocus = _q(self.defocus, "nanometer", "BeamSettings.defocus")
         self.scan_rotation = _q(self.scan_rotation, "degree", "BeamSettings.scan_rotation")
         self.spot_size = parse_optional_int_like(self.spot_size, name="BeamSettings.spot_size", strict=strict,
                                                  extra=self.extra)
 
-        self.stigmation = _maybe_point(self.stigmation, extra=self.extra, name="BeamSettings.stigmation", mode=mode)
-        self.beam_shift = _maybe_point(self.beam_shift, extra=self.extra, name="BeamSettings.beam_shift", mode=mode)
-        self.image_shift = _maybe_point(self.image_shift, extra=self.extra, name="BeamSettings.image_shift", mode=mode)
+        self.stigmation = maybe_from_dict(Point, self.stigmation, extra=self.extra, key="BeamSettings.stigmation", mode=mode)
+        self.beam_shift = maybe_from_dict(Point, self.beam_shift, extra=self.extra, key="BeamSettings.beam_shift", mode=mode)
+        self.image_shift = maybe_from_dict(Point, self.image_shift, extra=self.extra, key="BeamSettings.image_shift", mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -1414,7 +1407,6 @@ class BeamSettings:
             "voltage_kv": serialize_quantity(self.voltage, "kV"),
             "beam_current_na": serialize_quantity(self.beam_current, "nA"),
             "convergence_angle_mrad": serialize_quantity(self.convergence_angle, "mrad"),
-            # NEW: Serialize defocus
             "defocus_nm": serialize_quantity(self.defocus, "nm"),
             "scan_rotation_deg": serialize_quantity(self.scan_rotation, "degree"),
             "spot_size": self.spot_size,
@@ -1431,13 +1423,12 @@ class BeamSettings:
         if isinstance(d, BeamSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return BeamSettings(_mode=mode)
 
-        # Updated known keys
         known = {
             "voltage", "voltage_kv", "accelerating_voltage_kv",
             "beam_current", "beam_current_na", "current",
             "spot_size", "spot",
             "convergence_angle", "convergence_angle_mrad", "convergence_mrad",
-            "defocus", "defocus_nm",  # NEW
+            "defocus", "defocus_nm",
             "stigmation", "beam_shift", "image_shift",
             "scan_rotation", "scan_rotation_deg", "extra"
         }
@@ -1448,7 +1439,6 @@ class BeamSettings:
             beam_current=d.get("beam_current", d.get("beam_current_na", d.get("current"))),
             spot_size=d.get("spot_size", d.get("spot")),
             convergence_angle=d.get("convergence_angle", d.get("convergence_angle_mrad", d.get("convergence_mrad"))),
-            # NEW: Parse defocus
             defocus=d.get("defocus", d.get("defocus_nm")),
             stigmation=d.get("stigmation"),
             beam_shift=d.get("beam_shift"),
@@ -1467,23 +1457,23 @@ class BeamSystemSettings:
     Attributes:
         enabled: Master switch to enable/disable beam control.
         default_beam: A safe, default configuration to fallback to.
-        voltage_range: Allowable range (min, max) for accelerating voltage.
-        beam_current_range: Allowable range (min, max) for beam current.
-        spot_size_range: Min/Max valid indices for spot size.
-        convergence_angle_range: Allowable range (min, max) for convergence angle.
+        voltage_limits: Allowable range (min, max) for accelerating voltage.
+        beam_current_limits: Allowable range (min, max) for beam current.
+        spot_size_limits: Min/Max valid indices for spot size.
+        convergence_angle_limits: Allowable range (min, max) for convergence angle.
     """
     enabled: bool = True
     default_beam: BeamSettings = field(default_factory=BeamSettings)
-    voltage_range: Optional[Tuple["Quantity", "Quantity"]] = None
-    beam_current_range: Optional[Tuple["Quantity", "Quantity"]] = None
-    spot_size_range: Optional[Tuple[int, int]] = None
-    convergence_angle_range: Optional[Tuple["Quantity", "Quantity"]] = None
+    voltage_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    beam_current_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    spot_size_limits: Optional[Tuple[int, int]] = None
+    convergence_angle_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "BeamSystemSettings")
-        self.enabled = parse_bool(self.enabled, default=True)
+        self.enabled = parse_bool_like(self.enabled, default=True)
         self.default_beam = maybe_from_dict(BeamSettings, self.default_beam, mode=mode) or BeamSettings(_mode=mode)
 
         def _lim(val, unit):
@@ -1492,10 +1482,10 @@ class BeamSystemSettings:
                 return (ensure_quantity(val[0], unit), ensure_quantity(val[1], unit))
             return None
 
-        self.voltage_range = _lim(self.voltage_range, "kV")
-        self.beam_current_range = _lim(self.beam_current_range, "nA")
-        self.convergence_angle_range = _lim(self.convergence_angle_range, "mrad")
-        self.spot_size_range = parse_optional_pair_int_like(self.spot_size_range, name="BeamSystemSettings.spot_size_range", sort=False, strict=strict, extra=self.extra)
+        self.voltage_limits = _lim(self.voltage_limits, "kV")
+        self.beam_current_limits = _lim(self.beam_current_limits, "nA")
+        self.convergence_angle_limits = _lim(self.convergence_angle_limits, "mrad")
+        self.spot_size_limits = parse_optional_pair_int_like(self.spot_size_limits, name="BeamSystemSettings.spot_size_limits", sort=False, strict=strict, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
@@ -1523,10 +1513,10 @@ class BeamSystemSettings:
                      return False
             return True
 
-        ok = _check(self.voltage_range, "voltage_range") and ok
-        ok = _check(self.beam_current_range, "beam_current_range") and ok
-        ok = _check(self.convergence_angle_range, "convergence_angle_range") and ok
-        ok = _check(self.spot_size_range, "spot_size_range") and ok
+        ok = _check(self.voltage_limits, "voltage_limits") and ok
+        ok = _check(self.beam_current_limits, "beam_current_limits") and ok
+        ok = _check(self.convergence_angle_limits, "convergence_angle_limits") and ok
+        ok = _check(self.spot_size_limits, "spot_size_limits") and ok
 
         return ok
 
@@ -1535,10 +1525,10 @@ class BeamSystemSettings:
         d = {
             "enabled": self.enabled,
             "default_beam": self.default_beam.to_dict(),
-            "voltage_range_kv": _s_lim(self.voltage_range, "kV"),
-            "beam_current_range_na": _s_lim(self.beam_current_range, "nA"),
-            "spot_size_range": self.spot_size_range,
-            "convergence_angle_range_mrad": _s_lim(self.convergence_angle_range, "mrad"),
+            "voltage_limits_kv": _s_lim(self.voltage_limits, "kV"),
+            "beam_current_limits_na": _s_lim(self.beam_current_limits, "nA"),
+            "spot_size_limits": self.spot_size_limits,
+            "convergence_angle_limits_mrad": _s_lim(self.convergence_angle_limits, "mrad"),
         }
         add_extra_if_any(d, self.extra)
         return _jsonable(drop_none_keys(d))
@@ -1549,18 +1539,19 @@ class BeamSystemSettings:
         if isinstance(d, BeamSystemSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return BeamSystemSettings(_mode=mode)
 
-        known = {"enabled", "default_beam", "voltage_range", "voltage_range_kv", "voltage_limits_kv",
-                 "beam_current_range", "beam_current_range_na", "spot_size_range",
-                 "convergence_angle_range", "convergence_angle_range_mrad", "extra"}
+        known = {"enabled", "default_beam", "voltage_limits", "voltage_limits_kv", "voltage_range", "voltage_range_kv",
+                 "beam_current_limits", "beam_current_limits_na", "beam_current_range", "beam_current_range_na",
+                 "spot_size_limits", "spot_size_range",
+                 "convergence_angle_limits", "convergence_angle_limits_mrad", "convergence_angle_range", "extra"}
         extra = collect_extra(d, known, owner="BeamSystemSettings")
 
         return BeamSystemSettings(
             enabled=d.get("enabled", True),
             default_beam=d.get("default_beam"),
-            voltage_range=d.get("voltage_range", d.get("voltage_range_kv", d.get("voltage_limits_kv"))),
-            beam_current_range=d.get("beam_current_range", d.get("beam_current_range_na")),
-            spot_size_range=d.get("spot_size_range"),
-            convergence_angle_range=d.get("convergence_angle_range", d.get("convergence_angle_range_mrad")),
+            voltage_limits=_g(["voltage_limits", "voltage_limits_kv", "voltage_range", "voltage_range_kv"]),
+            beam_current_limits=_g(["beam_current_limits", "beam_current_limits_na", "beam_current_range", "beam_current_range_na"]),
+            spot_size_limits=_g(["spot_size_limits", "spot_size_range"]),
+            convergence_angle_limits=_g(["convergence_angle_limits", "convergence_angle_limits_mrad", "convergence_angle_range", "convergence_angle_range_mrad"]),
             extra=extra, _mode=mode
         )
 
@@ -1686,7 +1677,7 @@ class DetectorCapabilities:
 
     Attributes:
         can_*: Capability flags (binning, gain, offset, rotation).
-        *_min/max: Supported ranges for binning, exposure, ROI, gain, and offset.
+        *_min/max: Supported ranges for binning, exposure, ROI size, gain, and offset.
 
     Notes:
         This class is permanently `LENIENT` to safely ingest driver reports without validation errors.
@@ -1700,8 +1691,8 @@ class DetectorCapabilities:
     exposure_ms_max: Optional[float] = None
     frame_integration_min: Optional[int] = None
     frame_integration_max: Optional[int] = None
-    roi_min: Optional[Tuple[int, int]] = None
-    roi_max: Optional[Tuple[int, int]] = None
+    roi_size_min: Optional[Tuple[int, int]] = None
+    roi_size_max: Optional[Tuple[int, int]] = None
     can_gain: Optional[bool] = None
     gain_index_min: Optional[int] = None
     gain_index_max: Optional[int] = None
@@ -1720,8 +1711,8 @@ class DetectorCapabilities:
         # Pairs
         self.binning_xy_min = parse_optional_pair_int_like(self.binning_xy_min, name="DetectorCapabilities.binning_xy_min", strict=False, extra=self.extra)
         self.binning_xy_max = parse_optional_pair_int_like(self.binning_xy_max, name="DetectorCapabilities.binning_xy_max", strict=False, extra=self.extra)
-        self.roi_min = parse_optional_pair_int_like(self.roi_min, name="DetectorCapabilities.roi_min", strict=False, extra=self.extra)
-        self.roi_max = parse_optional_pair_int_like(self.roi_max, name="DetectorCapabilities.roi_max", strict=False, extra=self.extra)
+        self.roi_size_min = parse_optional_pair_int_like(self.roi_size_min, name="DetectorCapabilities.roi_size_min", strict=False, extra=self.extra)
+        self.roi_size_max = parse_optional_pair_int_like(self.roi_size_max, name="DetectorCapabilities.roi_size_max", strict=False, extra=self.extra)
 
         # Ints
         self.binning_index_min = parse_optional_int_like(self.binning_index_min, name="DetectorCapabilities.binning_index_min", strict=False, extra=self.extra)
@@ -1784,7 +1775,7 @@ class DetectorCapabilities:
         ok = _repair_pair_minmax("binning_xy_min", "binning_xy_max") and ok
         ok = _repair_minmax("exposure_ms_min", "exposure_ms_max") and ok
         ok = _repair_minmax("frame_integration_min", "frame_integration_max") and ok
-        ok = _repair_pair_minmax("roi_min", "roi_max") and ok
+        ok = _repair_pair_minmax("roi_size_min", "roi_size_max") and ok
         ok = _repair_minmax("gain_index_min", "gain_index_max") and ok
         ok = _repair_minmax("offset_index_min", "offset_index_max") and ok
         ok = _repair_minmax("digital_rotation_deg_min", "digital_rotation_deg_max") and ok
@@ -1806,12 +1797,12 @@ class DetectorCapabilities:
         if isinstance(d, DetectorCapabilities): return replace(d, _mode=mode)
         if not isinstance(d, dict): return DetectorCapabilities(_mode=mode)
 
-        known = {f.name for f in fields(DetectorCapabilities)} | {"extra"}
+        known = {f.name for f in fields(DetectorCapabilities)} | {"roi_min", "roi_max", "extra"}
         extra = collect_extra(d, known, owner="DetectorCapabilities")
 
         # Helper to extract kwargs manually since this is a complex mix of types
         kwargs: Dict[str, Any] = {}
-        pair_fields = {"binning_xy_min", "binning_xy_max", "roi_min", "roi_max"}
+        pair_fields = {"binning_xy_min", "binning_xy_max", "roi_size_min", "roi_size_max"}
         int_fields = {"binning_index_min", "binning_index_max", "frame_integration_min", "frame_integration_max", "gain_index_min", "gain_index_max", "offset_index_min", "offset_index_max"}
         float_fields = {"exposure_ms_min", "exposure_ms_max", "digital_rotation_deg_min", "digital_rotation_deg_max"}
         bool_fields = {"can_binning", "can_gain", "can_offset", "can_digital_rotation"}
@@ -1854,7 +1845,7 @@ class DetectorSystemSettings:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "DetectorSystemSettings")
-        self.enabled = parse_bool(self.enabled, default=True)
+        self.enabled = parse_bool_like(self.enabled, default=True)
 
         # Normalize mapping containers
         if self.defaults_by_id is None:
@@ -2207,9 +2198,9 @@ class Aperture:
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "Aperture")
         self.aperture_id = parse_optional_id_like(self.aperture_id, name="Aperture.aperture_id", strict=strict, extra=self.extra)
-        self.inserted = parse_bool(self.inserted, default=False)
+        self.inserted = parse_bool_like(self.inserted, default=False)
         self.size_index = parse_optional_int_like(self.size_index, name="Aperture.size_index", strict=strict, extra=self.extra)
-        self.position = _maybe_point(self.position, extra=self.extra, name="Aperture.position", mode=mode)
+        self.position = maybe_from_dict(Point, self.position, extra=self.extra, key="Aperture.position", mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         return True
@@ -2685,37 +2676,37 @@ class SystemSettings:
     Hierarchically aggregates settings for Stage, Beam, and Detectors.
 
     Attributes:
-        stage: Settings and limits for the stage.
-        beam: Settings and limits for the electron column.
-        detector: Settings and capabilities for all detectors.
+        stage_system: Settings and limits for the stage.
+        beam_system: Settings and limits for the electron column.
+        detector_system: Settings and capabilities for all detectors.
         info: Static system identity metadata.
     """
-    stage: StageSystemSettings = field(default_factory=StageSystemSettings)
-    beam: BeamSystemSettings = field(default_factory=BeamSystemSettings)
-    detector: DetectorSystemSettings = field(default_factory=DetectorSystemSettings)
+    stage_system: StageSystemSettings = field(default_factory=StageSystemSettings)
+    beam_system: BeamSystemSettings = field(default_factory=BeamSystemSettings)
+    detector_system: DetectorSystemSettings = field(default_factory=DetectorSystemSettings)
     info: SystemInfo = field(default_factory=SystemInfo)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         # Optim: No local mode/strict needed here as it delegates
         mode = as_parse_mode(self._mode)
-        self.stage = maybe_from_dict(StageSystemSettings, self.stage, mode=mode) or StageSystemSettings(_mode=mode)
-        self.beam = maybe_from_dict(BeamSystemSettings, self.beam, mode=mode) or BeamSystemSettings(_mode=mode)
-        self.detector = maybe_from_dict(DetectorSystemSettings, self.detector, mode=mode) or DetectorSystemSettings(_mode=mode)
+        self.stage_system = maybe_from_dict(StageSystemSettings, self.stage_system, mode=mode) or StageSystemSettings(_mode=mode)
+        self.beam_system = maybe_from_dict(BeamSystemSettings, self.beam_system, mode=mode) or BeamSystemSettings(_mode=mode)
+        self.detector_system = maybe_from_dict(DetectorSystemSettings, self.detector_system, mode=mode) or DetectorSystemSettings(_mode=mode)
         self.info = maybe_from_dict(SystemInfo, self.info, mode=mode) or SystemInfo(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
-        return (self.stage.validate(mode=mode) and
-                self.beam.validate(mode=mode) and
-                self.detector.validate(mode=mode) and
+        return (self.stage_system.validate(mode=mode) and
+                self.beam_system.validate(mode=mode) and
+                self.detector_system.validate(mode=mode) and
                 self.info.validate(mode=mode))
 
     def to_dict(self) -> dict:
         return _jsonable({
-            "stage": self.stage.to_dict(),
-            "beam": self.beam.to_dict(),
-            "detector": self.detector.to_dict(),
+            "stage_system": self.stage_system.to_dict(),
+            "beam_system": self.beam_system.to_dict(),
+            "detector_system": self.detector_system.to_dict(),
             "info": self.info.to_dict(),
         })
 
@@ -2725,9 +2716,9 @@ class SystemSettings:
         if isinstance(d, SystemSettings): return replace(d, _mode=mode)
         if not isinstance(d, dict): return SystemSettings(_mode=mode)
         return SystemSettings(
-            stage=d.get("stage"),
-            beam=d.get("beam"),
-            detector=d.get("detector"),
+            stage_system=d.get("stage_system", d.get("stage")),
+            beam_system=d.get("beam_system", d.get("beam")),
+            detector_system=d.get("detector_system", d.get("detector")),
             info=d.get("info"),
             _mode=mode,
         )
