@@ -2411,91 +2411,6 @@ class ImageOutputSettings:
         )
 
 @dataclass
-class AcquisitionRequest:
-    """
-    An executable command to acquire an image.
-
-    A control-plane object that combines detector settings with output preferences.
-
-    Attributes:
-        detector_id: The ID of the detector to use (Required).
-        detector: Specific settings for this acquisition.
-        image: Output settings (format, path).
-
-    Notes:
-        In `STRICT` mode, this object requires a valid `detector_id` to be instantiated.
-        It enforces consistency between the outer `detector_id` and the inner `detector.detector_id`.
-    """
-    detector_id: Optional[str] = None
-    detector: DetectorSettings = field(default_factory=DetectorSettings)
-    image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
-    extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
-
-    def __post_init__(self):
-        # NORMALIZATION:
-        # 1. Structure Coercion (Dict -> Dataclass)
-        # 2. Patch missing holes (Copy IDs if one is missing)
-        mode, strict, self.extra = _setup_init(self, self._mode, "AcquisitionRequest")
-
-        self.detector = maybe_from_dict(DetectorSettings, self.detector, mode=mode) or DetectorSettings(_mode=mode)
-        self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
-        self.detector_id = parse_optional_id_like(self.detector_id, name="id", strict=strict, extra=self.extra)
-
-        # Logic: Patching holes.
-        # DO NOT overwrite if both exist. That hides conflicts.
-        if self.detector_id is None and self.detector.detector_id is not None:
-            self.detector_id = self.detector.detector_id
-        elif self.detector.detector_id is None and self.detector_id is not None:
-            self.detector.detector_id = self.detector_id
-
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        # VALIDATION: Consistency & Readiness
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-
-        # Rule 1: Must have an ID to execute
-        if not self.detector_id:
-            note_or_raise(self.extra, "AcquisitionRequest.detector_id", ValueError("detector_id is required"), mode=mode)
-            ok = False
-
-        # Rule 2: Sub-objects must be valid
-        ok = self.detector.validate(mode=mode) and ok
-        ok = self.image.validate(mode=mode) and ok
-
-        # Rule 3: Cross-field consistency (The Conflict Case)
-        if self.detector.detector_id and self.detector_id and self.detector.detector_id != self.detector_id:
-            note_or_raise(self.extra, "AcquisitionRequest.id_mismatch", ValueError(
-                f"Ambiguous detector IDs: outer={self.detector_id}, inner={self.detector.detector_id}"), mode=mode)
-            if strict:
-                ok = False
-            else:
-                self.detector.detector_id = self.detector_id
-
-        return ok
-
-    def to_dict(self) -> dict:
-        d = {
-            "detector_id": self.detector_id,
-            "detector": self.detector.to_dict(),
-            "image": self.image.to_dict(),
-        }
-        return _finish_to_dict(d, self.extra)
-
-    @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
-        mode = as_parse_mode(mode)
-        if isinstance(d, AcquisitionRequest): return replace(d, _mode=mode)
-        if not isinstance(d, dict): return AcquisitionRequest(_mode=mode)
-        extra = collect_extra(d, ("detector_id", "detector", "image", "extra"), owner="AcquisitionRequest")
-        return AcquisitionRequest(
-            detector_id=d.get("detector_id"),
-            detector=d.get("detector"),
-            image=d.get("image"),
-            extra=extra, _mode=mode
-        )
-
-@dataclass
 class Aperture:
     aperture_id: Optional[str] = None
     inserted: bool = False
@@ -3131,4 +3046,196 @@ class MicroscopeSettings:
             image=d.get("image"),
             protocol=d.get("protocol", {"name": "demo"}),
             extra=extra, _mode=mode,
+        )
+
+# =============================================================================
+# Requests
+# =============================================================================
+
+@dataclass
+class AcquisitionRequest:
+    """
+    An executable command to acquire an image.
+
+    A control-plane object that combines detector settings with output preferences.
+
+    Attributes:
+        detector_id: The ID of the detector to use (Required).
+        detector: Specific settings for this acquisition.
+        image: Output settings (format, path).
+
+    Notes:
+        In `STRICT` mode, this object requires a valid `detector_id` to be instantiated.
+        It enforces consistency between the outer `detector_id` and the inner `detector.detector_id`.
+    """
+    detector_id: Optional[str] = None
+    detector: DetectorSettings = field(default_factory=DetectorSettings)
+    image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        # NORMALIZATION:
+        # 1. Structure Coercion (Dict -> Dataclass)
+        # 2. Patch missing holes (Copy IDs if one is missing)
+        mode, strict, self.extra = _setup_init(self, self._mode, "AcquisitionRequest")
+
+        self.detector = maybe_from_dict(DetectorSettings, self.detector, mode=mode) or DetectorSettings(_mode=mode)
+        self.image = maybe_from_dict(ImageOutputSettings, self.image, mode=mode) or ImageOutputSettings(_mode=mode)
+        self.detector_id = parse_optional_id_like(self.detector_id, name="id", strict=strict, extra=self.extra)
+
+        # Logic: Patching holes.
+        # DO NOT overwrite if both exist. That hides conflicts.
+        if self.detector_id is None and self.detector.detector_id is not None:
+            self.detector_id = self.detector.detector_id
+        elif self.detector.detector_id is None and self.detector_id is not None:
+            self.detector.detector_id = self.detector_id
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        # VALIDATION: Consistency & Readiness
+        mode, strict = _setup_validate(self._mode, mode)
+        ok = True
+
+        # Rule 1: Must have an ID to execute
+        if not self.detector_id:
+            note_or_raise(self.extra, "AcquisitionRequest.detector_id", ValueError("detector_id is required"), mode=mode)
+            ok = False
+
+        # Rule 2: Sub-objects must be valid
+        ok = self.detector.validate(mode=mode) and ok
+        ok = self.image.validate(mode=mode) and ok
+
+        # Rule 3: Cross-field consistency (The Conflict Case)
+        if self.detector.detector_id and self.detector_id and self.detector.detector_id != self.detector_id:
+            note_or_raise(self.extra, "AcquisitionRequest.id_mismatch", ValueError(
+                f"Ambiguous detector IDs: outer={self.detector_id}, inner={self.detector.detector_id}"), mode=mode)
+            if strict:
+                ok = False
+            else:
+                self.detector.detector_id = self.detector_id
+
+        return ok
+
+    def to_dict(self) -> dict:
+        d = {
+            "detector_id": self.detector_id,
+            "detector": self.detector.to_dict(),
+            "image": self.image.to_dict(),
+        }
+        return _finish_to_dict(d, self.extra)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
+        mode = as_parse_mode(mode)
+        if isinstance(d, AcquisitionRequest): return replace(d, _mode=mode)
+        if not isinstance(d, dict): return AcquisitionRequest(_mode=mode)
+        extra = collect_extra(d, ("detector_id", "detector", "image", "extra"), owner="AcquisitionRequest")
+        return AcquisitionRequest(
+            detector_id=d.get("detector_id"),
+            detector=d.get("detector"),
+            image=d.get("image"),
+            extra=extra, _mode=mode
+        )
+
+@dataclass
+class StageMoveRequest:
+    """
+    Explicit intent to move the microscope stage.
+
+    Attributes:
+        target: The coordinate goals (absolute or relative vectors).
+        relative: If True, target values are added to current position (deltas).
+        backlash_correction: Whether to perform hardware backlash compensation.
+        wait_for_settle: If True, blocks until movement and settling are complete.
+        settle_time: Optional duration to wait after movement stops.
+                     If None, uses the default from StageSystemSettings.
+    """
+    target: StagePosition = field(default_factory=StagePosition)
+    relative: bool = False
+    backlash_correction: bool = True
+    wait_for_settle: bool = True
+    settle_time: Optional["Quantity"] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        mode, strict, self.extra = _setup_init(self, self._mode, "StageMoveRequest")
+
+        self.target = maybe_from_dict(StagePosition, self.target, mode=mode) or StagePosition(_mode=mode)
+        self.relative = parse_bool_like(self.relative, default=False)
+        self.backlash_correction = parse_bool_like(self.backlash_correction, default=True)
+        self.wait_for_settle = parse_bool_like(self.wait_for_settle, default=True)
+
+        # 1. Capture the raw input (could be "500ms", float, or None)
+        raw_time = self.settle_time
+
+        # 2. Attempt to coerce it to a Quantity
+        self.settle_time = ensure_quantity(raw_time, "seconds")
+
+        # 3. Check if coercion failed (i.e. we had input, but now we have None)
+        if raw_time is not None and self.settle_time is None:
+            note_or_raise(
+                self.extra,
+                "StageMoveRequest.settle_time",
+                ValueError(f"Invalid time format: {raw_time!r}"),
+                mode=mode,
+                raw=raw_time
+            )
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode, strict = _setup_validate(self._mode, mode)
+        ok = True
+
+        if not self.target.validate(mode=mode):
+            ok = False
+
+        # Check for empty request
+        axes = [self.target.x, self.target.y, self.target.z,
+                self.target.r, self.target.tilt_x, self.target.tilt_y]
+        if all(a is None for a in axes):
+            note_or_raise(self.extra, "StageMoveRequest.empty",
+                          ValueError("StageMoveRequest has no target coordinates"),
+                          mode=mode)
+            if strict: ok = False
+
+        # Check for negative time
+        if self.settle_time is not None and self.settle_time.magnitude < 0:
+            note_or_raise(self.extra, "StageMoveRequest.settle_time",
+                          ValueError("Settle time cannot be negative"), mode=mode)
+            if strict:
+                ok = False
+            else:
+                self.settle_time = None  # Heal
+
+        return ok
+
+    def to_dict(self) -> dict:
+        d = {
+            "target": self.target.to_dict(),
+            "relative": self.relative,
+            "backlash_correction": self.backlash_correction,
+            "wait_for_settle": self.wait_for_settle,
+            "settle_time_s": serialize_quantity(self.settle_time, "seconds"),
+        }
+        return _finish_to_dict(d, self.extra)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageMoveRequest":
+        mode = as_parse_mode(mode)
+        if isinstance(d, StageMoveRequest): return replace(d, _mode=mode)
+        if not isinstance(d, dict): return StageMoveRequest(_mode=mode)
+
+        known = {"target", "relative", "backlash_correction", "wait_for_settle",
+                 "settle_time", "settle_time_s", "extra"}
+        extra = collect_extra(d, known, owner="StageMoveRequest")
+
+        # Just pass the raw value to the constructor; __post_init__ handles the rest.
+        return StageMoveRequest(
+            target=d.get("target"),
+            relative=d.get("relative", False),
+            backlash_correction=d.get("backlash_correction", True),
+            wait_for_settle=d.get("wait_for_settle", True),
+            settle_time=d.get("settle_time", d.get("settle_time_s")),
+            extra=extra,
+            _mode=mode
         )
