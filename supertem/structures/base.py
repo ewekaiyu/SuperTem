@@ -1099,13 +1099,10 @@ class StagePosition:
 
         def check_axis(q: Any, field_name: str) -> bool:
             if q is None: return True
-            try:
-                mag = float(q.magnitude)
-                if not math.isfinite(mag):
-                    note_or_raise(self.extra, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode, raw=mag)
-                    return False
-            except Exception as e:
-                note_or_raise(self.extra, field_name, e, mode=mode)
+            mag = float(q.magnitude)
+            if not math.isfinite(mag):
+                note_or_raise(self.extra, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode,
+                              raw=mag)
                 return False
             return True
 
@@ -1815,58 +1812,39 @@ class DetectorCapabilities:
         self.can_digital_rotation = parse_optional_bool_like(self.can_digital_rotation, name="DetectorCapabilities.can_digital_rotation", strict=False, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        # VALIDATION: Check consistency (min <= max) and non-negativity.
+        # We trust types are correct because __post_init__ guaranteed it.
         mode = as_parse_mode(self._mode if mode is None else mode)
         ok = True
 
-        # 1. Validate the snapshot object
-        if self.microscope_state:
-            ok = self.microscope_state.validate(mode=mode) and ok
-
-        # 2. Validate physical scalars (Must be non-negative)
-        def _check_pos(val: Optional[float], name: str, strictly_positive: bool = False) -> bool:
-            if val is not None:
-                # Check for finiteness (NaN/Inf)
-                if not math.isfinite(val):
-                    note_or_raise(self.extra, name, ValueError(f"{name} must be finite"), mode=mode, raw=val)
-                    return False
-
-                # Check for sign
-                limit = 0.0 if not strictly_positive else 1e-9
-                if val < limit:
-                    err_msg = f"{name} must be > 0" if strictly_positive else f"{name} must be >= 0"
-                    note_or_raise(self.extra, name, ValueError(err_msg), mode=mode, raw=val)
+        def _check_range(min_val, max_val, name):
+            if min_val is not None and max_val is not None:
+                if min_val > max_val:
+                    note_or_raise(self.extra, name, ValueError(f"{name} invalid: min > max ({min_val} > {max_val})"), mode=mode)
                     return False
             return True
 
-        # Magnification: strictly positive (0 usually implies error or uncalibrated)
-        ok = _check_pos(self.magnification, "MicroscopeImageMetadata.magnification", strictly_positive=True) and ok
+        def _check_pos(val, name):
+            if val is not None and val < 0:
+                note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
+                return False
+            return True
 
-        # Camera Length: non-negative (0 is unlikely but physically 'infinite' focus, negative is wrong)
-        ok = _check_pos(self.camera_length_mm, "MicroscopeImageMetadata.camera_length_mm",
-                        strictly_positive=False) and ok
+        # 1. Range Consistency
+        ok = _check_range(self.binning_index_min, self.binning_index_max, "DetectorCapabilities.binning_index") and ok
+        ok = _check_range(self.frame_integration_min, self.frame_integration_max, "DetectorCapabilities.frame_integration") and ok
+        ok = _check_range(self.gain_index_min, self.gain_index_max, "DetectorCapabilities.gain_index") and ok
+        ok = _check_range(self.offset_index_min, self.offset_index_max, "DetectorCapabilities.offset_index") and ok
+        ok = _check_range(self.exposure_ms_min, self.exposure_ms_max, "DetectorCapabilities.exposure_ms") and ok
 
-        # Voltage: strictly positive
-        ok = _check_pos(self.accelerating_voltage_kv, "MicroscopeImageMetadata.accelerating_voltage_kv",
-                        strictly_positive=True) and ok
+        # 2. Physical Non-negativity
+        ok = _check_pos(self.exposure_ms_min, "DetectorCapabilities.exposure_ms_min") and ok
 
-        # Current: non-negative
-        ok = _check_pos(self.beam_current_na, "MicroscopeImageMetadata.beam_current_na", strictly_positive=False) and ok
-
-        # Exposure: strictly positive
-        ok = _check_pos(self.exposure_ms, "MicroscopeImageMetadata.exposure_ms", strictly_positive=True) and ok
-
-        # 3. Validate tuples
-        if self.pixel_size_nm:
-            if self.pixel_size_nm[0] <= 0 or self.pixel_size_nm[1] <= 0:
-                note_or_raise(self.extra, "MicroscopeImageMetadata.pixel_size_nm",
-                              ValueError("pixel_size_nm components must be > 0"), mode=mode, raw=self.pixel_size_nm)
-                ok = False
-
-        if self.image_size_px:
-            if self.image_size_px[0] <= 0 or self.image_size_px[1] <= 0:
-                note_or_raise(self.extra, "MicroscopeImageMetadata.image_size_px",
-                              ValueError("image_size_px dimensions must be > 0"), mode=mode, raw=self.image_size_px)
-                ok = False
+        # 3. Tuple consistency (ROI/Binning)
+        if self.roi_size_min and self.roi_size_max:
+             if self.roi_size_min[0] > self.roi_size_max[0] or self.roi_size_min[1] > self.roi_size_max[1]:
+                 note_or_raise(self.extra, "DetectorCapabilities.roi_size", ValueError("ROI size min > max"), mode=mode)
+                 ok = False
 
         return ok
 
@@ -2068,7 +2046,7 @@ class DetectorSystemSettings:
         ok = True
 
         if self.default_detector_id:
-            det_id = str(self.default_detector_id)
+            det_id = self.default_detector_id
             known = set(self.defaults_by_id.keys()) | set(self.capabilities_by_id.keys()) | set(self.available_detector_ids)
             if known and det_id not in known:
                 note_or_raise(
@@ -2752,7 +2730,7 @@ class SystemInfo:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
-        ip = self.ip_address.strip() if isinstance(self.ip_address, str) else ""
+        ip = self.ip_address.strip()
         if ip and ip != "Unknown":
             try:
                 ipaddress.ip_address(ip)
