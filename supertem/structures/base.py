@@ -1056,28 +1056,38 @@ class StagePosition:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
+        is_valid = True
+
         def cleaned(q: Any, unit: str, field_name: str) -> Optional["Quantity"]:
+            nonlocal is_valid
             qq = ensure_quantity(q, unit)
             if qq is None:
                 if q is None: return None
-                note_or_raise(self.extra, field_name, ValueError(f"{field_name} must be convertible to {unit}"), mode=mode, raw=q)
+                note_or_raise(self.extra, field_name, ValueError(f"{field_name} must be convertible to {unit}"),
+                              mode=mode, raw=q)
+                is_valid = False
                 return None
             try:
                 mag = float(qq.to(unit).magnitude)
             except Exception as e:
                 note_or_raise(self.extra, field_name, e, mode=mode, raw=qq)
+                is_valid = False
                 return None
             if not math.isfinite(mag):
-                note_or_raise(self.extra, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode, raw=mag)
+                note_or_raise(self.extra, field_name, ValueError(f"{field_name} magnitude must be finite"), mode=mode,
+                              raw=mag)
+                is_valid = False
                 return None
             return qq
+
         self.x = cleaned(self.x, "nanometer", "StagePosition.x")
         self.y = cleaned(self.y, "nanometer", "StagePosition.y")
         self.z = cleaned(self.z, "nanometer", "StagePosition.z")
         self.r = cleaned(self.r, "degree", "StagePosition.r")
         self.tilt_x = cleaned(self.tilt_x, "degree", "StagePosition.tilt_x")
         self.tilt_y = cleaned(self.tilt_y, "degree", "StagePosition.tilt_y")
-        return True
+
+        return is_valid
 
     def to_dict(self) -> dict:
         d = {
@@ -1278,7 +1288,7 @@ class StageSystemSettings:
             z_min, z_max = self.z_limits
             if not (z_min <= self.eucentric_z <= z_max):
                 note_or_raise(self.extra, "StageSystemSettings.eucentric_z", ValueError(f"eucentric_z ({self.eucentric_z}) outside z_limits"), mode=mode)
-                if strict: ok = False
+                ok = False
 
         return ok
 
@@ -2073,6 +2083,7 @@ class ImageOutputSettings:
             if is_strict(mode or self._mode):
                 raise ValueError(f"Unsupported format: {self.file_format}")
             self.file_format = "tiff"
+            return False
         return True
 
     def to_dict(self):
@@ -2146,19 +2157,21 @@ class AcquisitionRequest:
 
         if not self.detector_id:
             if strict:
-                 note_or_raise(self.extra, "AcquisitionRequest.detector_id", ValueError("detector_id is required"), mode=mode)
-                 ok = False
+                note_or_raise(self.extra, "AcquisitionRequest.detector_id", ValueError("detector_id is required"),
+                              mode=mode)
+            ok = False
 
         ok = self.detector.validate(mode=mode) and ok
         ok = self.image.validate(mode=mode) and ok
 
         if self.detector.detector_id and self.detector_id and self.detector.detector_id != self.detector_id:
-             note_or_raise(self.extra, "AcquisitionRequest.id_mismatch", ValueError(f"Ambiguous detector IDs: outer={self.detector_id}, inner={self.detector.detector_id}"), mode=mode)
-             if strict:
-                 ok = False
-             else:
-                 # In lenient mode, we auto-repair by syncing inner to outer (outer scope wins)
-                 self.detector.detector_id = self.detector_id
+            note_or_raise(self.extra, "AcquisitionRequest.id_mismatch", ValueError(
+                f"Ambiguous detector IDs: outer={self.detector_id}, inner={self.detector.detector_id}"), mode=mode)
+            ok = False
+            if not strict:
+                # Auto-repair
+                self.detector.detector_id = self.detector_id
+
         return ok
 
     def to_dict(self) -> dict:
@@ -2340,23 +2353,21 @@ class MicroscopeState:
         mode = as_parse_mode(self._mode if mode is None else mode)
         strict = is_strict(mode)
         ok = True
+
         ok = self.stage_position.validate(mode=mode) and ok
         ok = self.beam.validate(mode=mode) and ok
 
-        # Validate Maps
         for ds in self.detectors.values():
             ok = ds.validate(mode=mode) and ok
         for ap in self.apertures.values():
             ok = ap.validate(mode=mode) and ok
 
-        # Validate ID References
         valid_ids = []
         for det_id in self.active_detector_ids:
             if det_id not in self.detectors:
                 note_or_raise(self.extra, "MicroscopeState.active_detector_ids",
                               ValueError(f"Active detector '{det_id}' not found in detectors list"), mode=mode)
-                if strict:
-                    ok = False
+                ok = False
             else:
                 valid_ids.append(det_id)
 
@@ -2669,6 +2680,7 @@ class SystemInfo:
             except Exception:
                 note_or_raise(self.extra, "SystemInfo.ip_address", ValueError(f"Invalid IP: {self.ip_address!r}"), mode=mode, raw=self.ip_address)
                 self.ip_address = "Unknown"
+                return False
         return True
 
     def to_dict(self) -> dict:
