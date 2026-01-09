@@ -933,10 +933,26 @@ def _normalize_keyed_map(
             continue
 
         # 2. Parse the object
-        obj = maybe_from_dict(target_cls, v, mode=mode)
+        obj_key = f"{owner_name}.{key_norm}"
+        obj = maybe_from_dict(target_cls, v, mode=mode, extra=extra, key=obj_key)
         if obj is None:
             # Instantiate default if parsing failed or v was None
-            obj = target_cls(_mode=mode)  # type: ignore
+            note_or_raise(
+                extra,
+                obj_key,
+                TypeError(f"Invalid or missing object for key '{key_norm}'"),
+                mode=mode,
+                raw=v,
+            )
+            try:
+                obj = target_cls(_mode=mode)  # type: ignore[arg-type]
+            except TypeError:
+                obj = target_cls()  # type: ignore[call-arg]
+                if hasattr(obj, "_mode"):
+                    try:
+                        setattr(obj, "_mode", mode)
+                    except Exception:
+                        pass
 
         # 3. Reconcile Map Key vs Internal ID
         internal_id = getattr(obj, id_field, None)
@@ -1295,7 +1311,14 @@ class StagePosition:
             qb = ensure_quantity(b, unit)
             if qa is None or qb is None: return False
             da = abs(qa - qb)
-            return float(da.m_as(unit)) <= float(tol)
+            try:
+                dv = float(da.to(unit).magnitude)
+            except Exception:
+                try:
+                    dv = float(da.m_as(unit))  # type: ignore[attr-defined]
+                except Exception:
+                    return False
+            return dv <= float(tol)
         return (close_axis(self.x, other.x, "nanometer", tol_nm) and
                 close_axis(self.y, other.y, "nanometer", tol_nm) and
                 close_axis(self.z, other.z, "nanometer", tol_nm) and
@@ -1355,18 +1378,29 @@ class StageSystemSettings:
         self.can_tilt_x = parse_bool_like(self.can_tilt_x, default=False)
         self.can_tilt_y = parse_bool_like(self.can_tilt_y, default=False)
 
-        def _lim(val, unit):
-            if val is None: return None
+        def _lim(val, unit, name):
+            if val is None:
+                return None
             if isinstance(val, (list, tuple)) and len(val) == 2:
-                return (ensure_quantity(val[0], unit), ensure_quantity(val[1], unit))
+                a = ensure_quantity(val[0], unit)
+                b = ensure_quantity(val[1], unit)
+                if a is None or b is None:
+                    note_or_raise(self.extra, f"{name}_limits",
+                                  TypeError(f"{name} limits must be quantities in {unit}: got {val!r}"),
+                                  mode=mode, raw=val)
+                    return None
+                return (a, b)
+            note_or_raise(self.extra, f"{name}_limits",
+                          TypeError(f"{name} limits must be a (min,max) pair: got {val!r}"),
+                          mode=mode, raw=val)
             return None
 
-        self.x_limits = _lim(self.x_limits, "nm")
-        self.y_limits = _lim(self.y_limits, "nm")
-        self.z_limits = _lim(self.z_limits, "nm")
-        self.r_limits = _lim(self.r_limits, "degree")
-        self.tilt_x_limits = _lim(self.tilt_x_limits, "degree")
-        self.tilt_y_limits = _lim(self.tilt_y_limits, "degree")
+        self.x_limits = _lim(self.x_limits, "nm", "StageSystemSettings.x")
+        self.y_limits = _lim(self.y_limits, "nm", "StageSystemSettings.y")
+        self.z_limits = _lim(self.z_limits, "nm", "StageSystemSettings.z")
+        self.r_limits = _lim(self.r_limits, "degree", "StageSystemSettings.r")
+        self.tilt_x_limits = _lim(self.tilt_x_limits, "degree", "StageSystemSettings.tilt_x")
+        self.tilt_y_limits = _lim(self.tilt_y_limits, "degree", "StageSystemSettings.tilt_y")
 
         self.max_step_distance = ensure_quantity(self.max_step_distance, "nm") or Q_(50000.0, "nm")
         self.max_step_angle = ensure_quantity(self.max_step_angle, "degree") or Q_(1.0, "degree")
@@ -1723,15 +1757,25 @@ class BeamSystemSettings:
         self.enabled = parse_bool_like(self.enabled, default=True)
         self.default_beam = maybe_from_dict(BeamSettings, self.default_beam, mode=mode) or BeamSettings(_mode=mode)
 
-        def _lim(val, unit):
+        def _lim(val, unit, name):
             if val is None: return None
             if isinstance(val, (list, tuple)) and len(val) == 2:
-                return (ensure_quantity(val[0], unit), ensure_quantity(val[1], unit))
+                a = ensure_quantity(val[0], unit)
+                b = ensure_quantity(val[1], unit)
+                if a is None or b is None:
+                    note_or_raise(self.extra, f"{name}_limits",
+                                  TypeError(f"{name} limits must be quantities in {unit}: got {val!r}"),
+                                  mode=mode, raw=val)
+                    return None
+                return (a, b)
+            note_or_raise(self.extra, f"{name}_limits",
+                          TypeError(f"{name} limits must be a (min,max) pair: got {val!r}"),
+                          mode=mode, raw=val)
             return None
 
-        self.voltage_limits = _lim(self.voltage_limits, "kV")
-        self.beam_current_limits = _lim(self.beam_current_limits, "nA")
-        self.convergence_angle_limits = _lim(self.convergence_angle_limits, "mrad")
+        self.voltage_limits = _lim(self.voltage_limits, "kV", "BeamSystemSettings.voltage")
+        self.beam_current_limits = _lim(self.beam_current_limits, "nA", "BeamSystemSettings.beam_current")
+        self.convergence_angle_limits = _lim(self.convergence_angle_limits, "mrad", "BeamSystemSettings.convergence_angle")
         self.spot_size_limits = parse_optional_pair_int_like(self.spot_size_limits, name="BeamSystemSettings.spot_size_limits", sort=False, strict=strict, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -1904,7 +1948,7 @@ class DetectorSettings:
         if self.binning_xy:
              # Semantic check: Binning must be positive integers
              if self.binning_xy[0] <= 0 or self.binning_xy[1] <= 0:
-                 note_or_raise(self.extra, "DetectorSettings.binning_xy", ValueError("binning_xy must be >= 0"), mode=mode, raw=self.binning_xy)
+                 note_or_raise(self.extra, "DetectorSettings.binning_xy", ValueError("binning_xy must be > 0"), mode=mode, raw=self.binning_xy)
                  if strict:
                      ok = False
                  else:
@@ -2494,15 +2538,15 @@ class MicroscopeState:
         mode: The optical mode (e.g., "TEM", "STEM").
         stage_position: Current coordinates of the stage.
         beam: Current state of the electron beam.
-        apertures: Dictionary of aperture states.
-        detectors: Dictionary of detector settings.
+        apertures: Dictionary of current aperture states.
+        detectors: Dictionary of current detector States.
         active_detector_ids: List of detectors currently marked as active.
         primary_detector_id: The ID of the currently selected main detector.
 
     Notes:
         Typically instantiated in `LENIENT` mode for logging/telemetry to preserve data despite partial failures.
     """
-    timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp())
+    timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
     mode: Optional[str] = None
     stage_position: StagePosition = field(default_factory=StagePosition)
     beam: BeamState = field(default_factory=BeamState)
