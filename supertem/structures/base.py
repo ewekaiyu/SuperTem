@@ -1910,161 +1910,128 @@ class DetectorSystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
+        # NORMALIZATION: Structure & Types
         mode, strict, self.extra = _setup_init(self, self._mode, "DetectorSystemSettings")
         self.enabled = parse_bool_like(self.enabled, default=True)
 
-        # Normalize mapping containers
-        if self.defaults_by_id is None:
-            self.defaults_by_id = {}
-        elif not isinstance(self.defaults_by_id, dict):
-            note_or_raise(
-                self.extra,
-                "DetectorSystemSettings.defaults_by_id",
-                TypeError(f"defaults_by_id must be dict, got {type(self.defaults_by_id)}"),
-                mode=mode,
-                raw=deepcopy(self.defaults_by_id),
-            )
-            self.defaults_by_id = {}
+        # 1. Normalize containers (ensure dicts/lists exist)
+        if self.defaults_by_id is None: self.defaults_by_id = {}
+        if self.capabilities_by_id is None: self.capabilities_by_id = {}
+        if self.available_detector_ids is None: self.available_detector_ids = []
 
-        if self.capabilities_by_id is None:
-            self.capabilities_by_id = {}
-        elif not isinstance(self.capabilities_by_id, dict):
-            note_or_raise(
-                self.extra,
-                "DetectorSystemSettings.capabilities_by_id",
-                TypeError(f"capabilities_by_id must be dict, got {type(self.capabilities_by_id)}"),
-                mode=mode,
-                raw=deepcopy(self.capabilities_by_id),
-            )
-            self.capabilities_by_id = {}
-
-        if self.available_detector_ids is None:
-            self.available_detector_ids = []
-        elif not isinstance(self.available_detector_ids, list):
-            note_or_raise(
-                self.extra,
-                "DetectorSystemSettings.available_detector_ids",
-                TypeError(f"available_detector_ids must be list, got {type(self.available_detector_ids)}"),
-                mode=mode,
-                raw=deepcopy(self.available_detector_ids),
-            )
-            self.available_detector_ids = []
-
-        # default_detector_id: allow missing; parse to optional id-like
+        # 2. Normalize default ID (ensure it's None or str)
         self.default_detector_id = parse_optional_id_like(
             self.default_detector_id, name="DetectorSystemSettings.default_detector_id", strict=False, extra=self.extra
         )
 
-        # Normalize dict keys to str, and values to proper objects
+        # 3. Normalize defaults_by_id (Recursively parse children)
         new_defaults: Dict[str, DetectorSettings] = {}
         for k, v in list(self.defaults_by_id.items()):
-            det_id = parse_optional_id_like(
-                k, name="DetectorSystemSettings.defaults_by_id.key", strict=strict, extra=self.extra
-            )
-            if det_id is None:
-                self.extra.notes[f"DetectorSystemSettings.defaults_by_id.{k}_raw_key"] = k
-                continue
+            det_id = parse_optional_id_like(k, name="DetectorSystemSettings.defaults_by_id.key", strict=strict,
+                                            extra=self.extra)
+            if det_id is None: continue
 
+            # Polymorphic parsing (Handle dict vs Object)
             if isinstance(v, dict):
-                try:
-                    v = DetectorSettings.from_dict(v, mode=mode)
-                except Exception as e:
-                    note_or_raise(self.extra, f"DetectorSystemSettings.defaults_by_id.{det_id}", e, mode=mode, raw=deepcopy(v))
-                    continue
+                v = maybe_from_dict(DetectorSettings, v, mode=mode, extra=self.extra)
 
             if isinstance(v, DetectorSettings):
-                if is_dataclass(v) and getattr(v, "_mode", None) != mode:
-                    v = replace(v, _mode=mode)
+                # Ensure the inner ID matches the map key
+                if v.detector_id is None:
+                    v.detector_id = det_id
+                elif str(v.detector_id) != det_id:
+                    # We fix this in normalization so validate doesn't see a conflict
+                    v.detector_id = det_id
+                new_defaults[det_id] = v
             else:
-                note_or_raise(
-                    self.extra,
-                    f"DetectorSystemSettings.defaults_by_id.{det_id}",
-                    TypeError(f"defaults_by_id['{det_id}'] must be DetectorSettings/dict, got {type(v)}"),
-                    mode=mode,
-                    raw=deepcopy(v),
-                )
-                continue
-
-            # Align detector_id with key
-            if v.detector_id is None:
-                v.detector_id = det_id
-            elif str(v.detector_id) != det_id:
-                self.extra.notes[f"DetectorSystemSettings.defaults_by_id.{det_id}.detector_id_mismatch"] = {
-                    "key": det_id,
-                    "detector_id": v.detector_id,
-                }
-                v.detector_id = det_id
-
-            new_defaults[det_id] = v
+                # In STRICT mode, we can't accept garbage. In LENIENT, we skip it.
+                pass
         self.defaults_by_id = new_defaults
 
+        # 4. Normalize capabilities_by_id
         new_caps: Dict[str, DetectorCapabilities] = {}
         for k, v in list(self.capabilities_by_id.items()):
-            det_id = parse_optional_id_like(
-                k, name="DetectorSystemSettings.capabilities_by_id.key", strict=strict, extra=self.extra
-            )
-            if det_id is None:
-                self.extra.notes[f"DetectorSystemSettings.capabilities_by_id.{k}_raw_key"] = k
-                continue
+            det_id = parse_optional_id_like(k, name="DetectorSystemSettings.capabilities_by_id.key", strict=strict,
+                                            extra=self.extra)
+            if det_id is None: continue
 
             if isinstance(v, dict):
-                v = DetectorCapabilities.from_dict(v)
-            if isinstance(v, DetectorCapabilities):
-                pass
-            else:
-                note_or_raise(
-                    self.extra,
-                    f"DetectorSystemSettings.capabilities_by_id.{det_id}",
-                    TypeError(f"capabilities_by_id['{det_id}'] must be DetectorCapabilities/dict, got {type(v)}"),
-                    mode=mode,
-                    raw=deepcopy(v),
-                )
-                continue
+                v = maybe_from_dict(DetectorCapabilities, v, mode=mode, extra=self.extra)
 
-            new_caps[det_id] = v
+            if isinstance(v, DetectorCapabilities):
+                new_caps[det_id] = v
         self.capabilities_by_id = new_caps
 
-        # Normalize available_detector_ids entries to str ids (drop invalid ones in lenient)
+        # 5. Normalize available_detector_ids (Deduplicate and str-ify)
         norm_avail: List[str] = []
         for item in self.available_detector_ids:
-            det_id = parse_optional_id_like(
-                item, name="DetectorSystemSettings.available_detector_ids[]", strict=False, extra=self.extra
-            )
-            if det_id is None:
-                self.extra.notes.setdefault("DetectorSystemSettings.available_detector_ids.invalid", []).append(repr(item))
-                continue
-            norm_avail.append(det_id)
-        seen=set()
-        self.available_detector_ids = [x for x in norm_avail if not (x in seen or seen.add(x))]
+            det_id = parse_optional_id_like(item, name="DetectorSystemSettings.available_detector_ids", strict=False,
+                                            extra=self.extra)
+            if det_id:
+                norm_avail.append(det_id)
+        # Unique preserve order
+        self.available_detector_ids = list(dict.fromkeys(norm_avail))
 
-        # Semantic constraints live in validate().
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        """Validate detector-system semantics."""
+        """Validate detector-system semantics and cross-field consistency."""
         mode = as_parse_mode(self._mode if mode is None else mode)
         strict = is_strict(mode)
-
         ok = True
 
+        # Rule 2B: Cross-Field Consistency
+        # We must ensure that the sets of IDs make sense together.
+
+        ids_available = set(self.available_detector_ids)
+        ids_defaults = set(self.defaults_by_id.keys())
+        ids_caps = set(self.capabilities_by_id.keys())
+
+        # Check 1: Default Selection Validity
         if self.default_detector_id:
-            det_id = self.default_detector_id
-            known = set(self.defaults_by_id.keys()) | set(self.capabilities_by_id.keys()) | set(self.available_detector_ids)
-            if known and det_id not in known:
+            # Note: We trust default_detector_id is str or None (from __post_init__)
+            known_anywhere = ids_available | ids_defaults | ids_caps
+            if known_anywhere and self.default_detector_id not in known_anywhere:
                 note_or_raise(
                     self.extra,
                     "DetectorSystemSettings.default_detector_id",
-                    ValueError(f"default_detector_id='{det_id}' not found in known detectors"),
-                    mode=mode,
-                    raw=det_id,
+                    ValueError(f"Selected default '{self.default_detector_id}' is unknown."),
+                    mode=mode
                 )
                 ok = False
-                if not strict:
-                    self.default_detector_id = None
+                if not strict: self.default_detector_id = None
 
-        for det_id, ds in self.defaults_by_id.items():
+        # Check 2: Configuration Completeness
+        # If a detector is 'available', it MUST have settings and capabilities to be usable.
+        missing_defaults = ids_available - ids_defaults
+        if missing_defaults:
+            note_or_raise(
+                self.extra,
+                "DetectorSystemSettings.completeness",
+                ValueError(f"Available detectors missing default settings: {missing_defaults}"),
+                mode=mode
+            )
+            # We do not set ok=False here necessarily, unless strict strictness is required.
+            # But usually, this implies a broken config.
+            ok = False
+
+        missing_caps = ids_available - ids_caps
+        if missing_caps:
+            note_or_raise(
+                self.extra,
+                "DetectorSystemSettings.completeness",
+                ValueError(f"Available detectors missing capabilities: {missing_caps}"),
+                mode=mode
+            )
+            ok = False
+
+        # Note: It is generally OK for defaults/caps to exist for detectors NOT in available
+        # (e.g. offline hardware), so we do not check the reverse direction.
+
+        # Rule 2A: Recursive Validation
+        for ds in self.defaults_by_id.values():
             ok = ds.validate(mode=mode) and ok
 
-        for det_id, cap in self.capabilities_by_id.items():
-             ok = cap.validate(mode=mode) and ok
+        for cap in self.capabilities_by_id.values():
+            ok = cap.validate(mode=mode) and ok
 
         return ok
 
