@@ -1035,7 +1035,6 @@ class Point:
     def to_list(self) -> list:
         return [self.x, self.y, self.z]
 
-
 @dataclass
 class ROI:
     """
@@ -1692,6 +1691,9 @@ class BeamSettings:
             extra=extra, _mode=mode
         )
 
+# Alias for semantic clarity in Read-Only contexts
+BeamState = BeamSettings
+
 @dataclass
 class BeamSystemSettings:
     """
@@ -1974,6 +1976,9 @@ class DetectorSettings:
             digital_rotation_deg=d.get("digital_rotation_deg"),
             extra=extra, _mode=mode
         )
+
+# Alias for semantic clarity in Read-Only contexts
+DetectorState = DetectorSettings
 
 @dataclass
 class DetectorCapabilities:
@@ -2500,9 +2505,9 @@ class MicroscopeState:
     timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).timestamp())
     mode: Optional[str] = None
     stage_position: StagePosition = field(default_factory=StagePosition)
-    beam: BeamSettings = field(default_factory=BeamSettings)
+    beam: BeamState = field(default_factory=BeamState)
     apertures: Dict[str, Aperture] = field(default_factory=dict)
-    detectors: Dict[str, DetectorSettings] = field(default_factory=dict)
+    detectors: Dict[str, DetectorState] = field(default_factory=dict)
     active_detector_ids: List[str] = field(default_factory=list)
     primary_detector_id: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
@@ -2518,7 +2523,7 @@ class MicroscopeState:
         self.timestamp = str(self.timestamp)
         self.mode = parse_optional_str_like(self.mode, name="MicroscopeState.mode", strict=strict, extra=self.extra)
         self.stage_position = maybe_from_dict(StagePosition, self.stage_position, mode=mode) or StagePosition()
-        self.beam = maybe_from_dict(BeamSettings, self.beam, mode=mode) or BeamSettings()
+        self.beam = maybe_from_dict(BeamState, self.beam, mode=mode) or BeamState()
 
         self.apertures = _normalize_keyed_map(
             target_cls=Aperture,
@@ -2530,7 +2535,7 @@ class MicroscopeState:
         )
 
         self.detectors = _normalize_keyed_map(
-            target_cls=DetectorSettings,
+            target_cls=DetectorState,
             raw_map=self.detectors,
             id_field="detector_id",
             owner_name="MicroscopeState.detectors",
