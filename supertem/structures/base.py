@@ -846,6 +846,10 @@ def maybe_from_dict(
         note_or_raise(extra, key or f"{getattr(cls, '__name__', 'object')}", e, mode=mode, raw=raw)
         return None
 
+# =============================================================================
+# Helpers
+# =============================================================================
+
 
 def _jsonable(obj: Any) -> Any:
     """Recursively convert object to JSON-safe primitives (dicts/lists/floats)."""
@@ -891,6 +895,67 @@ def _setup_init(obj: Any, mode_input: Any, owner_name: str) -> Tuple[ParseMode, 
     extra = normalize_extra(obj.extra) if strict else normalize_extra_lenient(obj.extra, owner_name)
     return mode, strict, extra
 
+def _setup_validate(obj_mode: Any, override_mode: Any) -> Tuple[ParseMode, bool]:
+    """
+    Standardizes the start of validation methods.
+    Returns: (effective_mode, is_strict_flag)
+    """
+    mode = as_parse_mode(obj_mode if override_mode is None else override_mode)
+    return mode, is_strict(mode)
+
+def _finish_to_dict(payload: Dict[str, Any], extra: Any) -> Dict[str, Any]:
+    """Standardizes the final steps of serialization: extras injection and cleanup."""
+    add_extra_if_any(payload, extra)
+    return _jsonable(drop_none_keys(payload))
+
+
+def _normalize_keyed_map(
+        target_cls: Type[T],
+        raw_map: Optional[Dict[str, Any]],
+        id_field: str,
+        owner_name: str,
+        mode: ParseMode,
+        extra: Extras
+) -> Dict[str, T]:
+    """Generic normalizer for dicts of objects (e.g. apertures, detectors)."""
+    out: Dict[str, T] = {}
+    if not raw_map:
+        return out
+
+    strict = is_strict(mode)
+
+    for k, v in raw_map.items():
+        # 1. Validate the key
+        key_norm = parse_optional_id_like(k, name=f"{owner_name}.key", strict=strict, extra=extra)
+        if key_norm is None:
+            if extra:
+                extra.notes[f"{owner_name}.{k}_raw_key"] = "Invalid ID Key"
+            continue
+
+        # 2. Parse the object
+        obj = maybe_from_dict(target_cls, v, mode=mode)
+        if obj is None:
+            # Instantiate default if parsing failed or v was None
+            obj = target_cls(_mode=mode)  # type: ignore
+
+        # 3. Reconcile Map Key vs Internal ID
+        internal_id = getattr(obj, id_field, None)
+
+        if internal_id is None:
+            setattr(obj, id_field, key_norm)
+        elif internal_id != key_norm:
+            note_or_raise(
+                extra,
+                f"{owner_name}.{key_norm}.id_mismatch",
+                ValueError(f"Key '{key_norm}' != internal id '{internal_id}'"),
+                mode=mode
+            )
+            # Trust the map key in lenient mode
+            setattr(obj, id_field, key_norm)
+
+        out[key_norm] = obj
+
+    return out
 
 # =============================================================================
 # Structures (Dataclasses)
@@ -1005,8 +1070,7 @@ class ROI:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         # VALIDATION: Semantic bounds check and Healing.
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         is_valid = True
 
         # Rule 1: Origin must be non-negative
@@ -1037,8 +1101,7 @@ class ROI:
 
     def to_dict(self) -> dict:
         d: Dict[str, Any] = {"x": self.x, "y": self.y, "width": self.width, "height": self.height}
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ROI":
@@ -1150,8 +1213,7 @@ class StagePosition:
             "tilt_y_deg": serialize_quantity(self.tilt_y, "degree"),
             "coordinate_system": self.coordinate_system,
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> 'StagePosition':
@@ -1314,8 +1376,7 @@ class StageSystemSettings:
         VALIDATION: Integrity of Meaning (Self-Consistency).
         Checks if the configuration itself is logical and complete.
         """
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         # 1. Logical Range Checks (Min <= Max)
@@ -1461,8 +1522,7 @@ class StageSystemSettings:
             "settle_time_s": self.settle_time_s,
             "timeout_s": self.timeout_s
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageSystemSettings":
@@ -1535,8 +1595,7 @@ class BeamSettings:
                                            mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         if self.stigmation: ok = self.stigmation.validate(mode=mode) and ok
@@ -1579,8 +1638,7 @@ class BeamSettings:
             "beam_shift": self.beam_shift.to_dict() if self.beam_shift else None,
             "image_shift": self.image_shift.to_dict() if self.image_shift else None,
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSettings":
@@ -1656,8 +1714,7 @@ class BeamSystemSettings:
         self.spot_size_limits = parse_optional_pair_int_like(self.spot_size_limits, name="BeamSystemSettings.spot_size_limits", sort=False, strict=strict, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = self.default_beam.validate(mode=mode)
 
         def _check(rng, name):
@@ -1730,8 +1787,7 @@ class BeamSystemSettings:
             "spot_size_limits": self.spot_size_limits,
             "convergence_angle_limits_mrad": _s_lim(self.convergence_angle_limits, "mrad"),
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSystemSettings":
@@ -1813,8 +1869,7 @@ class DetectorSettings:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         # VALIDATION: Semantic logic
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         if self.exposure is not None:
@@ -1867,8 +1922,7 @@ class DetectorSettings:
             "digital_rotation_deg": self.digital_rotation_deg,
             "roi": self.roi.to_dict() if self.roi else None,
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSettings":
@@ -2035,8 +2089,7 @@ class DetectorCapabilities:
             if f.name == "extra": continue
             v = getattr(self, f.name)
             if v is not None: d[f.name] = v
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "DetectorCapabilities":
@@ -2155,8 +2208,7 @@ class DetectorSystemSettings:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         """Validate detector-system semantics and cross-field consistency."""
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         # Rule 2B: Cross-Field Consistency
@@ -2234,8 +2286,7 @@ class DetectorSystemSettings:
             "defaults_by_id": {k: v.to_dict() for k, v in self.defaults_by_id.items()},
             "capabilities_by_id": {k: v.to_dict() for k, v in self.capabilities_by_id.items()},
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSystemSettings":
@@ -2276,8 +2327,7 @@ class ImageOutputSettings:
         self.path = parse_optional_str_like(self.path, name="ImageOutputSettings.path", strict=strict, extra=self.extra)
 
     def validate(self, *, mode=None):
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
 
         if self.file_format not in {"tiff", "tif", "png", "jpg", "jpeg", "bmp"}:
             note_or_raise(self.extra, "ImageOutputSettings.file_format", ValueError(f"Unsupported format: {self.file_format}"), mode=mode)
@@ -2288,8 +2338,7 @@ class ImageOutputSettings:
 
     def to_dict(self):
         d = {"file_format": self.file_format, "path": self.path}
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d, *, mode=ParseMode.STRICT):
@@ -2343,8 +2392,7 @@ class AcquisitionRequest:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         # VALIDATION: Consistency & Readiness
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         # Rule 1: Must have an ID to execute
@@ -2373,8 +2421,7 @@ class AcquisitionRequest:
             "detector": self.detector.to_dict(),
             "image": self.image.to_dict(),
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
@@ -2406,8 +2453,7 @@ class Aperture:
         self.position = maybe_from_dict(Point, self.position, extra=self.extra, key="Aperture.position", mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         if self.size_index is not None and self.size_index < 0:
@@ -2435,8 +2481,7 @@ class Aperture:
             "size_index": self.size_index,
             "position": self.position.to_dict() if self.position else None
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Aperture":
@@ -2495,49 +2540,23 @@ class MicroscopeState:
         self.stage_position = maybe_from_dict(StagePosition, self.stage_position, mode=mode) or StagePosition()
         self.beam = maybe_from_dict(BeamSettings, self.beam, mode=mode) or BeamSettings()
 
-        raw_aps = self.apertures or {}
-        self.apertures = {}
-        for k, v in raw_aps.items():
-            ap_key = parse_optional_id_like(k, name="MicroscopeState.apertures.key", strict=strict, extra=self.extra)
-            if ap_key is None:
-                if self.extra:
-                    self.extra.notes[f"MicroscopeState.apertures.{k}_raw_key"] = "Invalid ID"
-                continue
+        self.apertures = _normalize_keyed_map(
+            target_cls=Aperture,
+            raw_map=self.apertures,
+            id_field="aperture_id",
+            owner_name="MicroscopeState.apertures",
+            mode=mode,
+            extra=self.extra
+        )
 
-            ap_obj = maybe_from_dict(Aperture, v, mode=mode)
-            if ap_obj is None:
-                ap_obj = Aperture(_mode=mode)
-
-            if ap_obj.aperture_id is None:
-                ap_obj.aperture_id = ap_key
-            elif ap_obj.aperture_id != ap_key:
-                note_or_raise(self.extra, f"MicroscopeState.apertures.{ap_key}.id_mismatch",
-                              ValueError(f"Aperture key '{ap_key}' != internal id '{ap_obj.aperture_id}'"), mode=mode)
-                ap_obj.aperture_id = ap_key
-
-            self.apertures[ap_key] = ap_obj
-
-        raw_dets = self.detectors or {}
-        self.detectors = {}
-        for k, v in raw_dets.items():
-            det_key = parse_optional_id_like(k, name="MicroscopeState.detectors.key", strict=strict, extra=self.extra)
-            if det_key is None:
-                if self.extra:
-                    self.extra.notes[f"MicroscopeState.detectors.{k}_raw_key"] = "Invalid ID"
-                continue
-
-            det_obj = maybe_from_dict(DetectorSettings, v, mode=mode)
-            if det_obj is None:
-                det_obj = DetectorSettings(_mode=mode)
-
-            if det_obj.detector_id is None:
-                det_obj.detector_id = det_key
-            elif det_obj.detector_id != det_key:
-                note_or_raise(self.extra, f"MicroscopeState.detectors.{det_key}.id_mismatch",
-                              ValueError(f"Detector key '{det_key}' != internal id '{det_obj.detector_id}'"), mode=mode)
-                det_obj.detector_id = det_key
-
-            self.detectors[det_key] = det_obj
+        self.detectors = _normalize_keyed_map(
+            target_cls=DetectorSettings,
+            raw_map=self.detectors,
+            id_field="detector_id",
+            owner_name="MicroscopeState.detectors",
+            mode=mode,
+            extra=self.extra
+        )
 
         raw_ids = self.active_detector_ids or []
         self.active_detector_ids = []
@@ -2552,8 +2571,7 @@ class MicroscopeState:
                                                           extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         ok = self.stage_position.validate(mode=mode) and ok
@@ -2590,8 +2608,7 @@ class MicroscopeState:
             "active_detector_ids": self.active_detector_ids,
             "primary_detector_id": self.primary_detector_id
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeState":
@@ -2647,8 +2664,7 @@ class MicroscopeImageMetadata:
                                                           extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
         if self.microscope_state:
@@ -2681,8 +2697,7 @@ class MicroscopeImageMetadata:
             "exposure_ms": self.exposure_ms,
             "microscope_state": self.microscope_state.to_dict() if self.microscope_state else None
         }
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeImageMetadata":
@@ -2877,8 +2892,7 @@ class SystemInfo:
              setattr(self, f.name, parse_optional_str_like(v, name=f"SystemInfo.{f.name}", strict=strict, extra=self.extra) or "Unknown")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode = as_parse_mode(self._mode if mode is None else mode)
-        strict = is_strict(mode)
+        mode, strict = _setup_validate(self._mode, mode)
 
         ip = self.ip_address.strip()
         if ip and ip != "Unknown":
@@ -2893,8 +2907,7 @@ class SystemInfo:
 
     def to_dict(self) -> dict:
         d = {f.name: getattr(self, f.name) for f in fields(SystemInfo) if f.name not in ("extra", "_mode")}
-        add_extra_if_any(d, self.extra)
-        return _jsonable(drop_none_keys(d))
+        return _finish_to_dict(d, self.extra)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemInfo":
