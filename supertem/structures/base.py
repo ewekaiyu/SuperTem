@@ -1099,10 +1099,6 @@ class StagePosition:
 
         def check_axis(q: Any, field_name: str) -> bool:
             if q is None: return True
-            if not isinstance(q, Quantity):
-                 # Structural defensive check
-                 note_or_raise(self.extra, field_name, TypeError(f"{field_name} is not a valid Quantity"), mode=mode)
-                 return False
             try:
                 mag = float(q.magnitude)
                 if not math.isfinite(mag):
@@ -1433,6 +1429,9 @@ class BeamSettings:
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode = as_parse_mode(self._mode if mode is None else mode)
         ok = True
+        if self.stigmation: ok = self.stigmation.validate(mode=mode) and ok
+        if self.beam_shift: ok = self.beam_shift.validate(mode=mode) and ok
+        if self.image_shift: ok = self.image_shift.validate(mode=mode) and ok
         if self.voltage is not None and self.voltage.magnitude <= 0:
             note_or_raise(self.extra, "BeamSettings.voltage", ValueError("Voltage must be > 0"), mode=mode)
             ok = False
@@ -1547,15 +1546,10 @@ class BeamSystemSettings:
                         except Exception: pass
                     return False
 
-                # Non-negative check
-                if isinstance(mn, Quantity) and mn.magnitude < 0:
+                if mn.magnitude < 0:
                     note_or_raise(self.extra, f"BeamSystemSettings.{name}",
                                   ValueError(f"{name} invalid: min < 0"), mode=mode)
                     return False
-                if isinstance(mn, (int, float)) and mn < 0:
-                     note_or_raise(self.extra, f"BeamSystemSettings.{name}",
-                                  ValueError(f"{name} invalid: min < 0"), mode=mode)
-                     return False
             return True
 
         ok = _check(self.voltage_limits, "voltage_limits") and ok
@@ -2055,16 +2049,6 @@ class DetectorSystemSettings:
                     self.default_detector_id = None
 
         for det_id, ds in self.defaults_by_id.items():
-            if not isinstance(ds, DetectorSettings):
-                note_or_raise(
-                    self.extra,
-                    f"DetectorSystemSettings.defaults_by_id.{det_id}",
-                    TypeError(f"defaults_by_id['{det_id}'] must be DetectorSettings, got {type(ds)}"),
-                    mode=mode,
-                    raw=deepcopy(ds),
-                )
-                ok = False
-                continue
             ok = ds.validate(mode=mode) and ok
 
         for det_id, cap in self.capabilities_by_id.items():
