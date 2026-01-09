@@ -74,42 +74,71 @@ ParseMode.STRICT (control-plane default)
     - objects leaving STRICT validation are safe to execute
 
 ===============================================================================
-III. Normalization vs Validation (Separation of Concerns)
+III. The Normalization vs. Validation Rulebook
 ===============================================================================
 
-Normalization (parse step)
-  Purpose:
-    Convert untrusted input into a typed internal structure without discarding
-    information.
+To maintain safety without sacrificing robustness, this module enforces a strict
+separation of concerns between `__post_init__` and `validate()`.
 
-  Typical operations:
-    - dict -> dataclass conversion for nested fields
-    - scalar coercion where appropriate (e.g., "128" -> 128)
-    - Extras normalization and unknown-key capture
-    - move rejected values into Extras.raw and record diagnostics in Extras.notes
+1. Normalization (__post_init__)
+-------------------------------------------------------------------------------
+   GOAL:    Integrity of Structure (Type & Shape Safety)
+   INPUT:   "Dirty" data (Strings, Nones, Dicts, Missing Keys)
+   OUTPUT:  "Clean" data (Correct Python Types, Structurally Complete)
 
-  Policy:
-    - __post_init__ performs normalization only
-    - normalization should not enforce domain/physics constraints as business rules
+   Rules:
+   A. Coercion is Normalization.
+      Convert inputs to their target types.
+      (e.g., "128" -> 128, "10 nm" -> Quantity(10, 'nm'))
 
-Validation (semantic step)
-  Purpose:
-    Enforce domain constraints and invariants.
+   B. Structural Defaults are Normalization.
+      If a field is `None` but the system requires a value to function (to avoid
+      AttributeError/TypeError later), set a safe default here.
+      (e.g., `width=None` -> `width=512`)
 
-  Typical checks:
-    - range / non-negativity constraints
-    - required fields for executable requests
-    - cross-field consistency
-    - capability-limited bounds when available
+   C. Structural Patching is Normalization.
+      If a required value exists elsewhere in the object graph (e.g., copying
+      an ID from an inner object to a missing outer field), perform the copy
+      here to complete the structure.
 
-  Policy:
-    - validate(mode=...) is the single authoritative place for semantic constraints
-    - STRICT: raise via note_or_raise(...)
-    - LENIENT: record issue and repair-to-safe / disable unsafe fields
+   D. DO NOT Check Logic.
+      Do not check if a number is positive, finite, or consistent with other
+      fields. If the type is right, let it pass.
+      (e.g., `width=-100` is a valid integer. Leave it for validation.)
 
-Rule of thumb:
-  - Wrong type/shape => normalization concern
-  - Right type but invalid/unsafe value => validation concern
+2. Validation (validate)
+-------------------------------------------------------------------------------
+   GOAL:    Integrity of Meaning (Domain Safety & Logic)
+   INPUT:   "Clean" data (guaranteed types from step 1)
+   OUTPUT:  Boolean success flag (and populated Extras.notes)
+
+   Rules:
+   A. Domain Constraints are Validation.
+      Check physical and logical bounds.
+      (e.g., `width > 0`, `voltage < max_limit`, `isfinite(position)`)
+
+   B. Cross-Field Consistency is Validation.
+      Check if two fields contradict each other.
+      (e.g., `outer_id != inner_id`)
+
+   C. Healing is Validation (Lenient Mode Only).
+      If a value is structurally sound (correct type) but logically invalid
+      (e.g., `width=-50`):
+        - STRICT Mode: Raise an Exception.
+        - LENIENT Mode: "Heal" it to a safe value or disable the feature.
+
+   Summary Table:
+   +---------------------+-----------------------+------------------+
+   | Scenario            | Action                | Responsibility   |
+   +=====================+=======================+==================+
+   | Input is None       | Set Default (512)     | __post_init__    |
+   | Input is "128"      | Convert (int)         | __post_init__    |
+   | Missing Outer ID    | Copy Inner ID         | __post_init__    |
+   +---------------------+-----------------------+------------------+
+   | Input is -100       | Check > 0             | validate()       |
+   | Input is NaN        | Check isfinite()      | validate()       |
+   | ID Mismatch         | Check A == B          | validate()       |
+   +---------------------+-----------------------+------------------+
 
 ===============================================================================
 IV. Extras: Preservation and Diagnostics
@@ -924,7 +953,6 @@ class Point:
             return 0.0
         return float(out)
 
-
 @dataclass
 class ROI:
     """
@@ -1353,7 +1381,6 @@ class StageSystemSettings:
             extra=collect_extra(d, (), owner="StageSystemSettings"),
             _mode=mode
         )
-
 
 @dataclass
 class BeamSettings:
@@ -2523,7 +2550,6 @@ class MicroscopeImageMetadata:
             microscope_state=d.get("microscope_state"),
             extra=extra, _mode=mode
         )
-
 
 class MicroscopeImage:
     """
