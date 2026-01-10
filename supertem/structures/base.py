@@ -863,6 +863,45 @@ def _finish_to_dict(payload: Dict[str, Any], extra: Any) -> Dict[str, Any]:
     return _jsonable(drop_none_keys(payload))
 
 
+def _setup_from_dict(
+        cls: Type[T],
+        data: Any,
+        mode: Union[ParseMode, str, None],
+        known_keys: Iterable[str] = (),
+        aliases: Iterable[str] = ()
+) -> Tuple[Optional[Dict[str, Any]], ParseMode, Optional[Extras]]:
+    """
+    Standardizes the ingestion preamble: mode normalization, identity checks,
+    type validation, and extras harvesting.
+
+    Returns:
+        (clean_dict, mode, extra)
+        If clean_dict is None, the data was already a valid instance; caller should return it.
+    """
+    mode = as_parse_mode(mode)
+
+    # 1. Identity Check
+    if isinstance(data, cls):
+        return None, mode, None  # Signal: Identity match, just update mode
+
+    # 2. Type Check & Recovery
+    if not isinstance(data, dict):
+        if is_strict(mode):
+            raise TypeError(f"{cls.__name__} expects dict, got {type(data).__name__}")
+
+        # Lenient: Return empty containers
+        ex = Extras()
+        if data is not None:
+            _extra_put_raw(ex, "source_type_error", data)
+            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(data).__name__}"}
+        return {}, mode, ex
+
+    # 3. Harvest Extras
+    combined_keys = tuple(known_keys) + tuple(aliases)
+    extra = collect_extra(data, combined_keys, owner=cls.__name__)
+
+    return data, mode, extra
+
 # =============================================================================
 # Structures (Dataclasses)
 # =============================================================================
@@ -915,13 +954,18 @@ class Point:
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Point":
         mode = as_parse_mode(mode)
         if isinstance(d, Point): return replace(d, _mode=mode)
-        if isinstance(d, dict):
-            return Point(x=d.get("x"), y=d.get("y"), z=d.get("z"), name=d.get("name"), _mode=mode)
+
+        # Unique Tuple Support
         if isinstance(d, (list, tuple)) and len(d) in (2, 3):
             return Point(x=d[0], y=d[1], z=d[2] if len(d) == 3 else 0.0, _mode=mode)
-        return Point(_mode=mode)
 
-    def to_list(self) -> list: return [self.x, self.y, self.z]
+        # Standard Dict Lifecycle (Inline optimized for lightweight class)
+        if not isinstance(d, dict):
+            if is_strict(mode) and d is not None:
+                raise TypeError(f"Point expects dict, got {type(d).__name__}")
+            return Point(_mode=mode)
+
+        return Point(x=d.get("x"), y=d.get("y"), z=d.get("z"), name=d.get("name"), _mode=mode)
 
 @dataclass
 class ROI:
@@ -974,30 +1018,23 @@ class ROI:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ROI":
-        mode = as_parse_mode(mode)
-        if isinstance(d, ROI): return replace(d, _mode=mode)
-
-        # 1. Type Check & Recovery
-        ex = Extras() if is_strict(mode) else normalize_extra_lenient(None, "ROI")
-        if d is None:
-            return ROI(extra=ex, _mode=mode)
-
         if isinstance(d, (list, tuple)) and len(d) == 4:
-            return ROI(x=d[0], y=d[1], width=d[2], height=d[3], extra=ex, _mode=mode)
+            m = as_parse_mode(mode)
+            ex = Extras() if is_strict(m) else normalize_extra_lenient(None, "ROI")
+            return ROI(x=d[0], y=d[1], width=d[2], height=d[3], extra=ex, _mode=m)
 
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"ROI expects dict/list/tuple, got {type(d).__name__}")
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return ROI(extra=ex, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            ROI, d, mode,
+            known_keys=("x", "y", "width", "height", "extra"),
+            aliases=("w", "h")
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 2. Parse
-        ex = collect_extra(d, ("x", "y", "width", "height", "w", "h"), owner="ROI")
         return ROI(
-            x=d.get("x"), y=d.get("y"),
-            width=d.get("width", d.get("w")),
-            height=d.get("height", d.get("h")),
-            extra=ex, _mode=mode,
+            x=d_dict.get("x"), y=d_dict.get("y"),
+            width=d_dict.get("width", d_dict.get("w")),
+            height=d_dict.get("height", d_dict.get("h")),
+            extra=extra, _mode=mode,
         )
 
 @dataclass
@@ -1065,28 +1102,23 @@ class StagePosition:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> 'StagePosition':
-        mode = as_parse_mode(mode)
-        if isinstance(d, StagePosition): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            StagePosition, d, mode,
+            known_keys=("name", "x", "y", "z", "r", "tilt_x", "tilt_y", "coordinate_system", "extra"),
+            aliases=("x_nm", "y_nm", "z_nm", "r_deg", "tilt_x_deg", "tilt_y_deg")
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"StagePosition expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return StagePosition(extra=ex, _mode=mode)
-
-        ex = collect_extra(d, ("name", "x", "y", "z", "r", "tilt_x", "tilt_y", "x_nm", "y_nm", "z_nm", "r_deg", "tilt_x_deg", "tilt_y_deg", "coordinate_system", "extra"), owner="StagePosition")
         return StagePosition(
-            name=d.get("name"),
-            x=d.get("x", d.get("x_nm")),
-            y=d.get("y", d.get("y_nm")),
-            z=d.get("z", d.get("z_nm")),
-            r=d.get("r", d.get("r_deg")),
-            tilt_x=d.get("tilt_x", d.get("tilt_x_deg")),
-            tilt_y=d.get("tilt_y", d.get("tilt_y_deg")),
-            coordinate_system=d.get("coordinate_system"),
-            extra=ex, _mode=mode,
+            name=d_dict.get("name"),
+            x=d_dict.get("x", d_dict.get("x_nm")),
+            y=d_dict.get("y", d_dict.get("y_nm")),
+            z=d_dict.get("z", d_dict.get("z_nm")),
+            r=d_dict.get("r", d_dict.get("r_deg")),
+            tilt_x=d_dict.get("tilt_x", d_dict.get("tilt_x_deg")),
+            tilt_y=d_dict.get("tilt_y", d_dict.get("tilt_y_deg")),
+            coordinate_system=d_dict.get("coordinate_system"),
+            extra=extra, _mode=mode,
         )
 
     def __add__(self, other: 'StagePosition') -> 'StagePosition':
@@ -1330,33 +1362,33 @@ class StageSystemSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageSystemSettings":
-        mode = as_parse_mode(mode)
-        if isinstance(d, StageSystemSettings): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            StageSystemSettings, d, mode,
+            known_keys=("enabled", "can_x", "can_y", "can_z", "can_r", "can_tilt_x", "can_tilt_y",
+                        "x_limits", "y_limits", "z_limits", "r_limits", "tilt_x_limits", "tilt_y_limits",
+                        "max_step_distance", "max_step_angle", "eucentric_z", "settle_time", "timeout", "extra"),
+            aliases=("x_limits_nm", "y_limits_nm", "z_limits_nm", "r_limits_deg", "tilt_x_limits_deg",
+                     "tilt_y_limits_deg",
+                     "max_step_nm", "max_step_deg", "eucentric_z_nm", "settle_time_s", "timeout_s")
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"StageSystemSettings expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return StageSystemSettings(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="StageSystemSettings")
         return StageSystemSettings(
-            enabled=d.get("enabled", True),
-            can_x=d.get("can_x", True), can_y=d.get("can_y", True), can_z=d.get("can_z", True),
-            can_r=d.get("can_r", False), can_tilt_x=d.get("can_tilt_x", False), can_tilt_y=d.get("can_tilt_y", False),
-            x_limits=d.get("x_limits", d.get("x_limits_nm")),
-            y_limits=d.get("y_limits", d.get("y_limits_nm")),
-            z_limits=d.get("z_limits", d.get("z_limits_nm")),
-            r_limits=d.get("r_limits", d.get("r_limits_deg")),
-            tilt_x_limits=d.get("tilt_x_limits", d.get("tilt_x_limits_deg")),
-            tilt_y_limits=d.get("tilt_y_limits", d.get("tilt_y_limits_deg")),
-            max_step_distance=d.get("max_step_distance", d.get("max_step_nm")),
-            max_step_angle=d.get("max_step_angle", d.get("max_step_deg")),
-            eucentric_z=d.get("eucentric_z", d.get("eucentric_z_nm")),
-            settle_time=d.get("settle_time", d.get("settle_time_s")),
-            timeout=d.get("timeout", d.get("timeout_s")),
+            enabled=d_dict.get("enabled", True),
+            can_x=d_dict.get("can_x", True), can_y=d_dict.get("can_y", True), can_z=d_dict.get("can_z", True),
+            can_r=d_dict.get("can_r", False), can_tilt_x=d_dict.get("can_tilt_x", False),
+            can_tilt_y=d_dict.get("can_tilt_y", False),
+            x_limits=d_dict.get("x_limits", d_dict.get("x_limits_nm")),
+            y_limits=d_dict.get("y_limits", d_dict.get("y_limits_nm")),
+            z_limits=d_dict.get("z_limits", d_dict.get("z_limits_nm")),
+            r_limits=d_dict.get("r_limits", d_dict.get("r_limits_deg")),
+            tilt_x_limits=d_dict.get("tilt_x_limits", d_dict.get("tilt_x_limits_deg")),
+            tilt_y_limits=d_dict.get("tilt_y_limits", d_dict.get("tilt_y_limits_deg")),
+            max_step_distance=d_dict.get("max_step_distance", d_dict.get("max_step_nm")),
+            max_step_angle=d_dict.get("max_step_angle", d_dict.get("max_step_deg")),
+            eucentric_z=d_dict.get("eucentric_z", d_dict.get("eucentric_z_nm")),
+            settle_time=d_dict.get("settle_time", d_dict.get("settle_time_s")),
+            timeout=d_dict.get("timeout", d_dict.get("timeout_s")),
             extra=extra, _mode=mode
         )
 
@@ -1436,26 +1468,23 @@ class BeamSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSettings":
-        mode = as_parse_mode(mode)
-        if isinstance(d, BeamSettings): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            BeamSettings, d, mode,
+            known_keys=("voltage", "beam_current", "spot_size", "convergence_angle", "defocus", "scan_rotation",
+                        "stigmation", "beam_shift", "image_shift", "extra"),
+            aliases=("voltage_kv", "beam_current_na", "convergence_angle_mrad", "defocus_nm", "scan_rotation_deg")
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"BeamSettings expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return BeamSettings(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, ("voltage_kv", "beam_current_na", "spot_size", "convergence_angle_mrad", "defocus_nm", "scan_rotation_deg", "stigmation", "beam_shift", "image_shift", "extra"), owner="BeamSettings")
         return BeamSettings(
-            voltage=d.get("voltage", d.get("voltage_kv")),
-            beam_current=d.get("beam_current", d.get("beam_current_na")),
-            spot_size=d.get("spot_size"),
-            convergence_angle=d.get("convergence_angle", d.get("convergence_angle_mrad")),
-            defocus=d.get("defocus", d.get("defocus_nm")),
-            scan_rotation=d.get("scan_rotation", d.get("scan_rotation_deg")),
-            stigmation=d.get("stigmation"), beam_shift=d.get("beam_shift"), image_shift=d.get("image_shift"),
+            voltage=d_dict.get("voltage", d_dict.get("voltage_kv")),
+            beam_current=d_dict.get("beam_current", d_dict.get("beam_current_na")),
+            spot_size=d_dict.get("spot_size"),
+            convergence_angle=d_dict.get("convergence_angle", d_dict.get("convergence_angle_mrad")),
+            defocus=d_dict.get("defocus", d_dict.get("defocus_nm")),
+            scan_rotation=d_dict.get("scan_rotation", d_dict.get("scan_rotation_deg")),
+            stigmation=d_dict.get("stigmation"), beam_shift=d_dict.get("beam_shift"),
+            image_shift=d_dict.get("image_shift"),
             extra=extra, _mode=mode
         )
 
@@ -1574,25 +1603,22 @@ class BeamSystemSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSystemSettings":
-        mode = as_parse_mode(mode)
-        if isinstance(d, BeamSystemSettings): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            BeamSystemSettings, d, mode,
+            known_keys=("enabled", "default_beam", "voltage_limits", "beam_current_limits",
+                        "spot_size_limits", "convergence_angle_limits", "extra"),
+            aliases=("voltage_limits_kv", "beam_current_limits_na", "convergence_angle_limits_mrad")
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"BeamSystemSettings expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return BeamSystemSettings(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="BeamSystemSettings")
         return BeamSystemSettings(
-            enabled=d.get("enabled", True),
-            default_beam=d.get("default_beam"),
-            voltage_limits=d.get("voltage_limits", d.get("voltage_limits_kv")),
-            beam_current_limits=d.get("beam_current_limits", d.get("beam_current_limits_na")),
-            spot_size_limits=d.get("spot_size_limits"),
-            convergence_angle_limits=d.get("convergence_angle_limits", d.get("convergence_angle_limits_mrad")),
+            enabled=d_dict.get("enabled", True),
+            default_beam=d_dict.get("default_beam"),
+            voltage_limits=d_dict.get("voltage_limits", d_dict.get("voltage_limits_kv")),
+            beam_current_limits=d_dict.get("beam_current_limits", d_dict.get("beam_current_limits_na")),
+            spot_size_limits=d_dict.get("spot_size_limits"),
+            convergence_angle_limits=d_dict.get("convergence_angle_limits",
+                                                d_dict.get("convergence_angle_limits_mrad")),
             extra=extra, _mode=mode
         )
 
@@ -1699,28 +1725,24 @@ class DetectorSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSettings":
-        mode = as_parse_mode(mode)
-        if isinstance(d, DetectorSettings): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            DetectorSettings, d, mode,
+            known_keys=("detector_id", "exposure", "binning_index", "binning_xy", "roi",
+                        "frame_integration", "gain_index", "offset_index", "digital_rotation_deg", "extra"),
+            aliases=("exposure_ms",)
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"DetectorSettings expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return DetectorSettings(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="DetectorSettings")
         return DetectorSettings(
-            detector_id=d.get("detector_id"),
-            exposure=d.get("exposure", d.get("exposure_ms")),
-            binning_index=d.get("binning_index"),
-            binning_xy=d.get("binning_xy"),
-            roi=d.get("roi"),
-            frame_integration=d.get("frame_integration"),
-            gain_index=d.get("gain_index"),
-            offset_index=d.get("offset_index"),
-            digital_rotation_deg=d.get("digital_rotation_deg"),
+            detector_id=d_dict.get("detector_id"),
+            exposure=d_dict.get("exposure", d_dict.get("exposure_ms")),
+            binning_index=d_dict.get("binning_index"),
+            binning_xy=d_dict.get("binning_xy"),
+            roi=d_dict.get("roi"),
+            frame_integration=d_dict.get("frame_integration"),
+            gain_index=d_dict.get("gain_index"),
+            offset_index=d_dict.get("offset_index"),
+            digital_rotation_deg=d_dict.get("digital_rotation_deg"),
             extra=extra, _mode=mode
         )
 
@@ -1889,38 +1911,38 @@ class DetectorCapabilities:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "DetectorCapabilities":
-        mode = as_parse_mode(mode)
-        if isinstance(d, DetectorCapabilities): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            DetectorCapabilities, d, mode,
+            known_keys=("can_binning", "binning_index_min", "binning_index_max", "binning_xy_min", "binning_xy_max",
+                        "exposure_ms_min", "exposure_ms_max", "frame_integration_min", "frame_integration_max",
+                        "roi_size_min", "roi_size_max", "can_gain", "gain_index_min", "gain_index_max",
+                        "can_offset", "offset_index_min", "offset_index_max",
+                        "can_digital_rotation", "digital_rotation_deg_min", "digital_rotation_deg_max", "extra"),
+            aliases=("roi_min", "roi_max")
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"DetectorCapabilities expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return DetectorCapabilities(extra=ex, _mode=mode)
-        extra = collect_extra(d, (), owner="DetectorCapabilities")
         return DetectorCapabilities(
-            can_binning=d.get("can_binning"),
-            binning_index_min=d.get("binning_index_min"),
-            binning_index_max=d.get("binning_index_max"),
-            binning_xy_min=d.get("binning_xy_min"),
-            binning_xy_max=d.get("binning_xy_max"),
-            exposure_ms_min=d.get("exposure_ms_min"),
-            exposure_ms_max=d.get("exposure_ms_max"),
-            frame_integration_min=d.get("frame_integration_min"),
-            frame_integration_max=d.get("frame_integration_max"),
-            roi_size_min=d.get("roi_size_min", d.get("roi_min")),
-            roi_size_max=d.get("roi_size_max", d.get("roi_max")),
-            can_gain=d.get("can_gain"),
-            gain_index_min=d.get("gain_index_min"),
-            gain_index_max=d.get("gain_index_max"),
-            can_offset=d.get("can_offset"),
-            offset_index_min=d.get("offset_index_min"),
-            offset_index_max=d.get("offset_index_max"),
-            can_digital_rotation=d.get("can_digital_rotation"),
-            digital_rotation_deg_min=d.get("digital_rotation_deg_min"),
-            digital_rotation_deg_max=d.get("digital_rotation_deg_max"),
+            can_binning=d_dict.get("can_binning"),
+            binning_index_min=d_dict.get("binning_index_min"),
+            binning_index_max=d_dict.get("binning_index_max"),
+            binning_xy_min=d_dict.get("binning_xy_min"),
+            binning_xy_max=d_dict.get("binning_xy_max"),
+            exposure_ms_min=d_dict.get("exposure_ms_min"),
+            exposure_ms_max=d_dict.get("exposure_ms_max"),
+            frame_integration_min=d_dict.get("frame_integration_min"),
+            frame_integration_max=d_dict.get("frame_integration_max"),
+            roi_size_min=d_dict.get("roi_size_min", d_dict.get("roi_min")),
+            roi_size_max=d_dict.get("roi_size_max", d_dict.get("roi_max")),
+            can_gain=d_dict.get("can_gain"),
+            gain_index_min=d_dict.get("gain_index_min"),
+            gain_index_max=d_dict.get("gain_index_max"),
+            can_offset=d_dict.get("can_offset"),
+            offset_index_min=d_dict.get("offset_index_min"),
+            offset_index_max=d_dict.get("offset_index_max"),
+            can_digital_rotation=d_dict.get("can_digital_rotation"),
+            digital_rotation_deg_min=d_dict.get("digital_rotation_deg_min"),
+            digital_rotation_deg_max=d_dict.get("digital_rotation_deg_max"),
             extra=extra, _mode=mode
         )
 
@@ -2039,24 +2061,20 @@ class DetectorSystemSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSystemSettings":
-        mode = as_parse_mode(mode)
-        if isinstance(d, DetectorSystemSettings): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            DetectorSystemSettings, d, mode,
+            known_keys=("enabled", "default_detector_id", "available_detector_ids", "defaults_by_id",
+                        "capabilities_by_id", "extra"),
+            aliases=("available_detectors",)
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"DetectorSystemSettings expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return DetectorSystemSettings(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="DetectorSystemSettings")
         return DetectorSystemSettings(
-            enabled=d.get("enabled", True),
-            available_detector_ids=d.get("available_detector_ids", d.get("available_detectors", [])),
-            default_detector_id=d.get("default_detector_id"),
-            defaults_by_id=d.get("defaults_by_id"),
-            capabilities_by_id=d.get("capabilities_by_id"),
+            enabled=d_dict.get("enabled", True),
+            available_detector_ids=d_dict.get("available_detector_ids", d_dict.get("available_detectors", [])),
+            default_detector_id=d_dict.get("default_detector_id"),
+            defaults_by_id=d_dict.get("defaults_by_id"),
+            capabilities_by_id=d_dict.get("capabilities_by_id"),
             extra=extra, _mode=mode
         )
 
@@ -2098,21 +2116,17 @@ class ImageOutputSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ImageOutputSettings":
-        mode = as_parse_mode(mode)
-        if isinstance(d, ImageOutputSettings): return replace(d, _mode=mode)
-
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"ImageOutputSettings expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return ImageOutputSettings(extra=ex, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            ImageOutputSettings, d, mode,
+            known_keys=("file_format", "path", "extra"),
+            aliases=()
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
         return ImageOutputSettings(
-            file_format=d.get("file_format", "tiff"),
-            path=d.get("path"),
-            extra=collect_extra(d, (), owner="ImageOutputSettings"), _mode=mode
+            file_format=d_dict.get("file_format", "tiff"),
+            path=d_dict.get("path"),
+            extra=extra, _mode=mode
         )
 
 @dataclass
@@ -2170,23 +2184,18 @@ class Aperture:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Aperture":
-        mode = as_parse_mode(mode)
-        if isinstance(d, Aperture): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            Aperture, d, mode,
+            known_keys=("aperture_id", "inserted", "size_index", "position", "extra"),
+            aliases=("id",)
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"Aperture expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return Aperture(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="Aperture")
         return Aperture(
-            aperture_id=d.get("aperture_id", d.get("id")),
-            inserted=d.get("inserted", False),
-            size_index=d.get("size_index"),
-            position=d.get("position"),
+            aperture_id=d_dict.get("aperture_id", d_dict.get("id")),
+            inserted=d_dict.get("inserted", False),
+            size_index=d_dict.get("size_index"),
+            position=d_dict.get("position"),
             extra=extra, _mode=mode
         )
 
@@ -2281,23 +2290,20 @@ class MicroscopeState:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeState":
-        mode = as_parse_mode(mode)
-        if isinstance(d, MicroscopeState): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            MicroscopeState, d, mode,
+            known_keys=("timestamp", "mode", "stage_position", "beam", "apertures", "detectors",
+                        "active_detector_ids", "primary_detector_id", "extra"),
+            aliases=()
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"MicroscopeState expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return MicroscopeState(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="MicroscopeState")
         return MicroscopeState(
-            timestamp=d.get("timestamp"), mode=d.get("mode"),
-            stage_position=d.get("stage_position"), beam=d.get("beam"),
-            apertures=d.get("apertures"), detectors=d.get("detectors"),
-            active_detector_ids=d.get("active_detector_ids"), primary_detector_id=d.get("primary_detector_id"),
+            timestamp=d_dict.get("timestamp"), mode=d_dict.get("mode"),
+            stage_position=d_dict.get("stage_position"), beam=d_dict.get("beam"),
+            apertures=d_dict.get("apertures"), detectors=d_dict.get("detectors"),
+            active_detector_ids=d_dict.get("active_detector_ids"),
+            primary_detector_id=d_dict.get("primary_detector_id"),
             extra=extra, _mode=mode
         )
 
@@ -2367,24 +2373,21 @@ class MicroscopeImageMetadata:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeImageMetadata":
-        mode = as_parse_mode(mode)
-        if isinstance(d, MicroscopeImageMetadata): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            MicroscopeImageMetadata, d, mode,
+            known_keys=("version", "created_at", "magnification", "camera_length_mm", "pixel_size_nm", "image_size_px",
+                        "accelerating_voltage_kv", "beam_current_na", "exposure_ms", "microscope_state", "extra"),
+            aliases=()
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"MicroscopeImageMetadata expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return MicroscopeImageMetadata(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="MicroscopeImageMetadata")
         return MicroscopeImageMetadata(
-            version=d.get("version", str(METADATA_VERSION)), created_at=d.get("created_at"),
-            magnification=d.get("magnification"), camera_length_mm=d.get("camera_length_mm"),
-            pixel_size_nm=d.get("pixel_size_nm"), image_size_px=d.get("image_size_px"),
-            accelerating_voltage_kv=d.get("accelerating_voltage_kv"), beam_current_na=d.get("beam_current_na"),
-            exposure_ms=d.get("exposure_ms"), microscope_state=d.get("microscope_state"),
+            version=d_dict.get("version", str(METADATA_VERSION)), created_at=d_dict.get("created_at"),
+            magnification=d_dict.get("magnification"), camera_length_mm=d_dict.get("camera_length_mm"),
+            pixel_size_nm=d_dict.get("pixel_size_nm"), image_size_px=d_dict.get("image_size_px"),
+            accelerating_voltage_kv=d_dict.get("accelerating_voltage_kv"),
+            beam_current_na=d_dict.get("beam_current_na"),
+            exposure_ms=d_dict.get("exposure_ms"), microscope_state=d_dict.get("microscope_state"),
             extra=extra, _mode=mode
         )
 
@@ -2590,29 +2593,26 @@ class SystemInfo:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemInfo":
-        mode = as_parse_mode(mode)
-        if isinstance(d, SystemInfo): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            SystemInfo, d, mode,
+            known_keys=("name", "ip_address", "manufacturer", "model", "serial_number",
+                        "hardware_version", "software_version", "supertem_version",
+                        "application", "application_version", "extra"),
+            aliases=()
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"SystemInfo expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return SystemInfo(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="SystemInfo")
         return SystemInfo(
-            name=d.get("name"),
-            ip_address=d.get("ip_address"),
-            manufacturer=d.get("manufacturer"),
-            model=d.get("model"),
-            serial_number=d.get("serial_number"),
-            hardware_version=d.get("hardware_version"),
-            software_version=d.get("software_version"),
-            supertem_version=d.get("supertem_version", __version__),
-            application=d.get("application"),
-            application_version=d.get("application_version"),
+            name=d_dict.get("name"),
+            ip_address=d_dict.get("ip_address"),
+            manufacturer=d_dict.get("manufacturer"),
+            model=d_dict.get("model"),
+            serial_number=d_dict.get("serial_number"),
+            hardware_version=d_dict.get("hardware_version"),
+            software_version=d_dict.get("software_version"),
+            supertem_version=d_dict.get("supertem_version", __version__),
+            application=d_dict.get("application"),
+            application_version=d_dict.get("application_version"),
             extra=extra,
             _mode=mode
         )
@@ -2663,23 +2663,18 @@ class SystemSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemSettings":
-        mode = as_parse_mode(mode)
-        if isinstance(d, SystemSettings): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            SystemSettings, d, mode,
+            known_keys=("stage_system", "beam_system", "detector_system", "info", "extra"),
+            aliases=("stage", "beam", "detector")
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"SystemSettings expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return SystemSettings(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="SystemSettings")
         return SystemSettings(
-            stage_system=d.get("stage_system", d.get("stage")),
-            beam_system=d.get("beam_system", d.get("beam")),
-            detector_system=d.get("detector_system", d.get("detector")),
-            info=d.get("info"), extra=extra, _mode=mode
+            stage_system=d_dict.get("stage_system", d_dict.get("stage")),
+            beam_system=d_dict.get("beam_system", d_dict.get("beam")),
+            detector_system=d_dict.get("detector_system", d_dict.get("detector")),
+            info=d_dict.get("info"), extra=extra, _mode=mode
         )
 
 @dataclass
@@ -2721,19 +2716,15 @@ class MicroscopeSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeSettings":
-        mode = as_parse_mode(mode)
-        if isinstance(d, MicroscopeSettings): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            MicroscopeSettings, d, mode,
+            known_keys=("system", "image", "protocol", "extra"),
+            aliases=()
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"MicroscopeSettings expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return MicroscopeSettings(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="MicroscopeSettings")
-        return MicroscopeSettings(system=d.get("system"), image=d.get("image"), protocol=d.get("protocol"), extra=extra,
+        return MicroscopeSettings(system=d_dict.get("system"), image=d_dict.get("image"),
+                                  protocol=d_dict.get("protocol"), extra=extra,
                                   _mode=mode)
 
 # =============================================================================
@@ -2809,19 +2800,16 @@ class AcquisitionRequest:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
-        mode = as_parse_mode(mode)
-        if isinstance(d, AcquisitionRequest): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            AcquisitionRequest, d, mode,
+            known_keys=("detector_id", "detector", "image", "extra"),
+            aliases=()
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"AcquisitionRequest expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return AcquisitionRequest(extra=ex, _mode=mode)
+        return AcquisitionRequest(detector_id=d_dict.get("detector_id"), detector=d_dict.get("detector"),
+                                  image=d_dict.get("image"), extra=extra, _mode=mode)
 
-        extra = collect_extra(d, (), owner="AcquisitionRequest")
-        return AcquisitionRequest(detector_id=d.get("detector_id"), detector=d.get("detector"), image=d.get("image"), extra=extra, _mode=mode)
 
 @dataclass
 class StageMoveRequest:
@@ -2891,20 +2879,17 @@ class StageMoveRequest:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageMoveRequest":
-        mode = as_parse_mode(mode)
-        if isinstance(d, StageMoveRequest): return replace(d, _mode=mode)
+        d_dict, mode, extra = _setup_from_dict(
+            StageMoveRequest, d, mode,
+            known_keys=("target", "relative", "backlash_correction", "wait_for_settle", "settle_time", "extra"),
+            aliases=("settle_time_s",)
+        )
+        if d_dict is None: return replace(d, _mode=mode)
 
-        # 1. Type Check & Recovery
-        if not isinstance(d, dict):
-            if is_strict(mode): raise TypeError(f"StageMoveRequest expects dict, got {type(d).__name__}")
-            ex = Extras()
-            _extra_put_raw(ex, "source_type_error", d)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(d).__name__}"}
-            return StageMoveRequest(extra=ex, _mode=mode)
-
-        extra = collect_extra(d, (), owner="StageMoveRequest")
         return StageMoveRequest(
-            target=d.get("target"), relative=d.get("relative"), backlash_correction=d.get("backlash_correction"),
-            wait_for_settle=d.get("wait_for_settle"), settle_time=d.get("settle_time", d.get("settle_time_s")),
+            target=d_dict.get("target"), relative=d_dict.get("relative"),
+            backlash_correction=d_dict.get("backlash_correction"),
+            wait_for_settle=d_dict.get("wait_for_settle"),
+            settle_time=d_dict.get("settle_time", d_dict.get("settle_time_s")),
             extra=extra, _mode=mode
         )
