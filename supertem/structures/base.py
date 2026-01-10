@@ -166,7 +166,8 @@ To prevent ingestion crashes while ensuring runtime safety, `__post_init__` acts
 as a "loading dock" that accepts flexible inputs (including None). However, the
 final internal state depends on the object's semantic category.
 
-Universal Rule: All input fields are typed as `Optional[T] = None`.
+Universal Rule: All domain-data input fields are typed as `Optional[T] = None`.
+(Internal control fields like `_mode` and `extra` are excluded from this rule).
 
 Category A: Configuration & System Limits (Strict Runtime)
   - Definition: Definitions of behavior (limits, timeouts, file formats).
@@ -229,7 +230,9 @@ All to_dict() methods must return JSON-serializable output:
   - dataclasses -> dict
   - enums -> str
   - tuples -> lists
-  - quantities/units -> plain numbers (and/or unit annotations per project convention)
+  - quantities/units -> plain numbers.
+    *CONVENTION*: To maintain clarity after stripping units, keys for Quantities
+    MUST include unit suffixes (e.g., `_nm`, `_ms`, `_kv`, `_deg`).
   - any non-JSON-native objects must be converted via jsonable helpers
 
 If a value cannot be expressed safely as JSON, preserve a safe representation in
@@ -860,10 +863,11 @@ class Point:
     """
     Simple 3D point used for geometry and settings.
 
-    Role: STRUCTURE.
-    Category: A.
+    Role:     Structure
+    Context:  Both (Data-plane / Control-plane)
+    Category: A (Config)
 
-    Special:
+    Note:
     - This class is lightweight and does not include the `Extras` container.
     """
     x: Optional[float] = None
@@ -917,7 +921,8 @@ class ROI:
     """
     Region of Interest specified in pixel coordinates for a detector sensor.
 
-    Role: Gatekeeper (Hardware Window)
+    Role:     Gatekeeper (Hardware Window)
+    Context:  Control-plane
     Category: A (Config)
 
     Attributes:
@@ -990,8 +995,9 @@ class StagePosition:
     """
     Stage coordinate representation for both telemetry (State) and movement (Intent).
 
-    Role: Dual-Use (Snapshot and Intent)
-    Category: C / D
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Both (Data-plane / Control-plane)
+    Category: C / D (Measured State / Intent)
 
     Attributes:
         x, y, z (Optional[Quantity]): Translation coordinates. Units: nm.
@@ -1128,8 +1134,9 @@ class StageSystemSettings:
     """
     Safety limits and step sizes for physical stage motion.
 
-    Role: Gatekeeper (System Limits)
-    Category: A (Strict Runtime)
+    Role:     Gatekeeper (System Limits)
+    Context:  Control-plane
+    Category: A (Strict Runtime Config)
 
     Attributes:
         enabled (Optional[bool]): Master toggle for stage interaction.
@@ -1393,8 +1400,9 @@ class BeamSettings:
     """
     Optical parameters of the electron beam for both state reporting and control.
 
-    Role: Dual-Use (Snapshot and Intent)
-    Category: C / D
+    Role:     Gatekeeper (System Limits)
+    Context:  Control-plane
+    Category: A / B (Config and Structure)
 
     Attributes:
         voltage (Optional[Quantity]): Accelerating voltage. Units: kV.
@@ -1513,7 +1521,8 @@ class BeamSystemSettings:
     """
     Safety limits and supported ranges for beam optics and high voltage.
 
-    Role: Gatekeeper (System Limits)
+    Role:     Gatekeeper (System Limits)
+    Context:  Control-plane
     Category: A / B (Config and Structure)
 
     Attributes:
@@ -1649,8 +1658,9 @@ class DetectorSettings:
     """
     Detector parameters used for reporting state and requesting image acquisition.
 
-    Role: Dual-Use (Snapshot and Intent)
-    Category: C / D
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Both (Data-plane / Control-plane)
+    Category: C / D (Measured State / Intent)
 
     Attributes:
         detector_id (Optional[str]): The identifier of the camera to use.
@@ -1772,7 +1782,8 @@ class DetectorCapabilities:
     """
     Hardware-specific profile used to assess if a request is supported by the device.
 
-    Role: Gatekeeper (Capabilities)
+    Role:     Gatekeeper (Capabilities)
+    Context:  Control-plane
     Category: C (Measured State)
 
     Attributes:
@@ -1973,8 +1984,9 @@ class DetectorSystemSettings:
     """
     Registry for available detectors and their associated capability profiles.
 
-    Role: Gatekeeper (System Registry)
-    Category: B (Structural Containers)
+    Role:     Gatekeeper (System Registry)
+    Context:  Control-plane
+    Category: B (Structural Container)
 
     Attributes:
         available_detector_ids (Optional[List[str]]): List of known device names.
@@ -2095,7 +2107,8 @@ class ImageOutputSettings:
     """
     Configuration for naming conventions and storage formats for acquired data.
 
-    Role: Gatekeeper (Output Config)
+    Role:     Gatekeeper (Output Config)
+    Context:  Control-plane
     Category: A (Config)
 
     Attributes:
@@ -2149,8 +2162,9 @@ class Aperture:
     """
     Physical aperture status or a request to modify insertion/size.
 
-    Role: Dual-Use (Snapshot and Intent)
-    Category: C / D
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Both (Data-plane / Control-plane)
+    Category: C / D (Measured State / Intent)
 
     Attributes:
         inserted (Optional[bool]): Whether the aperture is in the beam path.
@@ -2169,11 +2183,7 @@ class Aperture:
         mode, strict, self.extra = _setup_init(self, self._mode, "Aperture")
         # Category C: Preserve None
         self.aperture_id = parse_opt_id(self.aperture_id, name="Aperture.aperture_id", strict=strict, extra=self.extra)
-        # Exception: Boolean state usually defaults to False if unknown for safety?
-        # But per Category C, if we truly don't know, we might want None.
-        # However, parse_bool enforces a default. We'll stick to False as "Safe State".
-        self.inserted = parse_bool(self.inserted, default=False, name="Aperture.inserted", strict=strict,
-                                   extra=self.extra)
+        self.inserted = parse_opt_bool(self.inserted, name="Aperture.inserted", strict=strict, extra=self.extra)
         self.size_index = parse_opt_int(self.size_index, name="Aperture.size_index", strict=strict, extra=self.extra)
         self.position = parse_model(Point, self.position, extra=self.extra, key="Aperture.position", mode=mode)
 
@@ -2220,7 +2230,7 @@ class Aperture:
         if d_dict is None: return replace(d, _mode=mode)
         return Aperture(
             aperture_id=d_dict.get("aperture_id", d_dict.get("id")),
-            inserted=d_dict.get("inserted", False),
+            inserted=d_dict.get("inserted"),
             size_index=d_dict.get("size_index"),
             position=d_dict.get("position"),
             extra=extra, _mode=mode
@@ -2231,7 +2241,8 @@ class MicroscopeState:
     """
     Comprehensive snapshot of the microscope telemetry at a specific timestamp.
 
-    Role: Snapshot (Measured State)
+    Role:     Snapshot (Measured State)
+    Context:  Data-plane
     Category: C (Nullable Runtime)
 
     Attributes:
@@ -2336,7 +2347,8 @@ class MicroscopeImageMetadata:
     """
     The scientific 'sidecar' metadata describing the context of an image acquisition.
 
-    Role: Snapshot (Measured State)
+    Role:     Snapshot (Scientific Context)
+    Context:  Data-plane
     Category: C (Measured State)
 
     Attributes:
@@ -2592,7 +2604,8 @@ class SystemInfo:
     """
     Static identifying information about the microscope hardware and software.
 
-    Role: Gateway (Structure)
+    Role:     Structure / Identity
+    Context:  Both (Data-plane / Control-plane)
     Category: A (Config/Identity)
 
     Attributes:
@@ -2710,8 +2723,9 @@ class SystemSettings:
     """
     Root container for system-wide settings and limit registries.
 
-    Role: Gateway (Structure)
-    Category: B (Structural Containers)
+    Role:     Structure / Gateway
+    Context:  Both (Data-plane / Control-plane)
+    Category: B (Structural Container)
 
     Attributes:
         stage_system (Optional[StageSystemSettings]): Limits for sample motion.
@@ -2781,8 +2795,9 @@ class MicroscopeSettings:
     """
     Root configuration for a microscope instance and its supported subsystems.
 
-    Role: Gateway (Structure)
-    Category: B (Structural Containers)
+    Role:     Structure / Gateway
+    Context:  Both (Data-plane / Control-plane)
+    Category: B (Structural Container)
 
     Attributes:
         system (Optional[SystemSettings]): The hardware limits and registries.
@@ -2842,8 +2857,9 @@ class AcquisitionRequest:
     """
     High-level intent to capture an image using a specific detector and settings.
 
-    Role: Intent (User Request)
-    Category: B / D (Structure and Intent)
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: B / D (Structure / Intent)
 
     Attributes:
         detector_id (Optional[str]): Targeted hardware device for capture.
@@ -2925,8 +2941,9 @@ class StageMoveRequest:
     """
     A specific command to move the sample stage.
 
-    Role: Intent (User Request)
-    Category: D (Tristate Logic)
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Tristate Intent)
 
     Attributes:
         target (Optional[StagePosition]): The destination coordinates.
