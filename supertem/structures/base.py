@@ -282,7 +282,6 @@ except PackageNotFoundError:
     except PackageNotFoundError:
         __version__ = "unknown"
 
-
 # =============================================================================
 # Parsing & Validation Helpers
 # =============================================================================
@@ -292,7 +291,6 @@ class ParseMode(str, Enum):
     STRICT = "strict"   # Raise errors immediately (Control Plane / Execution)
     LENIENT = "lenient" # Log errors to Extras and continue (Data Plane / Logging)
 
-
 def as_parse_mode(mode: Union["ParseMode", str, None]) -> "ParseMode":
     if isinstance(mode, ParseMode): return mode
     if isinstance(mode, str):
@@ -301,11 +299,9 @@ def as_parse_mode(mode: Union["ParseMode", str, None]) -> "ParseMode":
         if m == "strict": return ParseMode.STRICT
     return ParseMode.STRICT
 
-
 def is_strict(mode: Union["ParseMode", str, None]) -> bool:
     """Helper to check if the effective mode is STRICT."""
     return as_parse_mode(mode) == ParseMode.STRICT
-
 
 def note_or_raise(extra: Optional["Extras"], key: str, exc: Exception, *, mode: Union["ParseMode", str, None] = ParseMode.STRICT, raw: Any = None) -> None:
     """Handle a validation error according to the ParseMode.
@@ -320,7 +316,6 @@ def note_or_raise(extra: Optional["Extras"], key: str, exc: Exception, *, mode: 
         if raw is not None: extra.raw[key] = _jsonable(raw)
         extra.notes[key] = {"error": repr(exc)}
     except Exception: pass
-
 
 # =============================================================================
 # Unit Handling (Pint Integration)
@@ -400,7 +395,6 @@ def _check_data_format(data: np.ndarray) -> bool:
         if data.shape[0] == 1: data = data[0]
         elif data.shape[2] == 1: data = data[:, :, 0]
     return (data.ndim == 2) and (data.dtype.kind == "u") and (data.dtype.itemsize in (1, 2))
-
 
 # =============================================================================
 # Extras Container
@@ -595,6 +589,7 @@ def parse_opt_float(value: Any, *, name: str, unit: Optional[str] = None, strict
             s = value.strip()
             if s == "": return None
             return float(s)
+        raise TypeError(f"Cannot parse float from {type(value)}")
     except Exception:
         if extra is not None: _extra_put_raw(extra, name, value)
         if strict: raise ValueError(f"{name} must be float-like")
@@ -629,7 +624,7 @@ def parse_opt_id(value: Any, *, name: str, strict: bool = False, extra: Any = No
     if isinstance(value, str) and value.strip() == "":
         if extra is not None:
             _extra_put_raw(extra, name, value)
-            if hasattr(extra, "notes"): extra.notes.setdefault("empty_id_fields", []).append(name)
+            if hasattr(extra, "notes"): extra.notes.setdefault(f"{name}.empty", []).append(name)
         return None
     return parse_opt_str(value, name=name, strict=strict, extra=extra)
 
@@ -742,7 +737,6 @@ def parse_keyed_map(target_cls: Type[T], raw_map: Optional[Dict[str, Any]], id_f
             out[key_norm] = obj
     return out
 
-
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -841,12 +835,12 @@ class Point:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
-        if not (math.isfinite(self.x) and math.isfinite(self.y) and math.isfinite(self.z)):
+        if not (np.isfinite(self.x) and np.isfinite(self.y) and np.isfinite(self.z)):
             note_or_raise(None, "Point.coordinates", ValueError(f"Coordinates must be finite"), mode=mode, raw=(self.x, self.y, self.z))
             if strict: return False
-            self.x = 0.0 if not math.isfinite(self.x) else self.x
-            self.y = 0.0 if not math.isfinite(self.y) else self.y
-            self.z = 0.0 if not math.isfinite(self.z) else self.z
+            self.x = 0.0 if not np.isfinite(self.x) else self.x
+            self.y = 0.0 if not np.isfinite(self.y) else self.y
+            self.z = 0.0 if not np.isfinite(self.z) else self.z
         return True
 
     def to_dict(self) -> dict:
@@ -976,10 +970,44 @@ class StagePosition:
         mode, strict = _setup_validate(self._mode, mode)
         ok = True
         for name, q in [("x", self.x), ("y", self.y), ("z", self.z), ("r", self.r), ("tilt_x", self.tilt_x), ("tilt_y", self.tilt_y)]:
-            if q is not None and not math.isfinite(q.magnitude):
+            if q is not None and not np.isfinite(q.magnitude):
                 note_or_raise(self.extra, f"StagePosition.{name}", ValueError(f"{name} must be finite"), mode=mode, raw=q)
                 ok = False
         return ok
+
+    def __add__(self, other: 'StagePosition') -> 'StagePosition':
+        if not isinstance(other, StagePosition): return NotImplemented
+        def add(a, b, u):
+            if a is None and b is None: return None
+            return (a or Q_(0, u)) + (b or Q_(0, u))
+        return StagePosition(
+            name=self.name,
+            x=add(self.x, other.x, "nm"), y=add(self.y, other.y, "nm"), z=add(self.z, other.z, "nm"),
+            r=add(self.r, other.r, "degree"), tilt_x=add(self.tilt_x, other.tilt_x, "degree"), tilt_y=add(self.tilt_y, other.tilt_y, "degree"),
+            coordinate_system=self.coordinate_system,
+            _mode=self._mode
+        )
+
+    def __sub__(self, other: 'StagePosition') -> 'StagePosition':
+        if not isinstance(other, StagePosition): return NotImplemented
+        def sub(a, b): return (a - b) if (a is not None and b is not None) else None
+        return StagePosition(
+            name=self.name,
+            x=sub(self.x, other.x), y=sub(self.y, other.y), z=sub(self.z, other.z),
+            r=sub(self.r, other.r), tilt_x=sub(self.tilt_x, other.tilt_x), tilt_y=sub(self.tilt_y, other.tilt_y),
+            coordinate_system=self.coordinate_system,
+             _mode=self._mode
+        )
+
+    # ... [is_close, to_dict, from_dict preserved] ...
+    def is_close(self, other: 'StagePosition', tol_nm: float = 1.0, tol_deg: float = 1e-3) -> bool:
+        def chk(a, b, u, t):
+            if a is None and b is None: return True
+            if a is None or b is None: return False
+            return abs(a.to(u).magnitude - b.to(u).magnitude) <= t
+        return (chk(self.x, other.x, "nm", tol_nm) and chk(self.y, other.y, "nm", tol_nm) and
+                chk(self.z, other.z, "nm", tol_nm) and chk(self.r, other.r, "degree", tol_deg) and
+                chk(self.tilt_x, other.tilt_x, "degree", tol_deg) and chk(self.tilt_y, other.tilt_y, "degree", tol_deg))
 
     def to_dict(self) -> dict:
         d = {
@@ -1014,37 +1042,6 @@ class StagePosition:
             extra=extra, _mode=mode,
         )
 
-    def __add__(self, other: 'StagePosition') -> 'StagePosition':
-        """Enable vector addition for relative movements."""
-        if not isinstance(other, StagePosition): return NotImplemented
-        def add(a, b, u):
-            if a is None and b is None: return None
-            return (a or Q_(0, u)) + (b or Q_(0, u))
-        return StagePosition(
-            name=self.name,
-            x=add(self.x, other.x, "nm"), y=add(self.y, other.y, "nm"), z=add(self.z, other.z, "nm"),
-            r=add(self.r, other.r, "degree"), tilt_x=add(self.tilt_x, other.tilt_x, "degree"), tilt_y=add(self.tilt_y, other.tilt_y, "degree"),
-            coordinate_system=self.coordinate_system,
-        )
-
-    def __sub__(self, other: 'StagePosition') -> 'StagePosition':
-        if not isinstance(other, StagePosition): return NotImplemented
-        def sub(a, b): return (a - b) if (a is not None and b is not None) else None
-        return StagePosition(
-            name=self.name,
-            x=sub(self.x, other.x), y=sub(self.y, other.y), z=sub(self.z, other.z),
-            r=sub(self.r, other.r), tilt_x=sub(self.tilt_x, other.tilt_x), tilt_y=sub(self.tilt_y, other.tilt_y),
-            coordinate_system=self.coordinate_system,
-        )
-
-    def is_close(self, other: 'StagePosition', tol_nm: float = 1.0, tol_deg: float = 1e-3) -> bool:
-        def chk(a, b, u, t):
-            if a is None and b is None: return True
-            if a is None or b is None: return False
-            return abs(a.to(u).magnitude - b.to(u).magnitude) <= t
-        return (chk(self.x, other.x, "nm", tol_nm) and chk(self.y, other.y, "nm", tol_nm) and
-                chk(self.z, other.z, "nm", tol_nm) and chk(self.r, other.r, "degree", tol_deg) and
-                chk(self.tilt_x, other.tilt_x, "degree", tol_deg) and chk(self.tilt_y, other.tilt_y, "degree", tol_deg))
 
 @dataclass
 class StageSystemSettings:
@@ -1121,12 +1118,12 @@ class StageSystemSettings:
                     pass
             return True
 
-        ok = _check_limits(self.x_limits, "x") and ok
-        ok = _check_limits(self.y_limits, "y") and ok
-        ok = _check_limits(self.z_limits, "z") and ok
-        ok = _check_limits(self.r_limits, "r") and ok
-        ok = _check_limits(self.tilt_x_limits, "tilt_x") and ok
-        ok = _check_limits(self.tilt_y_limits, "tilt_y") and ok
+        ok = _check_limits(self.x_limits, "x_limits") and ok
+        ok = _check_limits(self.y_limits, "y_limits") and ok
+        ok = _check_limits(self.z_limits, "z_limits") and ok
+        ok = _check_limits(self.r_limits, "r_limits") and ok
+        ok = _check_limits(self.tilt_x_limits, "tilt_x_limits") and ok
+        ok = _check_limits(self.tilt_y_limits, "tilt_y_limits") and ok
 
         # 2. Cross-Field Consistency
         def _check_completeness(enabled: bool, limits: Any, name: str):
@@ -1134,7 +1131,6 @@ class StageSystemSettings:
                 note_or_raise(self.extra, f"StageSystemSettings.{name}_safety",
                               ValueError(f"Axis {name} is enabled but has no safety limits defined."), mode=mode)
                 if not strict:
-                     # Heal: Disable the unsafe axis
                      try: setattr(self, f"can_{name}", False)
                      except: pass
                 else:
@@ -1148,14 +1144,12 @@ class StageSystemSettings:
         ok = _check_completeness(self.can_tilt_x, self.tilt_x_limits, "tilt_x") and ok
         ok = _check_completeness(self.can_tilt_y, self.tilt_y_limits, "tilt_y") and ok
 
-        # 3. Parameter Safety
         if self.max_step_distance.magnitude <= 0:
             note_or_raise(self.extra, "StageSystemSettings.max_step_distance",
                           ValueError("max_step_distance must be > 0"), mode=mode)
             if strict:
                 ok = False
             else:
-                # Heal: Reset to default safe step (50um)
                 self.max_step_distance = Q_(50000.0, "nm")
 
         if self.eucentric_z is not None and self.z_limits:
@@ -1166,7 +1160,6 @@ class StageSystemSettings:
                 if strict:
                     ok = False
                 else:
-                    # Heal: Mark as unknown/unsafe to use
                     self.eucentric_z = None
 
         if self.settle_time.magnitude < 0:
@@ -1190,13 +1183,13 @@ class StageSystemSettings:
             current: The current stage position (required for relative checks or step size calc).
             relative: If True, 'target' is treated as a delta to 'current'.
         """
-        mode = as_parse_mode(self._mode)
+        mode = ParseMode.LENIENT
 
         # 1. Resolve Absolute Target
         # If relative, we MUST have current to know where we end up.
         if relative:
             if current is None:
-                note_or_raise(self.extra, "Safety.relative_no_current",
+                note_or_raise(self.extra, "StageSystemSettings.Safety.relative_no_current",
                               ValueError("Cannot validate relative move without current position"), mode=mode)
                 return False
             # Resolve the final destination
@@ -1213,7 +1206,7 @@ class StageSystemSettings:
         def check_bound(val, lims, name):
             if val is not None and lims:
                 if not (lims[0] <= val <= lims[1]):
-                    note_or_raise(self.extra, f"Safety.{name}_limit",
+                    note_or_raise(self.extra, f"StageSystemSettings.Safety.{name}_limit",
                                   ValueError(f"Target {val} outside limits {lims}"), mode=mode)
                     return False
             return True
@@ -1231,21 +1224,21 @@ class StageSystemSettings:
             # Euclidean distance for XY stage movement
             dx = step_vector.x or Q_(0, 'nm')
             dy = step_vector.y or Q_(0, 'nm')
-
-            # Simple magnitude check
+            dx_nm = dx.to("nm").magnitude
+            dy_nm = dy.to("nm").magnitude
             distance = (dx ** 2 + dy ** 2) ** 0.5
+            max_dist_nm = self.max_step_distance.to("nm").magnitude
 
-            if distance > self.max_step_distance:
-                note_or_raise(self.extra, "Safety.max_step_distance",
-                              ValueError(f"XY step {distance} exceeds limit {self.max_step_distance}"),
+            if distance > max_dist_nm:
+                note_or_raise(self.extra, "StageSystemSettings.Safety.max_step_distance",
+                              ValueError(f"XY step {distance} exceeds limit {max_dist_nm:.1f}nm"),
                               mode=mode)
                 ok = False
 
-            # Check tilt step
             if step_vector.tilt_x is not None:
                 d_tilt = abs(step_vector.tilt_x)
                 if d_tilt > self.max_step_angle:
-                    note_or_raise(self.extra, "Safety.max_step_angle",
+                    note_or_raise(self.extra, "StageSystemSettings.Safety.max_step_angle",
                                   ValueError(f"Tilt X step {d_tilt} exceeds limit {self.max_step_angle}"), mode=mode)
                     ok = False
 
@@ -1338,13 +1331,12 @@ class BeamSettings:
         if self.beam_shift: ok = self.beam_shift.validate(mode=mode) and ok
         if self.image_shift: ok = self.image_shift.validate(mode=mode) and ok
 
-        # Helper to check positivity and heal
         def _check_pos_qty(val, name, attr_name):
             if val is not None and val.magnitude < 0:
                 note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode)
                 if strict:
                     return False
-                setattr(self, attr_name, None)  # Heal: Set to Unknown
+                setattr(self, attr_name, None)
             return True
 
         def _check_pos_int(val, name, attr_name):
@@ -1352,7 +1344,7 @@ class BeamSettings:
                 note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode)
                 if strict:
                     return False
-                setattr(self, attr_name, None)  # Heal: Set to Unknown
+                setattr(self, attr_name, None)
             return True
 
         ok = _check_pos_qty(self.convergence_angle, "BeamSettings.convergence_angle", "convergence_angle") and ok
@@ -1416,7 +1408,7 @@ class BeamSystemSettings:
         convergence_angle_limits: Allowable range (min, max) for convergence angle.
     """
     enabled: bool = True
-    default_beam: BeamSettings = field(default_factory=BeamSettings)
+    default_beam: Optional[BeamSettings] = None
     voltage_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     beam_current_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     spot_size_limits: Optional[Tuple[int, int]] = None
@@ -1434,7 +1426,7 @@ class BeamSystemSettings:
         self.beam_current_limits = parse_opt_pair_quantity(self.beam_current_limits, "nA", name="BeamSystemSettings.beam_current_limits", strict=strict, extra=self.extra)
         self.convergence_angle_limits = parse_opt_pair_quantity(self.convergence_angle_limits, "mrad", name="BeamSystemSettings.convergence_angle_limits", strict=strict, extra=self.extra)
         # 3. Complex
-        self.default_beam = parse_model(BeamSettings, self.default_beam, mode=mode, extra=self.extra) or BeamSettings(_mode=mode)
+        self.default_beam = parse_model(BeamSettings, self.default_beam, mode=mode, extra=self.extra, key="BeamSystemSettings.default_beam") or BeamSettings(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -1444,21 +1436,21 @@ class BeamSystemSettings:
             if rng:
                 mn, mx = rng
                 if mn > mx:
-                    note_or_raise(self.extra, name, ValueError(f"{name} invalid: min > max"), mode=mode)
-                    if strict:
-                        return False
-                    # Heal: Swap
+                    note_or_raise(self.extra, f"BeamSystemSettings.{name}", ValueError(f"{name} invalid: min > max"), mode=mode)
+                    if strict: return False
                     try: setattr(self, name, (mx, mn))
                     except Exception: pass
-
-                # Check for negative lower bounds
-                if mn.magnitude < 0:
+                    mn, mx = (mx, mn)
+                is_neg = False
+                if hasattr(mn, "magnitude"):
+                    if mn.magnitude < 0: is_neg = True
+                elif mn < 0: is_neg = True
+                if is_neg:
                     note_or_raise(self.extra, f"BeamSystemSettings.{name}",
                                   ValueError(f"{name} invalid: min < 0"), mode=mode)
-                    if strict:
-                         return False
-                    # Heal: Clamp min to 0
-                    try: setattr(self, name, (Q_(0, mn.units), mx))
+                    if strict: return False
+                    zero = Q_(0, mn.units) if hasattr(mn, "units") else 0
+                    try: setattr(self, name, (zero, mx))
                     except: pass
             return True
 
@@ -1473,14 +1465,13 @@ class BeamSystemSettings:
         """
         Runtime Gatekeeper: Checks if a target beam configuration respects system limits.
         """
-        mode = as_parse_mode(self._mode)
+        mode = ParseMode.LENIENT
 
-        # Helper for limit checking
         def _check(val, limit_tuple, name):
             if val is None or limit_tuple is None: return True
             min_lim, max_lim = limit_tuple
             if not (min_lim <= val <= max_lim):
-                note_or_raise(self.extra, f"Safety.beam_{name}",
+                note_or_raise(self.extra, f"BeamSystemSettings.Safety.beam_{name}",
                               ValueError(f"{name} {val} outside limits {limit_tuple}"), mode=mode)
                 return False
             return True
@@ -1493,7 +1484,7 @@ class BeamSystemSettings:
         if target.spot_size is not None and self.spot_size_limits:
             min_s, max_s = self.spot_size_limits
             if not (min_s <= target.spot_size <= max_s):
-                note_or_raise(self.extra, "Safety.beam_spot",
+                note_or_raise(self.extra, "BeamSystemSettings.Safety.beam_spot",
                               ValueError(f"Spot size {target.spot_size} outside {self.spot_size_limits}"), mode=mode)
                 ok = False
 
@@ -1567,7 +1558,7 @@ class DetectorSettings:
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "DetectorSettings")
         # 1. Scalars
-        self.detector_id = parse_opt_id(self.detector_id, name="DetectorSettings.detector_id", strict=False, extra=self.extra)
+        self.detector_id = parse_opt_id(self.detector_id, name="DetectorSettings.detector_id", strict=strict, extra=self.extra)
         self.binning_index = parse_opt_int(self.binning_index, name="DetectorSettings.binning_index", strict=strict, extra=self.extra)
         self.binning_xy = parse_opt_pair_int(self.binning_xy, name="DetectorSettings.binning_xy", strict=strict, extra=self.extra)
         self.frame_integration = parse_opt_int(self.frame_integration, name="DetectorSettings.frame_integration", strict=strict, extra=self.extra)
@@ -1592,7 +1583,6 @@ class DetectorSettings:
                      self.exposure = None
 
         if self.binning_xy:
-             # Semantic check: Binning must be positive integers
              if self.binning_xy[0] <= 0 or self.binning_xy[1] <= 0:
                  note_or_raise(self.extra, "DetectorSettings.binning_xy", ValueError("binning_xy must be > 0"), mode=mode, raw=self.binning_xy)
                  if strict:
@@ -1730,22 +1720,17 @@ class DetectorCapabilities:
             if min_val is not None and max_val is not None:
                 if min_val > max_val:
                     note_or_raise(self.extra, name, ValueError(f"{name} invalid: min > max ({min_val} > {max_val})"), mode=mode)
-                    if strict:
-                        return False
-                    # Heal: Swap limits
+                    if strict: return False
                     try:
                         setattr(self, min_attr, max_val)
                         setattr(self, max_attr, min_val)
-                    except Exception:
-                        pass
+                    except Exception: pass
             return True
 
         def _check_pos(val, name, attr_name):
             if val is not None and val < 0:
                 note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
-                if strict:
-                    return False
-                # Heal: Clamp to 0
+                if strict: return False
                 setattr(self, attr_name, 0.0)
             return True
 
@@ -1792,7 +1777,6 @@ class DetectorCapabilities:
         return True
 
     def to_dict(self) -> dict:
-        # FIX: Explicit listing instead of dynamic iteration
         d = {
             "can_binning": self.can_binning,
             "binning_index_min": self.binning_index_min,
@@ -1891,20 +1875,13 @@ class DetectorSystemSettings:
         self.capabilities_by_id = parse_keyed_map(DetectorCapabilities, self.capabilities_by_id, None, "DetectorSystemSettings.capabilities_by_id", mode, self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        """Validate detector-system semantics and cross-field consistency."""
         mode, strict = _setup_validate(self._mode, mode)
         ok = True
-
-        # Rule 2B: Cross-Field Consistency
-        # We must ensure that the sets of IDs make sense together.
-
         ids_available = set(self.available_detector_ids)
         ids_defaults = set(self.defaults_by_id.keys())
         ids_caps = set(self.capabilities_by_id.keys())
 
-        # Check 1: Default Selection Validity
         if self.default_detector_id:
-            # Note: We trust default_detector_id is str or None (from __post_init__)
             known_anywhere = ids_available | ids_defaults | ids_caps
             if known_anywhere and self.default_detector_id not in known_anywhere:
                 note_or_raise(
@@ -1918,8 +1895,6 @@ class DetectorSystemSettings:
                 else:
                     self.default_detector_id = None
 
-        # Check 2: Configuration Completeness
-        # If a detector is 'available', it MUST have settings and capabilities to be usable.
         missing_defaults = ids_available - ids_defaults
         if missing_defaults:
             note_or_raise(
@@ -1928,7 +1903,6 @@ class DetectorSystemSettings:
                 ValueError(f"Available detectors missing default settings: {missing_defaults}"),
                 mode=mode
             )
-            # Generally broken config, but in lenient we might just proceed.
             if strict:
                 ok = False
 
@@ -2062,17 +2036,15 @@ class Aperture:
             )
             if strict: ok = False
             else:
-                self.size_index = None  # Heal: Unknown size
+                self.size_index = None
 
         if self.position is not None:
-            # Check if the nested object is valid
             if not self.position.validate(mode=mode):
                 note_or_raise(self.extra, "Aperture.position", ValueError("Invalid aperture position coordinates"),
                               mode=mode)
                 if strict:
                     ok = False
                 else:
-                    # Heal: Discard the invalid position data, keep the aperture info
                     self.position = None
 
         return ok
@@ -2124,8 +2096,8 @@ class MicroscopeState:
     """
     timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
     mode: Optional[str] = None
-    stage_position: StagePosition = field(default_factory=StagePosition)
-    beam: BeamState = field(default_factory=BeamState)
+    stage_position: Optional[StagePosition] = None
+    beam: Optional[BeamState] = None
     apertures: Dict[str, Aperture] = field(default_factory=dict)
     detectors: Dict[str, DetectorState] = field(default_factory=dict)
     active_detector_ids: List[str] = field(default_factory=list)
@@ -2136,14 +2108,14 @@ class MicroscopeState:
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeState")
         # 1. Scalars
-        self.timestamp = parse_opt_str(self.timestamp, name="timestamp", strict=False) or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.timestamp = parse_opt_str(self.timestamp, name="MicroscopeState.timestamp", strict=False, extra=self.extra) or datetime.datetime.now(datetime.timezone.utc).isoformat()
         self.mode = parse_opt_str(self.mode, name="MicroscopeState.mode", strict=strict, extra=self.extra)
         self.primary_detector_id = parse_opt_id(self.primary_detector_id, name="MicroscopeState.primary_detector_id", strict=strict, extra=self.extra)
         # 2. Lists
         self.active_detector_ids = parse_str_list(self.active_detector_ids, name="MicroscopeState.active_detector_ids", strict=strict, extra=self.extra)
         # 3. Complex
-        self.stage_position = parse_model(StagePosition, self.stage_position, mode=mode, extra=self.extra) or StagePosition()
-        self.beam = parse_model(BeamState, self.beam, mode=mode, extra=self.extra) or BeamState()
+        self.stage_position = parse_model(StagePosition, self.stage_position, mode=mode, extra=self.extra, key="MicroscopeState.stage_position") or StagePosition(_mode=mode)
+        self.beam = parse_model(BeamState, self.beam, mode=mode, extra=self.extra, key="MicroscopeState.beam") or BeamState(_mode=mode)
         self.apertures = parse_keyed_map(Aperture, self.apertures, "aperture_id", "MicroscopeState.apertures", mode, self.extra)
         self.detectors = parse_keyed_map(DetectorState, self.detectors, "detector_id", "MicroscopeState.detectors", mode, self.extra)
 
@@ -2223,8 +2195,8 @@ class MicroscopeImageMetadata:
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeImageMetadata")
         # 1. Scalars
-        self.version = parse_opt_str(self.version, name="version", strict=False) or str(METADATA_VERSION)
-        self.created_at = parse_opt_str(self.created_at, name="created_at", strict=False) or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.version = parse_opt_str(self.version, name="MicroscopeImageMetadata.version", strict=False, extra=self.extra) or str(METADATA_VERSION)
+        self.created_at = parse_opt_str(self.created_at, name="MicroscopeImageMetadata.created_at", strict=False, extra=self.extra) or datetime.datetime.now(datetime.timezone.utc).isoformat()
         self.magnification = parse_opt_float(self.magnification, name="MicroscopeImageMetadata.magnification", strict=strict, extra=self.extra)
         self.camera_length_mm = parse_opt_float(self.camera_length_mm, unit="mm", name="MicroscopeImageMetadata.camera_length_mm", strict=strict, extra=self.extra)
         self.accelerating_voltage_kv = parse_opt_float(self.accelerating_voltage_kv, unit="kV", name="MicroscopeImageMetadata.accelerating_voltage_kv", strict=strict, extra=self.extra)
@@ -2233,7 +2205,7 @@ class MicroscopeImageMetadata:
         self.pixel_size_nm = parse_opt_pair_float(self.pixel_size_nm, name="MicroscopeImageMetadata.pixel_size_nm", strict=strict, extra=self.extra)
         self.image_size_px = parse_opt_pair_int(self.image_size_px, name="MicroscopeImageMetadata.image_size_px", strict=strict, extra=self.extra)
         # 2. Complex
-        self.microscope_state = parse_model(MicroscopeState, self.microscope_state, mode=mode, extra=self.extra)
+        self.microscope_state = parse_model(MicroscopeState, self.microscope_state, mode=mode, extra=self.extra, key="MicroscopeImageMetadata.microscope_state")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -2247,7 +2219,7 @@ class MicroscopeImageMetadata:
                 note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
                 if strict:
                     return False
-                setattr(self, attr_name, None)  # Heal: Set to Unknown
+                setattr(self, attr_name, None)
             return True
 
         ok = _check_pos(self.magnification, "magnification", "magnification") and ok
@@ -2543,19 +2515,19 @@ class SystemSettings:
         detector_system: Settings and capabilities for all detectors.
         info: Static system identity metadata.
     """
-    stage_system: StageSystemSettings = field(default_factory=StageSystemSettings)
-    beam_system: BeamSystemSettings = field(default_factory=BeamSystemSettings)
-    detector_system: DetectorSystemSettings = field(default_factory=DetectorSystemSettings)
-    info: SystemInfo = field(default_factory=SystemInfo)
+    stage_system: Optional[StageSystemSettings] = None
+    beam_system: Optional[BeamSystemSettings] = None
+    detector_system: Optional[DetectorSystemSettings] = None
+    info: Optional[SystemInfo] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "SystemSettings")
-        self.stage_system = parse_model(StageSystemSettings, self.stage_system, mode=mode, extra=self.extra) or StageSystemSettings(_mode=mode)
-        self.beam_system = parse_model(BeamSystemSettings, self.beam_system, mode=mode, extra=self.extra) or BeamSystemSettings(_mode=mode)
-        self.detector_system = parse_model(DetectorSystemSettings, self.detector_system, mode=mode, extra=self.extra) or DetectorSystemSettings(_mode=mode)
-        self.info = parse_model(SystemInfo, self.info, mode=mode, extra=self.extra) or SystemInfo(_mode=mode)
+        self.stage_system = parse_model(StageSystemSettings, self.stage_system, mode=mode, extra=self.extra, key="SystemSettings.stage_system") or StageSystemSettings(_mode=mode)
+        self.beam_system = parse_model(BeamSystemSettings, self.beam_system, mode=mode, extra=self.extra, key="SystemSettings.beam_system") or BeamSystemSettings(_mode=mode)
+        self.detector_system = parse_model(DetectorSystemSettings, self.detector_system, mode=mode, extra=self.extra, key="SystemSettings.detector_system") or DetectorSystemSettings(_mode=mode)
+        self.info = parse_model(SystemInfo, self.info, mode=mode, extra=self.extra, key="SystemSettings.info") or SystemInfo(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -2571,7 +2543,6 @@ class SystemSettings:
             "detector_system": self.detector_system.to_dict(),
             "info": self.info.to_dict(),
         }
-        # FIX: Include extras
         return _finish_to_dict(d, self.extra)
 
     @staticmethod
@@ -2601,16 +2572,16 @@ class MicroscopeSettings:
         image: Global defaults for image output (Format, Path).
         protocol: Dictionary for experimental protocol parameters.
     """
-    system: SystemSettings = field(default_factory=SystemSettings)
-    image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
+    system: Optional[SystemSettings] = None
+    image: Optional[ImageOutputSettings] = None
     protocol: dict = field(default_factory=lambda: {"name": "demo"})
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeSettings")
-        self.system = parse_model(SystemSettings, self.system, mode=mode, extra=self.extra) or SystemSettings(_mode=mode)
-        self.image = parse_model(ImageOutputSettings, self.image, mode=mode, extra=self.extra) or ImageOutputSettings(_mode=mode)
+        self.system = parse_model(SystemSettings, self.system, mode=mode, extra=self.extra, key="MicroscopeSettings.system") or SystemSettings(_mode=mode)
+        self.image = parse_model(ImageOutputSettings, self.image, mode=mode, extra=self.extra, key="MicroscopeSettings.image") or ImageOutputSettings(_mode=mode)
         if not isinstance(self.protocol, dict): self.protocol = {"name": "demo"}
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -2623,7 +2594,6 @@ class MicroscopeSettings:
             "image": self.image.to_dict(),
             "protocol": self.protocol,
         }
-        # FIX: Include extras
         return _finish_to_dict(d, self.extra)
 
     @staticmethod
@@ -2659,26 +2629,23 @@ class AcquisitionRequest:
         It enforces consistency between the outer `detector_id` and the inner `detector.detector_id`.
     """
     detector_id: Optional[str] = None
-    detector: DetectorSettings = field(default_factory=DetectorSettings)
-    image: ImageOutputSettings = field(default_factory=ImageOutputSettings)
+    detector: Optional[DetectorSettings] = None
+    image: Optional[ImageOutputSettings] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "AcquisitionRequest")
-        # 1. Scalars
         self.detector_id = parse_opt_id(self.detector_id, name="AcquisitionRequest.detector_id", strict=strict, extra=self.extra)
-        # 2. Complex
-        self.detector = parse_model(DetectorSettings, self.detector, mode=mode, extra=self.extra) or DetectorSettings(_mode=mode)
-        self.image = parse_model(ImageOutputSettings, self.image, mode=mode, extra=self.extra) or ImageOutputSettings(_mode=mode)
-        # 3. Patching
+        self.detector = parse_model(DetectorSettings, self.detector, mode=mode, extra=self.extra, key="AcquisitionRequest.detector") or DetectorSettings(_mode=mode)
+        self.image = parse_model(ImageOutputSettings, self.image, mode=mode, extra=self.extra, key="AcquisitionRequest.image") or ImageOutputSettings(_mode=mode)
+
         if self.detector_id is None and self.detector.detector_id is not None:
             self.detector_id = self.detector.detector_id
         elif self.detector.detector_id is None and self.detector_id is not None:
             self.detector.detector_id = self.detector_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        # VALIDATION: Consistency & Readiness
         mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
@@ -2721,7 +2688,6 @@ class AcquisitionRequest:
         return AcquisitionRequest(detector_id=d_dict.get("detector_id"), detector=d_dict.get("detector"),
                                   image=d_dict.get("image"), extra=extra, _mode=mode)
 
-
 @dataclass
 class StageMoveRequest:
     """
@@ -2735,7 +2701,7 @@ class StageMoveRequest:
         settle_time: Optional duration to wait after movement stops.
                      If None, uses the default from StageSystemSettings.
     """
-    target: StagePosition = field(default_factory=StagePosition)
+    target: Optional[StagePosition] = None
     relative: bool = False
     backlash_correction: bool = True
     wait_for_settle: bool = True
@@ -2745,14 +2711,11 @@ class StageMoveRequest:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "StageMoveRequest")
-        # 1. Scalars
         self.relative = parse_bool(self.relative, default=False, name="StageMoveRequest.relative", strict=strict, extra=self.extra)
         self.backlash_correction = parse_bool(self.backlash_correction, default=True, name="StageMoveRequest.backlash_correction", strict=strict, extra=self.extra)
         self.wait_for_settle = parse_bool(self.wait_for_settle, default=True, name="StageMoveRequest.wait_for_settle", strict=strict, extra=self.extra)
-        # 2. Quantities
         self.settle_time = parse_opt_quantity(self.settle_time, "seconds", name="StageMoveRequest.settle_time", strict=strict, extra=self.extra)
-        # 3. Complex
-        self.target = parse_model(StagePosition, self.target, mode=mode, extra=self.extra) or StagePosition(_mode=mode)
+        self.target = parse_model(StagePosition, self.target, mode=mode, extra=self.extra, key="StageMoveRequest.target") or StagePosition(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -2777,7 +2740,7 @@ class StageMoveRequest:
             if strict:
                 ok = False
             else:
-                self.settle_time = None  # Heal
+                self.settle_time = None
 
         return ok
 
