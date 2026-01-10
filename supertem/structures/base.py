@@ -549,10 +549,9 @@ def parse_opt_float(value: Any, *, name: str, unit: Optional[str] = None, strict
         q = ensure_quantity(value, unit)
         if q is not None: return float(q.magnitude)
     try:
-        # Prevent "Off-by-1000" errors: Reject Quantities if no unit was specified
         if isinstance(value, Quantity) and not unit:
             if strict: raise ValueError(f"{name} is a Quantity but no target unit defined.")
-            return float(value.magnitude)
+            return None
         if isinstance(value, (int, float, np.number)): return float(value)
         if isinstance(value, str):
             s = value.strip()
@@ -647,7 +646,7 @@ def parse_str_list(value: Any, *, name: str, strict: bool = False, extra: Any = 
 
 T = TypeVar("T")
 
-def parse_model(cls: Type[T], raw: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT, extra: Optional["Extras"] = None, key: str = "", allow_empty: bool = False) -> Optional[T]:
+def parse_model(cls: Type[T], raw: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT, extra: Optional["Extras"] = None, key: str = "", allow_empty: bool = True) -> Optional[T]:
     """Instantiate a Dataclass from a dict/list/tuple safely."""
     mode = as_parse_mode(mode)
     if raw is None: return None
@@ -669,8 +668,7 @@ def parse_model(cls: Type[T], raw: Any, *, mode: Union[ParseMode, str, None] = P
     from_dict = getattr(cls, "from_dict", None)
     try:
         if callable(from_dict):
-             try: return from_dict(raw, mode=mode) # type: ignore
-             except TypeError: return from_dict(raw) # type: ignore
+             return from_dict(raw, mode=mode) # type: ignore
         elif is_dataclass(cls) and isinstance(raw, dict):
              return cls(**raw) # type: ignore
     except Exception as e:
@@ -1003,6 +1001,7 @@ class StagePosition:
 
     def is_close(self, other: 'StagePosition', tol_nm: float = 1.0, tol_deg: float = 1e-3) -> bool:
         def chk(a, b, u, t):
+            if a is None and b is None: return True
             if a is None or b is None: return False
             return abs(a.to(u).magnitude - b.to(u).magnitude) <= t
         return (chk(self.x, other.x, "nm", tol_nm) and chk(self.y, other.y, "nm", tol_nm) and
@@ -2285,7 +2284,9 @@ class MicroscopeImage:
         lo, hi = np.percentile(finite, [p_low, p_high])
         rng = hi - lo
         if not np.isfinite(rng) or rng <= 1e-9:
-            return np.zeros_like(a, dtype=np.uint8)
+            mean_val = np.mean(finite)
+            clipped = np.clip(mean_val, 0.0, 255.0).astype(np.uint8)
+            return np.full_like(a, clipped, dtype=np.uint8)
         scaled = (af - lo) * (255.0 / rng)
         return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
 
