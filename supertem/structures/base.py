@@ -207,6 +207,8 @@ VI. Implementation Conventions & Usage
       - Logic: Normalize every field using specific parsers (`parse_opt_int`,
         `parse_model`, etc.).
       - Constraint: DO NOT perform logic checks here. Only ensure types.
+      - Exception: Lightweight value objects (e.g., Point) may skip Extras/Lifecycle
+        overhead for performance, but must still normalize fields.
 
    B. validate(mode=...) (Logic & Healing)
       - Boilerplate: Must start with `_setup_validate` to determine effective mode.
@@ -314,7 +316,8 @@ def note_or_raise(extra: Optional["Extras"], key: str, exc: Exception, *, mode: 
     if extra is None: return
     try:
         if raw is not None: extra.raw[key] = _jsonable(raw)
-        extra.notes[key] = {"error": repr(exc)}
+        error_entry = {"error": str(exc), "type": type(exc).__name__}
+        extra.notes.setdefault(key, []).append(error_entry)
     except Exception: pass
 
 # =============================================================================
@@ -883,10 +886,17 @@ class ROI:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "ROI")
-        self.x = parse_opt_int(self.x, name="ROI.x", strict=strict, extra=self.extra) or 0
-        self.y = parse_opt_int(self.y, name="ROI.y", strict=strict, extra=self.extra) or 0
-        self.width = parse_opt_int(self.width, name="ROI.width", strict=strict, extra=self.extra) or 512
-        self.height = parse_opt_int(self.height, name="ROI.height", strict=strict, extra=self.extra) or 512
+        x_val = parse_opt_int(self.x, name="ROI.x", strict=strict, extra=self.extra)
+        self.x = x_val if x_val is not None else 0
+
+        y_val = parse_opt_int(self.y, name="ROI.y", strict=strict, extra=self.extra)
+        self.y = y_val if y_val is not None else 0
+
+        w_val = parse_opt_int(self.width, name="ROI.width", strict=strict, extra=self.extra)
+        self.width = w_val if w_val is not None else 512
+
+        h_val = parse_opt_int(self.height, name="ROI.height", strict=strict, extra=self.extra)
+        self.height = h_val if h_val is not None else 512
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -979,7 +989,9 @@ class StagePosition:
         if not isinstance(other, StagePosition): return NotImplemented
         def add(a, b, u):
             if a is None and b is None: return None
-            return (a or Q_(0, u)) + (b or Q_(0, u))
+            val_a = a if a is not None else Q_(0, u)
+            val_b = b if b is not None else Q_(0, u)
+            return val_a + val_b
         return StagePosition(
             name=self.name,
             x=add(self.x, other.x, "nm"), y=add(self.y, other.y, "nm"), z=add(self.z, other.z, "nm"),
@@ -990,7 +1002,8 @@ class StagePosition:
 
     def __sub__(self, other: 'StagePosition') -> 'StagePosition':
         if not isinstance(other, StagePosition): return NotImplemented
-        def sub(a, b): return (a - b) if (a is not None and b is not None) else None
+        def sub(a, b):
+            return (a - b) if (a is not None and b is not None) else None
         return StagePosition(
             name=self.name,
             x=sub(self.x, other.x), y=sub(self.y, other.y), z=sub(self.z, other.z),
@@ -1083,26 +1096,55 @@ class StageSystemSettings:
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "StageSystemSettings")
         # 1. Scalars
-        self.enabled = parse_bool(self.enabled, default=True, name="StageSystemSettings.enabled", strict=strict, extra=self.extra)
-        self.can_x = parse_bool(self.can_x, default=True, name="StageSystemSettings.can_x", strict=strict, extra=self.extra)
-        self.can_y = parse_bool(self.can_y, default=True, name="StageSystemSettings.can_y", strict=strict, extra=self.extra)
-        self.can_z = parse_bool(self.can_z, default=True, name="StageSystemSettings.can_z", strict=strict, extra=self.extra)
-        self.can_r = parse_bool(self.can_r, default=False, name="StageSystemSettings.can_r", strict=strict, extra=self.extra)
-        self.can_tilt_x = parse_bool(self.can_tilt_x, default=False, name="StageSystemSettings.can_tilt_x", strict=strict, extra=self.extra)
-        self.can_tilt_y = parse_bool(self.can_tilt_y, default=False, name="StageSystemSettings.can_tilt_y", strict=strict, extra=self.extra)
+        self.enabled = parse_bool(self.enabled, default=True, name="StageSystemSettings.enabled", strict=strict,
+                                  extra=self.extra)
+        self.can_x = parse_bool(self.can_x, default=True, name="StageSystemSettings.can_x", strict=strict,
+                                extra=self.extra)
+        self.can_y = parse_bool(self.can_y, default=True, name="StageSystemSettings.can_y", strict=strict,
+                                extra=self.extra)
+        self.can_z = parse_bool(self.can_z, default=True, name="StageSystemSettings.can_z", strict=strict,
+                                extra=self.extra)
+        self.can_r = parse_bool(self.can_r, default=False, name="StageSystemSettings.can_r", strict=strict,
+                                extra=self.extra)
+        self.can_tilt_x = parse_bool(self.can_tilt_x, default=False, name="StageSystemSettings.can_tilt_x",
+                                     strict=strict, extra=self.extra)
+        self.can_tilt_y = parse_bool(self.can_tilt_y, default=False, name="StageSystemSettings.can_tilt_y",
+                                     strict=strict, extra=self.extra)
 
         # 2. Quantities
-        self.x_limits = parse_opt_pair_quantity(self.x_limits, "nm", name="StageSystemSettings.x_limits", strict=strict, extra=self.extra)
-        self.y_limits = parse_opt_pair_quantity(self.y_limits, "nm", name="StageSystemSettings.y_limits", strict=strict, extra=self.extra)
-        self.z_limits = parse_opt_pair_quantity(self.z_limits, "nm", name="StageSystemSettings.z_limits", strict=strict, extra=self.extra)
-        self.r_limits = parse_opt_pair_quantity(self.r_limits, "degree", name="StageSystemSettings.r_limits", strict=strict, extra=self.extra)
-        self.tilt_x_limits = parse_opt_pair_quantity(self.tilt_x_limits, "degree", name="StageSystemSettings.tilt_x_limits", strict=strict, extra=self.extra)
-        self.tilt_y_limits = parse_opt_pair_quantity(self.tilt_y_limits, "degree", name="StageSystemSettings.tilt_y_limits", strict=strict, extra=self.extra)
-        self.max_step_distance = parse_opt_quantity(self.max_step_distance, "nm", name="StageSystemSettings.max_step_distance", strict=strict, extra=self.extra) or Q_(50000.0, "nm")
-        self.max_step_angle = parse_opt_quantity(self.max_step_angle, "degree", name="StageSystemSettings.max_step_angle", strict=strict, extra=self.extra) or Q_(1.0, "degree")
-        self.eucentric_z = parse_opt_quantity(self.eucentric_z, "nm", name="StageSystemSettings.eucentric_z", strict=strict, extra=self.extra)
-        self.settle_time = parse_opt_quantity(self.settle_time, "seconds", name="StageSystemSettings.settle_time", strict=strict, extra=self.extra) or Q_(0.2, "seconds")
-        self.timeout = parse_opt_quantity(self.timeout, "seconds", name="StageSystemSettings.timeout", strict=strict, extra=self.extra) or Q_(10.0, "seconds")
+        self.x_limits = parse_opt_pair_quantity(self.x_limits, "nm", name="StageSystemSettings.x_limits", strict=strict,
+                                                extra=self.extra)
+        self.y_limits = parse_opt_pair_quantity(self.y_limits, "nm", name="StageSystemSettings.y_limits", strict=strict,
+                                                extra=self.extra)
+        self.z_limits = parse_opt_pair_quantity(self.z_limits, "nm", name="StageSystemSettings.z_limits", strict=strict,
+                                                extra=self.extra)
+        self.r_limits = parse_opt_pair_quantity(self.r_limits, "degree", name="StageSystemSettings.r_limits",
+                                                strict=strict, extra=self.extra)
+        self.tilt_x_limits = parse_opt_pair_quantity(self.tilt_x_limits, "degree",
+                                                     name="StageSystemSettings.tilt_x_limits", strict=strict,
+                                                     extra=self.extra)
+        self.tilt_y_limits = parse_opt_pair_quantity(self.tilt_y_limits, "degree",
+                                                     name="StageSystemSettings.tilt_y_limits", strict=strict,
+                                                     extra=self.extra)
+
+        _max_dist = parse_opt_quantity(self.max_step_distance, "nm", name="StageSystemSettings.max_step_distance",
+                                       strict=strict, extra=self.extra)
+        self.max_step_distance = _max_dist if _max_dist is not None else Q_(50000.0, "nm")
+
+        _max_angle = parse_opt_quantity(self.max_step_angle, "degree", name="StageSystemSettings.max_step_angle",
+                                        strict=strict, extra=self.extra)
+        self.max_step_angle = _max_angle if _max_angle is not None else Q_(1.0, "degree")
+
+        self.eucentric_z = parse_opt_quantity(self.eucentric_z, "nm", name="StageSystemSettings.eucentric_z",
+                                              strict=strict, extra=self.extra)
+
+        _settle = parse_opt_quantity(self.settle_time, "seconds", name="StageSystemSettings.settle_time", strict=strict,
+                                     extra=self.extra)
+        self.settle_time = _settle if _settle is not None else Q_(0.2, "seconds")
+
+        _timeout = parse_opt_quantity(self.timeout, "seconds", name="StageSystemSettings.timeout", strict=strict,
+                                      extra=self.extra)
+        self.timeout = _timeout if _timeout is not None else Q_(10.0, "seconds")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -1225,7 +1267,7 @@ class StageSystemSettings:
             dy = step_vector.y or Q_(0, 'nm')
             dx_nm = dx.to("nm").magnitude
             dy_nm = dy.to("nm").magnitude
-            distance = (dx ** 2 + dy ** 2) ** 0.5
+            distance = (dx_nm ** 2 + dy_nm ** 2) ** 0.5
             max_dist_nm = self.max_step_distance.to("nm").magnitude
 
             if distance > max_dist_nm:
