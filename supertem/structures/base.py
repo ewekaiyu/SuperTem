@@ -1758,7 +1758,9 @@ class DetectorCapabilities:
 
     Attributes:
         can_*: Capability flags (binning, gain, offset, rotation).
-        *_min/max: Supported ranges for binning, exposure, ROI size, gain, and offset.
+        *_min/max: Supported ranges.
+                   Quantities (exposure, rotation) are unit-aware.
+                   Discrete values (binning, gain) are integers.
 
     Notes:
         This class is permanently `LENIENT` to safely ingest driver reports without validation errors.
@@ -1770,8 +1772,8 @@ class DetectorCapabilities:
     binning_index_max: Optional[int] = None
     binning_xy_min: Optional[Tuple[int, int]] = None
     binning_xy_max: Optional[Tuple[int, int]] = None
-    exposure_ms_min: Optional[float] = None
-    exposure_ms_max: Optional[float] = None
+    exposure_min: Optional["Quantity"] = None
+    exposure_max: Optional["Quantity"] = None
     frame_integration_min: Optional[int] = None
     frame_integration_max: Optional[int] = None
     roi_size_min: Optional[Tuple[int, int]] = None
@@ -1783,8 +1785,8 @@ class DetectorCapabilities:
     offset_index_min: Optional[int] = None
     offset_index_max: Optional[int] = None
     can_digital_rotation: Optional[bool] = None
-    digital_rotation_deg_min: Optional[float] = None
-    digital_rotation_deg_max: Optional[float] = None
+    digital_rotation_min: Optional["Quantity"] = None
+    digital_rotation_max: Optional["Quantity"] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
 
@@ -1799,8 +1801,8 @@ class DetectorCapabilities:
         self.binning_index_max = parse_opt_int(self.binning_index_max, name="DetectorCapabilities.binning_index_max", strict=strict, extra=self.extra)
         self.binning_xy_min = parse_opt_pair_int(self.binning_xy_min, name="DetectorCapabilities.binning_xy_min", strict=strict, extra=self.extra)
         self.binning_xy_max = parse_opt_pair_int(self.binning_xy_max, name="DetectorCapabilities.binning_xy_max", strict=strict, extra=self.extra)
-        self.exposure_ms_min = parse_opt_float(self.exposure_ms_min, name="DetectorCapabilities.exposure_ms_min", strict=strict, extra=self.extra)
-        self.exposure_ms_max = parse_opt_float(self.exposure_ms_max, name="DetectorCapabilities.exposure_ms_max", strict=strict, extra=self.extra)
+        self.exposure_min = parse_opt_quantity(self.exposure_min, "ms", name="DetectorCapabilities.exposure_min", strict=strict, extra=self.extra)
+        self.exposure_max = parse_opt_quantity(self.exposure_max, "ms", name="DetectorCapabilities.exposure_max", strict=strict, extra=self.extra)
         self.frame_integration_min = parse_opt_int(self.frame_integration_min, name="DetectorCapabilities.frame_integration_min", strict=strict, extra=self.extra)
         self.frame_integration_max = parse_opt_int(self.frame_integration_max, name="DetectorCapabilities.frame_integration_max", strict=strict, extra=self.extra)
         self.roi_size_min = parse_opt_pair_int(self.roi_size_min, name="DetectorCapabilities.roi_size_min", strict=strict, extra=self.extra)
@@ -1809,8 +1811,8 @@ class DetectorCapabilities:
         self.gain_index_max = parse_opt_int(self.gain_index_max, name="DetectorCapabilities.gain_index_max", strict=strict, extra=self.extra)
         self.offset_index_min = parse_opt_int(self.offset_index_min, name="DetectorCapabilities.offset_index_min", strict=strict, extra=self.extra)
         self.offset_index_max = parse_opt_int(self.offset_index_max, name="DetectorCapabilities.offset_index_max", strict=strict, extra=self.extra)
-        self.digital_rotation_deg_min = parse_opt_float(self.digital_rotation_deg_min, name="DetectorCapabilities.digital_rotation_deg_min", strict=strict, extra=self.extra)
-        self.digital_rotation_deg_max = parse_opt_float(self.digital_rotation_deg_max, name="DetectorCapabilities.digital_rotation_deg_max", strict=strict, extra=self.extra)
+        self.digital_rotation_min = parse_opt_quantity(self.digital_rotation_min, "degree", name="DetectorCapabilities.digital_rotation_min", strict=strict, extra=self.extra)
+        self.digital_rotation_max = parse_opt_quantity(self.digital_rotation_max, "degree", name="DetectorCapabilities.digital_rotation_max", strict=strict, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -1828,22 +1830,28 @@ class DetectorCapabilities:
             return True
 
         def _check_pos(val, name, attr_name):
-            if val is not None and val < 0:
-                note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
-                if strict: return False
-                setattr(self, attr_name, 0.0)
+            if val is not None:
+                is_neg = False
+                if isinstance(val, Quantity): is_neg = (val < Q_(0, val.units))
+                elif val < 0: is_neg = True
+
+                if is_neg:
+                    note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
+                    if strict: return False
+                    zero = Q_(0.0, val.units) if isinstance(val, Quantity) else 0.0
+                    setattr(self, attr_name, zero)
             return True
 
         # 1. Range Consistency
-        # Note: We pass attribute names to allow swapping in _check_range
         ok = _check_range(self.binning_index_min, self.binning_index_max, "DetectorCapabilities.binning_index", "binning_index_min", "binning_index_max") and ok
         ok = _check_range(self.frame_integration_min, self.frame_integration_max, "DetectorCapabilities.frame_integration", "frame_integration_min", "frame_integration_max") and ok
         ok = _check_range(self.gain_index_min, self.gain_index_max, "DetectorCapabilities.gain_index", "gain_index_min", "gain_index_max") and ok
         ok = _check_range(self.offset_index_min, self.offset_index_max, "DetectorCapabilities.offset_index", "offset_index_min", "offset_index_max") and ok
-        ok = _check_range(self.exposure_ms_min, self.exposure_ms_max, "DetectorCapabilities.exposure_ms", "exposure_ms_min", "exposure_ms_max") and ok
+        ok = _check_range(self.exposure_min, self.exposure_max, "DetectorCapabilities.exposure", "exposure_min", "exposure_max") and ok
+        ok = _check_range(self.digital_rotation_min, self.digital_rotation_max, "DetectorCapabilities.digital_rotation", "digital_rotation_min", "digital_rotation_max") and ok
 
         # 2. Physical Non-negativity
-        ok = _check_pos(self.exposure_ms_min, "DetectorCapabilities.exposure_ms_min", "exposure_ms_min") and ok
+        ok = _check_pos(self.exposure_min, "DetectorCapabilities.exposure_min", "exposure_min") and ok
 
         # 3. Tuple consistency (ROI/Binning)
         if self.roi_size_min and self.roi_size_max:
@@ -1875,9 +1883,13 @@ class DetectorCapabilities:
             if self.binning_index_min and settings.binning_index < self.binning_index_min: return False
             if self.binning_index_max and settings.binning_index > self.binning_index_max: return False
 
-        if settings.exposure:
-            if self.exposure_ms_min and settings.exposure < Q_(self.exposure_ms_min, 'ms'): return False
-            if self.exposure_ms_max and settings.exposure > Q_(self.exposure_ms_max, 'ms'): return False
+        if settings.exposure is not None:
+            if self.exposure_min is not None and settings.exposure < self.exposure_min: return False
+            if self.exposure_max is not None and settings.exposure > self.exposure_max: return False
+
+        if settings.digital_rotation_deg is not None and self.can_digital_rotation:
+             if self.digital_rotation_min is not None and settings.digital_rotation_deg < self.digital_rotation_min: return False
+             if self.digital_rotation_max is not None and settings.digital_rotation_deg > self.digital_rotation_max: return False
 
         return True
 
@@ -1888,8 +1900,8 @@ class DetectorCapabilities:
             "binning_index_max": self.binning_index_max,
             "binning_xy_min": list(self.binning_xy_min) if self.binning_xy_min else None,
             "binning_xy_max": list(self.binning_xy_max) if self.binning_xy_max else None,
-            "exposure_ms_min": self.exposure_ms_min,
-            "exposure_ms_max": self.exposure_ms_max,
+            "exposure_ms_min": serialize_quantity(self.exposure_min, "ms"),
+            "exposure_ms_max": serialize_quantity(self.exposure_max, "ms"),
             "frame_integration_min": self.frame_integration_min,
             "frame_integration_max": self.frame_integration_max,
             "roi_size_min": list(self.roi_size_min) if self.roi_size_min else None,
@@ -1901,8 +1913,8 @@ class DetectorCapabilities:
             "offset_index_min": self.offset_index_min,
             "offset_index_max": self.offset_index_max,
             "can_digital_rotation": self.can_digital_rotation,
-            "digital_rotation_deg_min": self.digital_rotation_deg_min,
-            "digital_rotation_deg_max": self.digital_rotation_deg_max,
+            "digital_rotation_deg_min": serialize_quantity(self.digital_rotation_min, "degree"),
+            "digital_rotation_deg_max": serialize_quantity(self.digital_rotation_max, "degree"),
         }
         return _finish_to_dict(d, self.extra)
 
@@ -1924,8 +1936,8 @@ class DetectorCapabilities:
             binning_index_max=d_dict.get("binning_index_max"),
             binning_xy_min=d_dict.get("binning_xy_min"),
             binning_xy_max=d_dict.get("binning_xy_max"),
-            exposure_ms_min=d_dict.get("exposure_ms_min"),
-            exposure_ms_max=d_dict.get("exposure_ms_max"),
+            exposure_min=d_dict.get("exposure_ms_min"),
+            exposure_max=d_dict.get("exposure_ms_max"),
             frame_integration_min=d_dict.get("frame_integration_min"),
             frame_integration_max=d_dict.get("frame_integration_max"),
             roi_size_min=d_dict.get("roi_size_min", d_dict.get("roi_min")),
@@ -1937,8 +1949,8 @@ class DetectorCapabilities:
             offset_index_min=d_dict.get("offset_index_min"),
             offset_index_max=d_dict.get("offset_index_max"),
             can_digital_rotation=d_dict.get("can_digital_rotation"),
-            digital_rotation_deg_min=d_dict.get("digital_rotation_deg_min"),
-            digital_rotation_deg_max=d_dict.get("digital_rotation_deg_max"),
+            digital_rotation_min=d_dict.get("digital_rotation_deg_min"),
+            digital_rotation_max=d_dict.get("digital_rotation_deg_max"),
             extra=extra, _mode=mode
         )
 
