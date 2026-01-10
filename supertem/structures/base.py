@@ -193,16 +193,54 @@ If a value cannot be expressed safely as JSON, preserve a safe representation in
 Extras.raw and record a diagnostic note.
 
 ===============================================================================
-VI. Implementation Conventions
+VI. Implementation Conventions & Usage
 ===============================================================================
 
-- __post_init__ should:
-    1) normalize types and nested objects
-    2) normalize Extras
-    3) defer validation to the boundary (do not call validate() here)
-- from_dict(...) should be thin:
-    - construct with _mode set
-    - rely on __post_init__ for parsing and validate() for logic
+1. Internal Implementation Patterns
+-------------------------------------------------------------------------------
+   To ensure consistent behavior across 20+ structures, every lifecycle method
+   must follow a strict pattern using the shared helper functions.
+
+   A. __post_init__ (Normalization)
+      - Boilerplate: Must start with `_setup_init` to resolve mode and extras.
+        `mode, strict, self.extra = _setup_init(self, self._mode, "ClassName")`
+      - Logic: Normalize every field using specific parsers (`parse_opt_int`,
+        `parse_model`, etc.).
+      - Constraint: DO NOT perform logic checks here. Only ensure types.
+
+   B. validate(mode=...) (Logic & Healing)
+      - Boilerplate: Must start with `_setup_validate` to determine effective mode.
+        `mode, strict = _setup_validate(self._mode, mode)`
+      - Logic: Check physical constraints. Use `note_or_raise(self.extra, ...)`
+        to handle violations (raising in STRICT, recording in LENIENT).
+      - Healing: In LENIENT mode, auto-correct invalid values after recording them.
+
+   C. to_dict() (Serialization)
+      - Logic: Build a local dict of canonical fields.
+      - Boilerplate: Must return via `_finish_to_dict` to inject extras and
+        ensure JSON safety.
+        `return _finish_to_dict(d, self.extra)`
+
+   D. from_dict(data, mode=...) (Ingestion)
+      - Boilerplate: Must use `_setup_from_dict` to validate input type and
+        harvest unknown keys into specific Extras.
+        `d, mode, extra = _setup_from_dict(Cls, data, mode, known_keys=...)`
+      - Fallback: If `d` is None (e.g. input was already an object), return
+        `replace(data, _mode=mode)`.
+      - Construction: Pass cleaned data and `extra` into the constructor.
+
+2. External Usage: Immutability by Policy
+-------------------------------------------------------------------------------
+   To guarantee type safety, external code MUST treat these objects as immutable.
+
+   - DO NOT modify attributes directly:
+       `settings.beam.voltage = "300 kV"`  <-- UNSAFE. Bypasses normalization.
+                                               Result is a string, not a Quantity.
+
+   - ALWAYS use `dataclasses.replace()`:
+       `new_beam = replace(settings.beam, voltage="300 kV")` <-- SAFE.
+       This triggers `__init__` and `__post_init__` again, ensuring the string
+       is correctly parsed into a Quantity object.
 
 ===============================================================================
 Rationale
