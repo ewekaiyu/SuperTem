@@ -1141,44 +1141,71 @@ class StageSystemSettings:
 
         return ok
 
-    def is_safe_move(self, target: StagePosition, current: Optional[StagePosition] = None) -> bool:
+    def is_safe_move(self, target: StagePosition, current: Optional[StagePosition] = None,
+                     relative: bool = False) -> bool:
         """
         RUNTIME CHECK: External Safety.
         Checks if a specific request complies with the validated limits.
+
+        Args:
+            target: The desired position (absolute) or movement vector (relative).
+            current: The current stage position (required for relative checks or step size calc).
+            relative: If True, 'target' is treated as a delta to 'current'.
         """
         mode = as_parse_mode(self._mode)
-        def check(val, lims, name):
-            if val is not None and lims and not (lims[0] <= val <= lims[1]):
-                note_or_raise(self.extra, f"Safety.{name}", ValueError(f"Target {val} outside {lims}"), mode=mode)
+
+        # 1. Resolve Absolute Target
+        # If relative, we MUST have current to know where we end up.
+        if relative:
+            if current is None:
+                note_or_raise(self.extra, "Safety.relative_no_current",
+                              ValueError("Cannot validate relative move without current position"), mode=mode)
                 return False
+            # Resolve the final destination
+            abs_target = current + target
+            # For relative moves, the 'target' IS the step vector
+            step_vector = target
+        else:
+            # For absolute moves, the target is the destination
+            abs_target = target
+            # The step vector is the difference (if current is known)
+            step_vector = (target - current) if current else None
+
+        # 2. Check Static Limits (Boundaries) using abs_target
+        def check_bound(val, lims, name):
+            if val is not None and lims:
+                if not (lims[0] <= val <= lims[1]):
+                    note_or_raise(self.extra, f"Safety.{name}_limit",
+                                  ValueError(f"Target {val} outside limits {lims}"), mode=mode)
+                    return False
             return True
 
         ok = True
-        ok = check(target.x, self.x_limits, "x") and ok
-        ok = check(target.y, self.y_limits, "y") and ok
-        ok = check(target.z, self.z_limits, "z") and ok
-        ok = check(target.r, self.r_limits, "r") and ok
-        ok = check(target.tilt_x, self.tilt_x_limits, "tilt_x") and ok
-        ok = check(target.tilt_y, self.tilt_y_limits, "tilt_y") and ok
+        ok = check_bound(abs_target.x, self.x_limits, "x") and ok
+        ok = check_bound(abs_target.y, self.y_limits, "y") and ok
+        ok = check_bound(abs_target.z, self.z_limits, "z") and ok
+        ok = check_bound(abs_target.r, self.r_limits, "r") and ok
+        ok = check_bound(abs_target.tilt_x, self.tilt_x_limits, "tilt_x") and ok
+        ok = check_bound(abs_target.tilt_y, self.tilt_y_limits, "tilt_y") and ok
 
-        # 2. Relative Step Size Checks (Dynamics)
-        if current is not None:
+        # 3. Check Dynamic Limits (Step Size) using step_vector
+        if step_vector is not None:
             # Euclidean distance for XY stage movement
-            dx = (target.x - current.x) if (target.x is not None and current.x is not None) else Q_(0, 'nm')
-            dy = (target.y - current.y) if (target.y is not None and current.y is not None) else Q_(0, 'nm')
+            dx = step_vector.x or Q_(0, 'nm')
+            dy = step_vector.y or Q_(0, 'nm')
 
-            # Simple magnitude check without sqrt optimization for clarity/units
+            # Simple magnitude check
             distance = (dx ** 2 + dy ** 2) ** 0.5
 
             if distance > self.max_step_distance:
                 note_or_raise(self.extra, "Safety.max_step_distance",
-                              ValueError(f"XY move distance {distance} exceeds limit {self.max_step_distance}"),
+                              ValueError(f"XY step {distance} exceeds limit {self.max_step_distance}"),
                               mode=mode)
                 ok = False
 
             # Check tilt step
-            if target.tilt_x is not None and current.tilt_x is not None:
-                d_tilt = abs(target.tilt_x - current.tilt_x)
+            if step_vector.tilt_x is not None:
+                d_tilt = abs(step_vector.tilt_x)
                 if d_tilt > self.max_step_angle:
                     note_or_raise(self.extra, "Safety.max_step_angle",
                                   ValueError(f"Tilt X step {d_tilt} exceeds limit {self.max_step_angle}"), mode=mode)
@@ -1713,9 +1740,6 @@ class DetectorCapabilities:
         return ok
 
     def supports(self, settings: DetectorSettings) -> bool:
-        if settings.detector_id:
-             pass
-
         if settings.binning_xy:
             bx, by = settings.binning_xy
             if self.binning_xy_max:
@@ -2241,12 +2265,20 @@ class MicroscopeImage:
     Notes:
         Supports TIFF (with embedded metadata), PNG, and JPEG formats.
     """
+
     def __init__(self, data: np.ndarray, metadata: Optional[MicroscopeImageMetadata] = None):
+        # 1. Normalize: Squeeze trivial dimensions if 3D (e.g. [1, H, W] -> [H, W])
+        if data.ndim == 3:
+            if data.shape[0] == 1:
+                data = data[0]
+            elif data.shape[-1] == 1:
+                data = data[..., 0]
+
+        # 2. Validate: Strict check on the final 2D form
         if not _check_data_format(data):
-            if data.ndim == 3 and data.shape[0] == 1: data = data[0]
-            elif data.ndim == 3 and data.shape[-1] == 1: data = data[..., 0]
-            if not _check_data_format(data):
-                raise ValueError("Invalid data format for MicroscopeImage. Must be 2D uint8/uint16.")
+            raise ValueError(
+                f"Invalid data format for MicroscopeImage. Expected 2D uint8/uint16, got shape={data.shape} dtype={data.dtype}")
+
         self.data = data
         self.metadata = MicroscopeImageMetadata.from_dict(metadata) if isinstance(metadata, dict) else metadata
 
