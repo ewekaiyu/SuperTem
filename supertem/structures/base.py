@@ -665,7 +665,11 @@ def parse_opt_id(value: Any, *, name: str, strict: bool = False, extra: Any = No
     if isinstance(value, str) and value.strip() == "":
         if extra is not None:
             _extra_put_raw(extra, name, value)
-            if hasattr(extra, "notes"): extra.notes.setdefault(f"{name}.empty", []).append(name)
+            if hasattr(extra, "notes"):
+                extra.notes.setdefault(f"{name}.empty", []).append({
+                    "error": f"Field '{name}' is an empty string",
+                    "type": "ValueError"
+                })
         return None
     return parse_opt_str(value, name=name, strict=strict, extra=extra)
 
@@ -835,7 +839,10 @@ def _setup_from_dict(cls: Type[T], data: Any, mode: Union[ParseMode, str, None],
         ex = Extras()
         if data is not None:
             _extra_put_raw(ex, "source_type_error", data)
-            ex.notes["source_type_error"] = {"error": f"Expected dict, got {type(data).__name__}"}
+            ex.notes["source_type_error"] = [{
+                "error": f"Expected dict, got {type(data).__name__}",
+                "type": "TypeError"
+            }]
         return {}, mode, ex
     extra = collect_extra(data, tuple(known_keys) + tuple(aliases), owner=cls.__name__)
     return data, mode, extra
@@ -1065,15 +1072,37 @@ class StagePosition:
              _mode=self._mode
         )
 
-    # ... [is_close, to_dict, from_dict preserved] ...
     def is_close(self, other: 'StagePosition', tol_nm: float = 1.0, tol_deg: float = 1e-3) -> bool:
-        def chk(a, b, u, t):
-            if a is None and b is None: return True
-            if a is None or b is None: return False
-            return abs(a.to(u).magnitude - b.to(u).magnitude) <= t
-        return (chk(self.x, other.x, "nm", tol_nm) and chk(self.y, other.y, "nm", tol_nm) and
-                chk(self.z, other.z, "nm", tol_nm) and chk(self.r, other.r, "degree", tol_deg) and
-                chk(self.tilt_x, other.tilt_x, "degree", tol_deg) and chk(self.tilt_y, other.tilt_y, "degree", tol_deg))
+        """
+        Checks if the 'other' position satisfies the constraints defined by 'self'.
+
+        This is an asymmetric 'Target vs. Current' check:
+          1. Wildcard: If self.axis is None, it ignores that axis in 'other'.
+          2. Constraint: If self.axis is set, 'other' MUST have a value and be within tolerance.
+        """
+        if not isinstance(other, StagePosition):
+            raise TypeError(f"Cannot compare StagePosition with {type(other)}")
+
+        def chk(target_val, current_val, unit, tol):
+            # Case 1: Target (Self) is None -> "Don't Care" / Wildcard.
+            if target_val is None:
+                return True
+
+            # Case 2: Target is Set, but Current (Other) is Missing -> Fail.
+            if current_val is None:
+                return False
+
+            # Case 3: Both exist -> Check numerical proximity.
+            return abs(target_val.to(unit).magnitude - current_val.to(unit).magnitude) <= tol
+
+        return (
+                chk(self.x, other.x, "nm", tol_nm) and
+                chk(self.y, other.y, "nm", tol_nm) and
+                chk(self.z, other.z, "nm", tol_nm) and
+                chk(self.r, other.r, "degree", tol_deg) and
+                chk(self.tilt_x, other.tilt_x, "degree", tol_deg) and
+                chk(self.tilt_y, other.tilt_y, "degree", tol_deg)
+        )
 
     def to_dict(self) -> dict:
         d = {
