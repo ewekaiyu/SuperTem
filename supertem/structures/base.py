@@ -1042,7 +1042,6 @@ class StagePosition:
             extra=extra, _mode=mode,
         )
 
-
 @dataclass
 class StageSystemSettings:
     """
@@ -1770,6 +1769,11 @@ class DetectorCapabilities:
                 if bx > max_x or by > max_y: return False
             if self.can_binning is False and (bx > 1 or by > 1): return False
 
+        if settings.binning_index is not None:
+            if self.can_binning is False and settings.binning_index > 1: return False
+            if self.binning_index_min and settings.binning_index < self.binning_index_min: return False
+            if self.binning_index_max and settings.binning_index > self.binning_index_max: return False
+
         if settings.exposure:
             if self.exposure_ms_min and settings.exposure < Q_(self.exposure_ms_min, 'ms'): return False
             if self.exposure_ms_max and settings.exposure > Q_(self.exposure_ms_max, 'ms'): return False
@@ -2398,7 +2402,6 @@ class MicroscopeImage:
         try:
             if self.metadata is not None:
                 sidecar.write_text(json.dumps(self.metadata.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-            elif sidecar.exists(): sidecar.unlink()
         except Exception: pass
         return path
 
@@ -2698,8 +2701,9 @@ class StageMoveRequest:
         relative: If True, target values are added to current position (deltas).
         backlash_correction: Whether to perform hardware backlash compensation.
         wait_for_settle: If True, blocks until movement and settling are complete.
-        settle_time: Optional duration to wait after movement stops.
-                     If None, uses the default from StageSystemSettings.
+       settle_time: Optional duration to wait.
+                 If None, uses StageSystemSettings.settle_time.
+                 If 0, settles immediately (no wait).
     """
     target: Optional[StagePosition] = None
     relative: bool = False
