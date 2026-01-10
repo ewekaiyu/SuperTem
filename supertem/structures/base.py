@@ -20,6 +20,11 @@ The intended lifecycle for objects in this module is:
   1) Ingest (untrusted input)
      - Source: vendor SDK returns, JSON logs, user configs, network payloads
      - Entry:  Class.from_dict(payload, mode=LENIENT or STRICT)
+     - Mode propagation: The `mode` provided to a top-level `from_dict(...)` is
+       treated as the default for the entire object graph. Nested `from_dict(...)`
+       calls MUST pass the same effective mode to children (unless a field
+       explicitly overrides it), so a single boundary choice (LENIENT vs STRICT)
+       controls all descendants consistently.
      - Goal:   Capture data without crashing, even if imperfect.
 
   2) Normalize (Integrity of Structure)
@@ -295,7 +300,6 @@ and safe (STRICT validation/execution).
 """
 import datetime
 import json
-import math
 import os
 import ipaddress
 from dataclasses import dataclass, field, replace, is_dataclass
@@ -838,7 +842,7 @@ def _setup_from_dict(cls: Type[T], data: Any, mode: Union[ParseMode, str, None],
         if is_strict(mode): raise TypeError(f"{cls.__name__} expects dict")
         ex = Extras()
         if data is not None:
-            _extra_put_raw(ex, "source_type_error", data)
+            _extra_put_raw(ex, f"{cls.__name__}.from_dict.source_type_error", data)
             ex.notes["source_type_error"] = [{
                 "error": f"Expected dict, got {type(data).__name__}",
                 "type": "TypeError"
@@ -854,20 +858,13 @@ def _setup_from_dict(cls: Type[T], data: Any, mode: Union[ParseMode, str, None],
 @dataclass
 class Point:
     """
-    A 3D coordinate vector with an optional label.
+    Simple 3D point used for geometry and settings.
 
-    Used to represent beam shifts, stigmation vectors, and logical coordinates.
+    Role: STRUCTURE.
+    Category: A.
 
-    Attributes:
-        x: X-axis component.
-        y: Y-axis component.
-        z: Z-axis component (defaults to 0.0 for 2D vectors).
-        name: Optional label (e.g., "center", "stigmator_a").
-
-    Notes:
-        This class is lightweight and does not include the `Extras` container.
-    Role: Lightweight Structure / Config
-    Category: A (Strict Runtime for x,y,z - defaults to 0.0)
+    Special:
+    - This class is lightweight and does not include the `Extras` container.
     """
     x: Optional[float] = None
     y: Optional[float] = None
@@ -918,21 +915,16 @@ class Point:
 @dataclass
 class ROI:
     """
-    Defines a rectangular Region of Interest on a detector.
+    Region of Interest specified in pixel coordinates for a detector sensor.
 
-    Specifies the offset and dimensions for image acquisition relative to the full sensor.
+    Role: Gatekeeper (Hardware Window)
+    Category: A (Config)
 
     Attributes:
-        x: Horizontal offset from the left edge (0-indexed).
-        y: Vertical offset from the top edge (0-indexed).
-        width: Width of the region in pixels.
-        height: Height of the region in pixels.
-
-    Notes:
-        In `STRICT` mode, non-positive dimensions raise specific validation errors.
-        In `LENIENT` mode, invalid dimensions are auto-corrected to defaults to ensure continuity.
-    Role: Configuration
-    Category: A (Strict Runtime - must have valid integers)
+        x, y (Optional[int]): Top-left corner of the window. Units: px.
+            None Behavior: Defaulted to 0.
+        width, height (Optional[int]): Dimensions of the window. Units: px.
+            None Behavior: Defaulted to 512.
     """
     x: Optional[int] = None
     y: Optional[int] = None
@@ -996,22 +988,16 @@ class ROI:
 @dataclass
 class StagePosition:
     """
-    Represents a 5-axis microscope stage position with physical units.
+    Stage coordinate representation for both telemetry (State) and movement (Intent).
 
-    Stores coordinates as Pint Quantities to ensure unit safety (e.g., meters vs nanometers).
-    Supports vector arithmetic for calculating relative movements.
+    Role: Dual-Use (Snapshot and Intent)
+    Category: C / D
 
     Attributes:
-        name: Optional label for this position (e.g., "Sample Center").
-        x: Physical X-axis position (Length).
-        y: Physical Y-axis position (Length).
-        z: Physical Z-axis height (Length).
-        r: Stage rotation (Angle).
-        tilt_x: Alpha tilt (Angle).
-        tilt_y: Beta tilt (Angle).
-        coordinate_system: Label for the reference frame (e.g., "Raw", "Cartesian").
-    Role: Measured State / Request
-    Category: C/D (Nullable Runtime - None means 'Unknown' or 'Don't Move')
+        x, y, z (Optional[Quantity]): Translation coordinates. Units: nm.
+            None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
+        tilt_x, tilt_y (Optional[Quantity]): Rotation/Alpha-Beta tilts. Units: degree.
+            None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
     """
     name: Optional[str] = None
     x: Optional["Quantity"] = None
@@ -1140,21 +1126,20 @@ class StagePosition:
 @dataclass
 class StageSystemSettings:
     """
-    Configuration and safety limits for the microscope stage.
+    Safety limits and step sizes for physical stage motion.
 
-    Defines enabled axes, movement boundaries, and step size limits to ensure hardware safety.
+    Role: Gatekeeper (System Limits)
+    Category: A (Strict Runtime)
 
     Attributes:
-        enabled: Master switch to enable/disable stage control.
-        can_*: Capability flags for specific axes (x, y, z, r, tilt).
-        *_limits: Tuple of (min, max) Quantities defining the allowable range for each axis.
-        max_step_distance: Safety limit for the largest single lateral move allowed.
-        max_step_angle: Safety limit for the largest single tilt/rotation move allowed.
-        eucentric_z: The calibrated Z-height where the sample is at the eucentric plane.
-        settle_time_s: Time to wait for stabilization after movement.
-        timeout_s: Maximum duration to wait for a movement command.
-    Role: Configuration & Limits
-    Category: A (Strict Runtime - Drivers need concrete limits)
+        enabled (Optional[bool]): Master toggle for stage interaction.
+            None Behavior: Defaulted to True.
+        max_step_distance (Optional[Quantity]): Safety cap for XY travel. Units: nm.
+            None Behavior: Defaulted to 50,000 nm.
+        settle_time (Optional[Quantity]): Time to wait for vibration damping. Units: seconds.
+            None Behavior: Defaulted to 0.2 seconds.
+        x_limits, y_limits, z_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
+            None Behavior: Preserved as None (implies 'Unlimited').
     """
     enabled: Optional[bool] = None
     can_x: Optional[bool] = None
@@ -1406,9 +1391,19 @@ class StageSystemSettings:
 @dataclass
 class BeamSettings:
     """
-        Role: Measured State / Request
-        Category: C/D (Nullable Runtime)
-        """
+    Optical parameters of the electron beam for both state reporting and control.
+
+    Role: Dual-Use (Snapshot and Intent)
+    Category: C / D
+
+    Attributes:
+        voltage (Optional[Quantity]): Accelerating voltage. Units: kV.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        spot_size (Optional[int]): Beam focus index.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        defocus (Optional[Quantity]): Lens shift from focus. Units: nm.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+    """
     voltage: Optional["Quantity"] = None
     beam_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
@@ -1516,19 +1511,20 @@ BeamState = BeamSettings
 @dataclass
 class BeamSystemSettings:
     """
-    Operational constraints and defaults for the electron beam.
+    Safety limits and supported ranges for beam optics and high voltage.
 
-    Defines safe operating ranges for voltage and current to prevent invalid hardware states.
+    Role: Gatekeeper (System Limits)
+    Category: A / B (Config and Structure)
 
     Attributes:
-        enabled: Master switch to enable/disable beam control.
-        default_beam: A safe, default configuration to fallback to.
-        voltage_limits: Allowable range (min, max) for accelerating voltage.
-        beam_current_limits: Allowable range (min, max) for beam current.
-        spot_size_limits: Min/Max valid indices for spot size.
-        convergence_angle_limits: Allowable range (min, max) for convergence angle.
-    Role: Configuration
-    Category: A (Config) & B (Structure)
+        enabled (Optional[bool]): Master toggle for beam control.
+            None Behavior: Defaulted to True.
+        default_beam (Optional[BeamSettings]): Baseline settings for beam reset.
+            None Behavior: Structural Default (Empty BeamSettings).
+        voltage_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max HT. Units: kV.
+            None Behavior: Preserved as None (implies 'Unlimited').
+        spot_size_limits (Optional[Tuple[int, int]]): Valid range for spot indices.
+            None Behavior: Preserved as None.
     """
     enabled: Optional[bool] = None
     default_beam: Optional[BeamSettings] = None
@@ -1651,25 +1647,18 @@ class BeamSystemSettings:
 @dataclass
 class DetectorSettings:
     """
-    Configuration for a single image acquisition.
+    Detector parameters used for reporting state and requesting image acquisition.
 
-    Specifies which detector to use and how the image should be captured (exposure, binning, ROI).
+    Role: Dual-Use (Snapshot and Intent)
+    Category: C / D
 
     Attributes:
-        detector_id: Unique identifier for the camera.
-        exposure: Integration time (Time quantity).
-        binning_index: Discrete binning level index.
-        binning_xy: Explicit (x, y) binning factors.
-        roi: Region of Interest to read from the sensor.
-        frame_integration: Number of internal frames to accumulate.
-        gain_index: Index for hardware gain setting.
-        offset_index: Index for hardware offset/black-level setting.
-        digital_rotation_deg: Rotation applied to the image.
-
-    Notes:
-        Strictly validates that exposure is positive and ROI dimensions are safe.
-    Role: Request / Partial Config
-    Category: D (Requests - Nullable)
+        detector_id (Optional[str]): The identifier of the camera to use.
+            None Behavior: Required for routing; error in Strict mode.
+        exposure (Optional[Quantity]): Integration time. Units: ms.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        roi (Optional[ROI]): Pixel-coordinate window on the sensor.
+            None Behavior: Snapshot (Unknown/Full) | Intent (No Change).
     """
     detector_id: Optional[str] = None
     exposure: Optional["Quantity"] = None
@@ -1781,20 +1770,16 @@ DetectorState = DetectorSettings
 @dataclass
 class DetectorCapabilities:
     """
-    Read-only hardware capabilities of a specific detector.
+    Hardware-specific profile used to assess if a request is supported by the device.
 
-    Describes supported ranges (e.g., min/max exposure) and features (e.g., binning) reported by drivers.
+    Role: Gatekeeper (Capabilities)
+    Category: C (Measured State)
 
     Attributes:
-        can_*: Capability flags (binning, gain, offset, rotation).
-        *_min/max: Supported ranges.
-                   Quantities (exposure, rotation) are unit-aware.
-                   Discrete values (binning, gain) are integers.
-
-    Notes:
-        This class is permanently `LENIENT` to safely ingest driver reports without validation errors.
-    Role: Measured State (Static)
-    Category: C (Nullable - None means capability unknown)
+        can_binning (Optional[bool]): If the sensor supports hardware pixel grouping.
+            None Behavior: Preserved as None (Unknown).
+        exposure_min, exposure_max (Optional[Quantity]): Physical timing limits. Units: ms.
+            None Behavior: Preserved as None (Unknown).
     """
     can_binning: Optional[bool] = None
     binning_index_min: Optional[int] = None
@@ -1986,21 +1971,18 @@ class DetectorCapabilities:
 @dataclass
 class DetectorSystemSettings:
     """
-    Registry for all available detectors and their configurations.
+    Registry for available detectors and their associated capability profiles.
 
-    Maps detector IDs to their specific settings and hardware capabilities.
+    Role: Gatekeeper (System Registry)
+    Category: B (Structural Containers)
 
     Attributes:
-        enabled: Master switch to enable/disable detector control.
-        defaults_by_id: Mapping of detector IDs to their default startup settings.
-        default_detector_id: The ID of the primary detector to use if none is specified.
-        capabilities_by_id: Mapping of detector IDs to their read-only hardware capabilities.
-        available_detector_ids: List of all valid detector IDs currently recognized.
-
-    Notes:
-        Validates that `default_detector_id` exists within the available detectors.
-    Role: Structure / Registry
-    Category: B (Strict Structure - Maps must be initialized)
+        available_detector_ids (Optional[List[str]]): List of known device names.
+            None Behavior: Structural Default (Empty List).
+        defaults_by_id (Optional[Dict[str, DetectorSettings]]): Base settings per device.
+            None Behavior: Structural Default (Empty Dict).
+        capabilities_by_id (Optional[Dict[str, DetectorCapabilities]]): Hardware limits per device.
+            None Behavior: Structural Default (Empty Dict).
     """
     enabled: Optional[bool] = None
     defaults_by_id: Optional[Dict[str, DetectorSettings]] = None
@@ -2111,15 +2093,16 @@ class DetectorSystemSettings:
 @dataclass
 class ImageOutputSettings:
     """
-    Configuration for image file persistence.
+    Configuration for naming conventions and storage formats for acquired data.
 
-    Controls the file format and destination path for saving acquired images.
+    Role: Gatekeeper (Output Config)
+    Category: A (Config)
 
     Attributes:
-        file_format: The file extension/format (e.g., "tiff", "png", "jpg").
-        path: The target directory or full file path for saving.
-    Role: Configuration
-    Category: A (Strict Runtime)
+        file_format (Optional[str]): Destination format (tiff, png, jpg, bmp).
+            None Behavior: Defaulted to "tiff".
+        path (Optional[str]): Base directory or template for saving files.
+            None Behavior: Preserved as None (implies auto-selection or current dir).
     """
     file_format: Optional[str] = None
     path: Optional[str] = None
@@ -2164,9 +2147,17 @@ class ImageOutputSettings:
 @dataclass
 class Aperture:
     """
-        Role: Measured State
-        Category: C (Nullable)
-        """
+    Physical aperture status or a request to modify insertion/size.
+
+    Role: Dual-Use (Snapshot and Intent)
+    Category: C / D
+
+    Attributes:
+        inserted (Optional[bool]): Whether the aperture is in the beam path.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        size_index (Optional[int]): The currently selected hole size index.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+    """
     aperture_id: Optional[str] = None
     inserted: Optional[bool] = None
     size_index: Optional[int] = None
@@ -2238,24 +2229,16 @@ class Aperture:
 @dataclass
 class MicroscopeState:
     """
-    A comprehensive snapshot of the microscope hardware state.
+    Comprehensive snapshot of the microscope telemetry at a specific timestamp.
 
-    Aggregates the status of the stage, beam, apertures, and detectors at a specific timestamp.
+    Role: Snapshot (Measured State)
+    Category: C (Nullable Runtime)
 
     Attributes:
-        timestamp: UTC timestamp of the snapshot.
-        mode: The optical mode (e.g., "TEM", "STEM").
-        stage_position: Current coordinates of the stage.
-        beam: Current state of the electron beam.
-        apertures: Dictionary of current aperture states.
-        detectors: Dictionary of current detector States.
-        active_detector_ids: List of detectors currently marked as active.
-        primary_detector_id: The ID of the currently selected main detector.
-
-    Notes:
-        Typically instantiated in `LENIENT` mode for logging/telemetry to preserve data despite partial failures.
-    Role: Snapshot / Structure
-    Category: B (Structures must exist) & C (State inside is nullable)
+        timestamp (Optional[str]): ISO8601 formatted time of capture.
+            None Behavior: Defaulted to "Now" if missing during ingestion.
+        stage_position (Optional[StagePosition]): Current physical coordinates.
+            None Behavior: Structural Default (Empty StagePosition).
     """
     timestamp: Optional[str] = None
     mode: Optional[str] = None
@@ -2351,9 +2334,21 @@ class MicroscopeState:
 @dataclass
 class MicroscopeImageMetadata:
     """
-        Role: Metadata / State
-        Category: C (Preserve None)
-        """
+    The scientific 'sidecar' metadata describing the context of an image acquisition.
+
+    Role: Snapshot (Measured State)
+    Category: C (Measured State)
+
+    Attributes:
+        magnification (Optional[float]): The indicated microscope magnification.
+            None Behavior: Preserved as None (Unknown).
+        pixel_size_nm (Optional[Tuple[float, float]]): Calibrated pixel dimensions. Units: nm.
+            None Behavior: Preserved as None (Unknown).
+        microscope_state (Optional[MicroscopeState]): Full machine telemetry at acquisition.
+            None Behavior: Preserved as None.
+        created_at (Optional[str]): ISO8601 timestamp of acquisition.
+            None Behavior: Defaulted to 'Now' if missing during ingestion.
+    """
     version: Optional[str] = None
     created_at: Optional[str] = None
     magnification: Optional[float] = None
@@ -2595,24 +2590,20 @@ class MicroscopeImage:
 @dataclass
 class SystemInfo:
     """
-    Static identity and version information for the system.
+    Static identifying information about the microscope hardware and software.
 
-    Identifies hardware (Model, Serial) and software versions.
+    Role: Gateway (Structure)
+    Category: A (Config/Identity)
 
     Attributes:
-        name: Human-readable name for this microscope instance.
-        ip_address: Network address of the control PC.
-        manufacturer: Vendor name.
-        model: Model name.
-        serial_number: Unique hardware serial number.
-        hardware_version: Vendor hardware revision.
-        software_version: Vendor control software version.
-        application: Connected application name.
-
-    Notes:
-        Defaults to "Unknown" to prevent logging crashes on missing data.
-    Role: Info / Config
-    Category: A (Strict Runtime Defaults)
+        name (Optional[str]): Human-readable name of the system.
+            None Behavior: Defaulted to "Unknown".
+        ip_address (Optional[str]): Network address for the microscope control PC.
+            None Behavior: Defaulted to "Unknown"; validated as IP format.
+        supertem_version (Optional[str]): Version of the SuperTEM library.
+            None Behavior: Defaulted to the current installed package version.
+        manufacturer, model, serial_number (Optional[str]): Hardware identifiers.
+            None Behavior: Defaulted to "Unknown".
     """
     name: Optional[str] = None
     ip_address: Optional[str] = None
@@ -2717,17 +2708,20 @@ class SystemInfo:
 @dataclass
 class SystemSettings:
     """
-    Root configuration object for the microscope hardware.
+    Root container for system-wide settings and limit registries.
 
-    Hierarchically aggregates settings for Stage, Beam, and Detectors.
+    Role: Gateway (Structure)
+    Category: B (Structural Containers)
 
     Attributes:
-        stage_system: Settings and limits for the stage.
-        beam_system: Settings and limits for the electron column.
-        detector_system: Settings and capabilities for all detectors.
-        info: Static system identity metadata.
-    Role: Root Structure
-    Category: B (Must instantiate children)
+        stage_system (Optional[StageSystemSettings]): Limits for sample motion.
+            None Behavior: Structural Default (Empty StageSystemSettings).
+        beam_system (Optional[BeamSystemSettings]): Limits for optics and voltage.
+            None Behavior: Structural Default (Empty BeamSystemSettings).
+        detector_system (Optional[DetectorSystemSettings]): Registry of camera hardware.
+            None Behavior: Structural Default (Empty DetectorSystemSettings).
+        info (Optional[SystemInfo]): Static hardware/software identification.
+            None Behavior: Structural Default (Empty SystemInfo).
     """
     stage_system: Optional[StageSystemSettings] = None
     beam_system: Optional[BeamSystemSettings] = None
@@ -2785,16 +2779,18 @@ class SystemSettings:
 @dataclass
 class MicroscopeSettings:
     """
-    Top-level application configuration.
+    Root configuration for a microscope instance and its supported subsystems.
 
-    Combines hardware system settings with global application preferences and protocols.
+    Role: Gateway (Structure)
+    Category: B (Structural Containers)
 
     Attributes:
-        system: Hardware configuration (Stage, Beam, Detectors).
-        image: Global defaults for image output (Format, Path).
-        protocol: Dictionary for experimental protocol parameters.
-    Role: Root Config
-    Category: B (Must instantiate children)
+        system (Optional[SystemSettings]): The hardware limits and registries.
+            None Behavior: Structural Default (Empty SystemSettings).
+        image (Optional[ImageOutputSettings]): Default save and naming settings.
+            None Behavior: Structural Default (Empty ImageOutputSettings).
+        protocol (Optional[dict]): High-level automation logic definitions.
+            None Behavior: Defaulted to a "demo" protocol dict.
     """
     system: Optional[SystemSettings] = None
     image: Optional[ImageOutputSettings] = None
@@ -2844,20 +2840,18 @@ class MicroscopeSettings:
 @dataclass
 class AcquisitionRequest:
     """
-    An executable command to acquire an image.
+    High-level intent to capture an image using a specific detector and settings.
 
-    A control-plane object that combines detector settings with output preferences.
+    Role: Intent (User Request)
+    Category: B / D (Structure and Intent)
 
     Attributes:
-        detector_id: The ID of the detector to use (Required).
-        detector: Specific settings for this acquisition.
-        image: Output settings (format, path).
-
-    Notes:
-        In `STRICT` mode, this object requires a valid `detector_id` to be instantiated.
-        It enforces consistency between the outer `detector_id` and the inner `detector.detector_id`.
-    Role: Request / Structure
-    Category: B (Children must exist) & D (Request ID is nullable)
+        detector_id (Optional[str]): Targeted hardware device for capture.
+            None Behavior: Preserved as None; syncs with inner DetectorSettings.
+        detector (Optional[DetectorSettings]): Detailed camera parameters.
+            None Behavior: Structural Default (Empty DetectorSettings).
+        image (Optional[ImageOutputSettings]): Specific overrides for saving this image.
+            None Behavior: Structural Default (Empty ImageOutputSettings).
     """
     detector_id: Optional[str] = None
     detector: Optional[DetectorSettings] = None
@@ -2929,18 +2923,16 @@ class AcquisitionRequest:
 @dataclass
 class StageMoveRequest:
     """
-    Explicit intent to move the microscope stage.
+    A specific command to move the sample stage.
+
+    Role: Intent (User Request)
+    Category: D (Tristate Logic)
 
     Attributes:
-        target: The coordinate goals (absolute or relative vectors).
-        relative: If True, target values are added to current position (deltas).
-        backlash_correction: Whether to perform hardware backlash compensation.
-        wait_for_settle: If True, blocks until movement and settling are complete.
-       settle_time: Optional duration to wait.
-                 If None, uses StageSystemSettings.settle_time.
-                 If 0, settles immediately (no wait).
-    Role: Request
-    Category: D (Tristate Logic) / B (Target structure)
+        target (Optional[StagePosition]): The destination coordinates.
+            None Behavior: Structural Default (Empty StagePosition).
+        relative (Optional[bool]): If True, 'target' is a delta, not an absolute.
+            None Behavior: Defaulted to False for safety.
     """
     target: Optional[StagePosition] = None
     relative: Optional[bool] = None
