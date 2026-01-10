@@ -153,19 +153,57 @@ separation of concerns across three distinct lifecycles:
       - `is_safe_beam(target)`: Checks voltage/optical limits (Beam).
       - `is_supported(settings)`: Checks driver capabilities (Detector).
 
-   Summary Table:
-   +------------------+-----------------------+-----------------------------+
-   | Phase            | Question Asked        | Example                     |
-   +==================+=======================+=============================+
-   | Normalization    | "Is it the right type?"| "10" -> 10 (int)           |
-   | Validation       | "Is it logical?"      | min_limit < max_limit       |
-   |                  | "Is it complete?"     | enabled=True -> limits!=None|
-   +------------------+-----------------------+-----------------------------+
-   | Gatekeeping      | "Is it safe/allowed?" | target_x < x_limit          |
-   +------------------+-----------------------+-----------------------------+
+===============================================================================
+IV. Handling Defaults & None (The 4 Categories)
+===============================================================================
+
+To prevent ingestion crashes while ensuring runtime safety, `__post_init__` acts
+as a "loading dock" that accepts flexible inputs (including None). However, the
+final internal state depends on the object's semantic category.
+
+Universal Rule: All input fields are typed as `Optional[T] = None`.
+
+Category A: Configuration & System Limits (Strict Runtime)
+  - Definition: Definitions of behavior (limits, timeouts, file formats).
+  - Constraint: Hardware drivers cannot accept None; they need concrete numbers.
+  - Action:     Aggressive Defaulting. Fill "holes" with safe defaults.
+  - Pattern:    `self.val = parsed if parsed is not None else SAFE_DEFAULT`
+
+Category B: Structural Containers (Strict Runtime)
+  - Definition: Fields holding nested objects/lists.
+  - Constraint: Prevent `AttributeError` on access.
+  - Action:     Structural Defaulting. Never leave as None.
+  - Pattern:    `self.child = parsed if parsed is not None else ChildClass()`
+
+Category C: Measured State (Nullable Runtime)
+  - Definition: Snapshots of reality (current voltage, position).
+  - Constraint: None != 0. None means "Sensor Read Failed."
+  - Action:     Preserve None.
+  - Pattern:    `self.val = parsed` (keep None if input was None)
+
+Category D: Requests & Intents (Nullable Runtime)
+  - Definition: Commands to change specific settings (Tristate logic).
+  - Constraint: Value=Change, None=Ignore/Don't Touch.
+  - Action:     Preserve None.
+  - Pattern:    `self.val = parsed`
+
+The "Zero Trap" Warning:
+  Avoid: `self.val = parse_opt_int(...) or 10`  <-- UNSAFE. 0 becomes 10.
+  Use:   `val = parse_opt_int(...)`
+         `self.val = val if val is not None else 10`
+
+Summary Reference Table:
++----------------+---------------------+-------------------+------------------+
+| Role           | Examples            | Runtime State     | Action           |
++================+=====================+===================+==================+
+| Config/Limits  | timeout, ROI.width  | Strict (Non-None) | Apply Default    |
+| Structure      | stage_system, lists | Strict (Non-None) | Apply Empty()    |
+| Measured State | voltage, position   | Nullable          | Preserve None    |
+| User Request   | target, settle_time | Nullable          | Preserve None    |
++----------------+---------------------+-------------------+------------------+
 
 ===============================================================================
-IV. Extras: Preservation and Diagnostics
+V. Extras: Preservation and Diagnostics
 ===============================================================================
 
 `Extras` is the structured container for non-canonical information:
@@ -179,7 +217,7 @@ Conventions:
   - LENIENT mode should preserve information rather than discard it.
 
 ===============================================================================
-V. Serialization Contract: to_dict Must Be JSON-Capable
+VI. Serialization Contract: to_dict Must Be JSON-Capable
 ===============================================================================
 
 All to_dict() methods must return JSON-serializable output:
@@ -193,7 +231,7 @@ If a value cannot be expressed safely as JSON, preserve a safe representation in
 Extras.raw and record a diagnostic note.
 
 ===============================================================================
-VI. Implementation Conventions & Usage
+VII. Implementation Conventions & Usage
 ===============================================================================
 
 1. Internal Implementation Patterns
@@ -821,19 +859,29 @@ class Point:
 
     Notes:
         This class is lightweight and does not include the `Extras` container.
+    Role: Lightweight Structure / Config
+    Category: A (Strict Runtime for x,y,z - defaults to 0.0)
     """
-    x: float = 0.0
-    y: float = 0.0
-    z: float = 0.0
+    x: Optional[float] = None
+    y: Optional[float] = None
+    z: Optional[float] = None
     name: Optional[str] = None
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
         mode = as_parse_mode(self._mode)
         strict = is_strict(mode)
-        self.x = parse_opt_float(self.x, name="Point.x", strict=strict) or 0.0
-        self.y = parse_opt_float(self.y, name="Point.y", strict=strict) or 0.0
-        self.z = parse_opt_float(self.z, name="Point.z", strict=strict) or 0.0
+
+        # Category A: Apply Defaults (0.0) safely
+        _x = parse_opt_float(self.x, name="Point.x", strict=strict)
+        self.x = _x if _x is not None else 0.0
+
+        _y = parse_opt_float(self.y, name="Point.y", strict=strict)
+        self.y = _y if _y is not None else 0.0
+
+        _z = parse_opt_float(self.z, name="Point.z", strict=strict)
+        self.z = _z if _z is not None else 0.0
+
         self.name = parse_opt_str(self.name, name="Point.name", strict=False)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -876,27 +924,31 @@ class ROI:
     Notes:
         In `STRICT` mode, non-positive dimensions raise specific validation errors.
         In `LENIENT` mode, invalid dimensions are auto-corrected to defaults to ensure continuity.
+    Role: Configuration
+    Category: A (Strict Runtime - must have valid integers)
     """
-    x: int = 0
-    y: int = 0
-    width: int = 512
-    height: int = 512
+    x: Optional[int] = None
+    y: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "ROI")
-        x_val = parse_opt_int(self.x, name="ROI.x", strict=strict, extra=self.extra)
-        self.x = x_val if x_val is not None else 0
 
-        y_val = parse_opt_int(self.y, name="ROI.y", strict=strict, extra=self.extra)
-        self.y = y_val if y_val is not None else 0
+        # Category A: Apply Defaults safely
+        _x = parse_opt_int(self.x, name="ROI.x", strict=strict, extra=self.extra)
+        self.x = _x if _x is not None else 0
 
-        w_val = parse_opt_int(self.width, name="ROI.width", strict=strict, extra=self.extra)
-        self.width = w_val if w_val is not None else 512
+        _y = parse_opt_int(self.y, name="ROI.y", strict=strict, extra=self.extra)
+        self.y = _y if _y is not None else 0
 
-        h_val = parse_opt_int(self.height, name="ROI.height", strict=strict, extra=self.extra)
-        self.height = h_val if h_val is not None else 512
+        _w = parse_opt_int(self.width, name="ROI.width", strict=strict, extra=self.extra)
+        self.width = _w if _w is not None else 512
+
+        _h = parse_opt_int(self.height, name="ROI.height", strict=strict, extra=self.extra)
+        self.height = _h if _h is not None else 512
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -951,6 +1003,8 @@ class StagePosition:
         tilt_x: Alpha tilt (Angle).
         tilt_y: Beta tilt (Angle).
         coordinate_system: Label for the reference frame (e.g., "Raw", "Cartesian").
+    Role: Measured State / Request
+    Category: C/D (Nullable Runtime - None means 'Unknown' or 'Don't Move')
     """
     name: Optional[str] = None
     x: Optional["Quantity"] = None
@@ -965,10 +1019,9 @@ class StagePosition:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "StagePosition")
-        # 1. Scalars
+        # Category C: Preserve None
         self.name = parse_opt_str(self.name, name="StagePosition.name", strict=strict, extra=self.extra)
         self.coordinate_system = parse_opt_str(self.coordinate_system, name="StagePosition.coordinate_system", strict=strict, extra=self.extra)
-        # 2. Quantities
         self.x = parse_opt_quantity(self.x, "nm", name="StagePosition.x", strict=strict, extra=self.extra)
         self.y = parse_opt_quantity(self.y, "nm", name="StagePosition.y", strict=strict, extra=self.extra)
         self.z = parse_opt_quantity(self.z, "nm", name="StagePosition.z", strict=strict, extra=self.extra)
@@ -1071,79 +1124,64 @@ class StageSystemSettings:
         eucentric_z: The calibrated Z-height where the sample is at the eucentric plane.
         settle_time_s: Time to wait for stabilization after movement.
         timeout_s: Maximum duration to wait for a movement command.
+    Role: Configuration & Limits
+    Category: A (Strict Runtime - Drivers need concrete limits)
     """
-    enabled: bool = True
-    can_x: bool = True
-    can_y: bool = True
-    can_z: bool = True
-    can_r: bool = False
-    can_tilt_x: bool = False
-    can_tilt_y: bool = False
+    enabled: Optional[bool] = None
+    can_x: Optional[bool] = None
+    can_y: Optional[bool] = None
+    can_z: Optional[bool] = None
+    can_r: Optional[bool] = None
+    can_tilt_x: Optional[bool] = None
+    can_tilt_y: Optional[bool] = None
     x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     z_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     r_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     tilt_x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     tilt_y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
-    max_step_distance: "Quantity" = field(default_factory=lambda: Q_(50000.0, "nm"))
-    max_step_angle: "Quantity" = field(default_factory=lambda: Q_(1.0, "degree"))
+    max_step_distance: Optional["Quantity"] = None
+    max_step_angle: Optional["Quantity"] = None
     eucentric_z: Optional["Quantity"] = None
-    settle_time: "Quantity" = field(default_factory=lambda: Q_(0.2, "seconds"))
-    timeout: "Quantity" = field(default_factory=lambda: Q_(10.0, "seconds"))
+    settle_time: Optional["Quantity"] = None
+    timeout: Optional["Quantity"] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "StageSystemSettings")
-        # 1. Scalars
-        self.enabled = parse_bool(self.enabled, default=True, name="StageSystemSettings.enabled", strict=strict,
-                                  extra=self.extra)
-        self.can_x = parse_bool(self.can_x, default=True, name="StageSystemSettings.can_x", strict=strict,
-                                extra=self.extra)
-        self.can_y = parse_bool(self.can_y, default=True, name="StageSystemSettings.can_y", strict=strict,
-                                extra=self.extra)
-        self.can_z = parse_bool(self.can_z, default=True, name="StageSystemSettings.can_z", strict=strict,
-                                extra=self.extra)
-        self.can_r = parse_bool(self.can_r, default=False, name="StageSystemSettings.can_r", strict=strict,
-                                extra=self.extra)
-        self.can_tilt_x = parse_bool(self.can_tilt_x, default=False, name="StageSystemSettings.can_tilt_x",
-                                     strict=strict, extra=self.extra)
-        self.can_tilt_y = parse_bool(self.can_tilt_y, default=False, name="StageSystemSettings.can_tilt_y",
-                                     strict=strict, extra=self.extra)
 
-        # 2. Quantities
-        self.x_limits = parse_opt_pair_quantity(self.x_limits, "nm", name="StageSystemSettings.x_limits", strict=strict,
-                                                extra=self.extra)
-        self.y_limits = parse_opt_pair_quantity(self.y_limits, "nm", name="StageSystemSettings.y_limits", strict=strict,
-                                                extra=self.extra)
-        self.z_limits = parse_opt_pair_quantity(self.z_limits, "nm", name="StageSystemSettings.z_limits", strict=strict,
-                                                extra=self.extra)
-        self.r_limits = parse_opt_pair_quantity(self.r_limits, "degree", name="StageSystemSettings.r_limits",
-                                                strict=strict, extra=self.extra)
-        self.tilt_x_limits = parse_opt_pair_quantity(self.tilt_x_limits, "degree",
-                                                     name="StageSystemSettings.tilt_x_limits", strict=strict,
-                                                     extra=self.extra)
-        self.tilt_y_limits = parse_opt_pair_quantity(self.tilt_y_limits, "degree",
-                                                     name="StageSystemSettings.tilt_y_limits", strict=strict,
-                                                     extra=self.extra)
+        # Category A: Apply Defaults (Booleans)
+        # parse_bool handles default logic internally safely
+        self.enabled = parse_bool(self.enabled, default=True, name="StageSystemSettings.enabled", strict=strict, extra=self.extra)
+        self.can_x = parse_bool(self.can_x, default=True, name="StageSystemSettings.can_x", strict=strict, extra=self.extra)
+        self.can_y = parse_bool(self.can_y, default=True, name="StageSystemSettings.can_y", strict=strict, extra=self.extra)
+        self.can_z = parse_bool(self.can_z, default=True, name="StageSystemSettings.can_z", strict=strict, extra=self.extra)
+        self.can_r = parse_bool(self.can_r, default=False, name="StageSystemSettings.can_r", strict=strict, extra=self.extra)
+        self.can_tilt_x = parse_bool(self.can_tilt_x, default=False, name="StageSystemSettings.can_tilt_x", strict=strict, extra=self.extra)
+        self.can_tilt_y = parse_bool(self.can_tilt_y, default=False, name="StageSystemSettings.can_tilt_y", strict=strict, extra=self.extra)
 
-        _max_dist = parse_opt_quantity(self.max_step_distance, "nm", name="StageSystemSettings.max_step_distance",
-                                       strict=strict, extra=self.extra)
+        # Category C: Limits (Nullable - If None, it implies 'Unlimited')
+        self.x_limits = parse_opt_pair_quantity(self.x_limits, "nm", name="StageSystemSettings.x_limits", strict=strict, extra=self.extra)
+        self.y_limits = parse_opt_pair_quantity(self.y_limits, "nm", name="StageSystemSettings.y_limits", strict=strict, extra=self.extra)
+        self.z_limits = parse_opt_pair_quantity(self.z_limits, "nm", name="StageSystemSettings.z_limits", strict=strict, extra=self.extra)
+        self.r_limits = parse_opt_pair_quantity(self.r_limits, "degree", name="StageSystemSettings.r_limits", strict=strict, extra=self.extra)
+        self.tilt_x_limits = parse_opt_pair_quantity(self.tilt_x_limits, "degree", name="StageSystemSettings.tilt_x_limits", strict=strict, extra=self.extra)
+        self.tilt_y_limits = parse_opt_pair_quantity(self.tilt_y_limits, "degree", name="StageSystemSettings.tilt_y_limits", strict=strict, extra=self.extra)
+
+        # Category A: Apply Defaults (Safety Settings)
+        _max_dist = parse_opt_quantity(self.max_step_distance, "nm", name="StageSystemSettings.max_step_distance", strict=strict, extra=self.extra)
         self.max_step_distance = _max_dist if _max_dist is not None else Q_(50000.0, "nm")
 
-        _max_angle = parse_opt_quantity(self.max_step_angle, "degree", name="StageSystemSettings.max_step_angle",
-                                        strict=strict, extra=self.extra)
+        _max_angle = parse_opt_quantity(self.max_step_angle, "degree", name="StageSystemSettings.max_step_angle", strict=strict, extra=self.extra)
         self.max_step_angle = _max_angle if _max_angle is not None else Q_(1.0, "degree")
 
-        self.eucentric_z = parse_opt_quantity(self.eucentric_z, "nm", name="StageSystemSettings.eucentric_z",
-                                              strict=strict, extra=self.extra)
+        self.eucentric_z = parse_opt_quantity(self.eucentric_z, "nm", name="StageSystemSettings.eucentric_z", strict=strict, extra=self.extra)
 
-        _settle = parse_opt_quantity(self.settle_time, "seconds", name="StageSystemSettings.settle_time", strict=strict,
-                                     extra=self.extra)
+        _settle = parse_opt_quantity(self.settle_time, "seconds", name="StageSystemSettings.settle_time", strict=strict, extra=self.extra)
         self.settle_time = _settle if _settle is not None else Q_(0.2, "seconds")
 
-        _timeout = parse_opt_quantity(self.timeout, "seconds", name="StageSystemSettings.timeout", strict=strict,
-                                      extra=self.extra)
+        _timeout = parse_opt_quantity(self.timeout, "seconds", name="StageSystemSettings.timeout", strict=strict, extra=self.extra)
         self.timeout = _timeout if _timeout is not None else Q_(10.0, "seconds")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -1338,6 +1376,10 @@ class StageSystemSettings:
 
 @dataclass
 class BeamSettings:
+    """
+        Role: Measured State / Request
+        Category: C/D (Nullable Runtime)
+        """
     voltage: Optional["Quantity"] = None
     beam_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
@@ -1352,18 +1394,27 @@ class BeamSettings:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "BeamSettings")
-        # 1. Scalars
+        # Category C: Preserve None
         self.spot_size = parse_opt_int(self.spot_size, name="BeamSettings.spot_size", strict=strict, extra=self.extra)
-        # 2. Quantities
-        self.voltage = parse_opt_quantity(self.voltage, "kV", name="BeamSettings.voltage", strict=strict, extra=self.extra)
-        self.beam_current = parse_opt_quantity(self.beam_current, "nA", name="BeamSettings.beam_current", strict=strict, extra=self.extra)
-        self.convergence_angle = parse_opt_quantity(self.convergence_angle, "mrad", name="BeamSettings.convergence_angle", strict=strict, extra=self.extra)
-        self.defocus = parse_opt_quantity(self.defocus, "nm", name="BeamSettings.defocus", strict=strict, extra=self.extra)
-        self.scan_rotation = parse_opt_quantity(self.scan_rotation, "degree", name="BeamSettings.scan_rotation", strict=strict, extra=self.extra)
-        # 3. Complex
-        self.stigmation = parse_model(Point, self.stigmation, extra=self.extra, key="BeamSettings.stigmation", mode=mode)
-        self.beam_shift = parse_model(Point, self.beam_shift, extra=self.extra, key="BeamSettings.beam_shift", mode=mode)
-        self.image_shift = parse_model(Point, self.image_shift, extra=self.extra, key="BeamSettings.image_shift", mode=mode)
+        self.voltage = parse_opt_quantity(self.voltage, "kV", name="BeamSettings.voltage", strict=strict,
+                                          extra=self.extra)
+        self.beam_current = parse_opt_quantity(self.beam_current, "nA", name="BeamSettings.beam_current", strict=strict,
+                                               extra=self.extra)
+        self.convergence_angle = parse_opt_quantity(self.convergence_angle, "mrad",
+                                                    name="BeamSettings.convergence_angle", strict=strict,
+                                                    extra=self.extra)
+        self.defocus = parse_opt_quantity(self.defocus, "nm", name="BeamSettings.defocus", strict=strict,
+                                          extra=self.extra)
+        self.scan_rotation = parse_opt_quantity(self.scan_rotation, "degree", name="BeamSettings.scan_rotation",
+                                                strict=strict, extra=self.extra)
+
+        # Category C/D: Complex objects are preserved as None if not present (tristate logic)
+        self.stigmation = parse_model(Point, self.stigmation, extra=self.extra, key="BeamSettings.stigmation",
+                                      mode=mode, allow_empty=False)
+        self.beam_shift = parse_model(Point, self.beam_shift, extra=self.extra, key="BeamSettings.beam_shift",
+                                      mode=mode, allow_empty=False)
+        self.image_shift = parse_model(Point, self.image_shift, extra=self.extra, key="BeamSettings.image_shift",
+                                       mode=mode, allow_empty=False)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -1447,8 +1498,10 @@ class BeamSystemSettings:
         beam_current_limits: Allowable range (min, max) for beam current.
         spot_size_limits: Min/Max valid indices for spot size.
         convergence_angle_limits: Allowable range (min, max) for convergence angle.
+    Role: Configuration
+    Category: A (Config) & B (Structure)
     """
-    enabled: bool = True
+    enabled: Optional[bool] = None
     default_beam: Optional[BeamSettings] = None
     voltage_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     beam_current_limits: Optional[Tuple["Quantity", "Quantity"]] = None
@@ -1459,15 +1512,18 @@ class BeamSystemSettings:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "BeamSystemSettings")
-        # 1. Scalars
+        # Category A: Default to True
         self.enabled = parse_bool(self.enabled, default=True, name="BeamSystemSettings.enabled", strict=strict, extra=self.extra)
+
+        # Category C: Limits can remain None (implies unlimited)
         self.spot_size_limits = parse_opt_pair_int(self.spot_size_limits, name="BeamSystemSettings.spot_size_limits", strict=strict, extra=self.extra)
-        # 2. Quantities
         self.voltage_limits = parse_opt_pair_quantity(self.voltage_limits, "kV", name="BeamSystemSettings.voltage_limits", strict=strict, extra=self.extra)
         self.beam_current_limits = parse_opt_pair_quantity(self.beam_current_limits, "nA", name="BeamSystemSettings.beam_current_limits", strict=strict, extra=self.extra)
         self.convergence_angle_limits = parse_opt_pair_quantity(self.convergence_angle_limits, "mrad", name="BeamSystemSettings.convergence_angle_limits", strict=strict, extra=self.extra)
-        # 3. Complex
-        self.default_beam = parse_model(BeamSettings, self.default_beam, mode=mode, extra=self.extra, key="BeamSystemSettings.default_beam") or BeamSettings(_mode=mode)
+
+        # Category B: Structural Default (Must not be None)
+        _db = parse_model(BeamSettings, self.default_beam, mode=mode, extra=self.extra, key="BeamSystemSettings.default_beam")
+        self.default_beam = _db if _db is not None else BeamSettings(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -1583,6 +1639,8 @@ class DetectorSettings:
 
     Notes:
         Strictly validates that exposure is positive and ROI dimensions are safe.
+    Role: Request / Partial Config
+    Category: D (Requests - Nullable)
     """
     detector_id: Optional[str] = None
     exposure: Optional["Quantity"] = None
@@ -1598,7 +1656,7 @@ class DetectorSettings:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "DetectorSettings")
-        # 1. Scalars
+        # Category D: Preserve None (Do not overwrite with defaults, these are requests)
         self.detector_id = parse_opt_id(self.detector_id, name="DetectorSettings.detector_id", strict=strict, extra=self.extra)
         self.binning_index = parse_opt_int(self.binning_index, name="DetectorSettings.binning_index", strict=strict, extra=self.extra)
         self.binning_xy = parse_opt_pair_int(self.binning_xy, name="DetectorSettings.binning_xy", strict=strict, extra=self.extra)
@@ -1606,9 +1664,9 @@ class DetectorSettings:
         self.gain_index = parse_opt_int(self.gain_index, name="DetectorSettings.gain_index", strict=strict, extra=self.extra)
         self.offset_index = parse_opt_int(self.offset_index, name="DetectorSettings.offset_index", strict=strict, extra=self.extra)
         self.digital_rotation_deg = parse_opt_float(self.digital_rotation_deg, name="DetectorSettings.digital_rotation_deg", strict=strict, extra=self.extra)
-        # 2. Quantities
         self.exposure = parse_opt_quantity(self.exposure, "ms", name="DetectorSettings.exposure", strict=strict, extra=self.extra)
-        # 3. Complex
+
+        # ROI is slightly complex: If None, it means "Full Frame" or "No Change". Preserve None.
         self.roi = parse_model(ROI, self.roi, mode=mode, extra=self.extra, key="DetectorSettings.roi")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -1704,6 +1762,8 @@ class DetectorCapabilities:
 
     Notes:
         This class is permanently `LENIENT` to safely ingest driver reports without validation errors.
+    Role: Measured State (Static)
+    Category: C (Nullable - None means capability unknown)
     """
     can_binning: Optional[bool] = None
     binning_index_min: Optional[int] = None
@@ -1730,12 +1790,11 @@ class DetectorCapabilities:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "DetectorCapabilities")
-        # 1. Booleans (Fail Fast)
+        # Category C: Preserve None
         self.can_binning = parse_opt_bool(self.can_binning, name="DetectorCapabilities.can_binning", strict=strict, extra=self.extra)
         self.can_gain = parse_opt_bool(self.can_gain, name="DetectorCapabilities.can_gain", strict=strict, extra=self.extra)
         self.can_offset = parse_opt_bool(self.can_offset, name="DetectorCapabilities.can_offset", strict=strict, extra=self.extra)
         self.can_digital_rotation = parse_opt_bool(self.can_digital_rotation, name="DetectorCapabilities.can_digital_rotation", strict=strict, extra=self.extra)
-        # 2. Scalars/Ranges
         self.binning_index_min = parse_opt_int(self.binning_index_min, name="DetectorCapabilities.binning_index_min", strict=strict, extra=self.extra)
         self.binning_index_max = parse_opt_int(self.binning_index_max, name="DetectorCapabilities.binning_index_max", strict=strict, extra=self.extra)
         self.binning_xy_min = parse_opt_pair_int(self.binning_xy_min, name="DetectorCapabilities.binning_xy_min", strict=strict, extra=self.extra)
@@ -1899,24 +1958,27 @@ class DetectorSystemSettings:
 
     Notes:
         Validates that `default_detector_id` exists within the available detectors.
+    Role: Structure / Registry
+    Category: B (Strict Structure - Maps must be initialized)
     """
-    enabled: bool = True
-    defaults_by_id: Dict[str, DetectorSettings] = field(default_factory=dict)
+    enabled: Optional[bool] = None
+    defaults_by_id: Optional[Dict[str, DetectorSettings]] = None
     default_detector_id: Optional[str] = None
-    capabilities_by_id: Dict[str, DetectorCapabilities] = field(default_factory=dict)
-    available_detector_ids: List[str] = field(default_factory=list)
+    capabilities_by_id: Optional[Dict[str, DetectorCapabilities]] = None
+    available_detector_ids: Optional[List[str]] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "DetectorSystemSettings")
-        # 1. Scalars
+        # Category A: Default to True
         self.enabled = parse_bool(self.enabled, default=True, name="DetectorSystemSettings.enabled", strict=strict, extra=self.extra)
         self.default_detector_id = parse_opt_id(self.default_detector_id, name="DetectorSystemSettings.default_detector_id", strict=False, extra=self.extra)
-        # 2. Lists
-        self.available_detector_ids = parse_str_list(self.available_detector_ids, name="DetectorSystemSettings.available_detector_ids", strict=False, extra=self.extra)
-        self.available_detector_ids = list(dict.fromkeys(self.available_detector_ids))
-        # 3. Maps
+
+        # Category B: Structural Defaults (Always Lists/Dicts, never None)
+        _ids = parse_str_list(self.available_detector_ids, name="DetectorSystemSettings.available_detector_ids", strict=False, extra=self.extra)
+        self.available_detector_ids = list(dict.fromkeys(_ids)) # Dedup
+
         self.defaults_by_id = parse_keyed_map(DetectorSettings, self.defaults_by_id, "detector_id", "DetectorSystemSettings.defaults_by_id", mode, self.extra)
         self.capabilities_by_id = parse_keyed_map(DetectorCapabilities, self.capabilities_by_id, None, "DetectorSystemSettings.capabilities_by_id", mode, self.extra)
 
@@ -2015,16 +2077,21 @@ class ImageOutputSettings:
     Attributes:
         file_format: The file extension/format (e.g., "tiff", "png", "jpg").
         path: The target directory or full file path for saving.
+    Role: Configuration
+    Category: A (Strict Runtime)
     """
-    file_format: str = "tiff"
+    file_format: Optional[str] = None
     path: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "ImageOutputSettings")
-        self.file_format = parse_opt_str(self.file_format, name="ImageOutputSettings.file_format", strict=strict, extra=self.extra) or "tiff"
-        self.file_format = self.file_format.lower()
+        # Category A: Default to 'tiff'
+        _fmt = parse_opt_str(self.file_format, name="ImageOutputSettings.file_format", strict=strict, extra=self.extra)
+        self.file_format = (_fmt.lower() if _fmt else "tiff")
+
+        # Category C: Path can be None (implies 'current directory' or 'auto')
         self.path = parse_opt_str(self.path, name="ImageOutputSettings.path", strict=strict, extra=self.extra)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -2055,8 +2122,12 @@ class ImageOutputSettings:
 
 @dataclass
 class Aperture:
+    """
+        Role: Measured State
+        Category: C (Nullable)
+        """
     aperture_id: Optional[str] = None
-    inserted: bool = False
+    inserted: Optional[bool] = None
     size_index: Optional[int] = None
     position: Optional[Point] = None
     extra: Extras = field(default_factory=Extras)
@@ -2064,11 +2135,14 @@ class Aperture:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "Aperture")
-        # 1. Scalars
+        # Category C: Preserve None
         self.aperture_id = parse_opt_id(self.aperture_id, name="Aperture.aperture_id", strict=strict, extra=self.extra)
-        self.inserted = parse_bool(self.inserted, default=False, name="Aperture.inserted", strict=strict, extra=self.extra)
+        # Exception: Boolean state usually defaults to False if unknown for safety?
+        # But per Category C, if we truly don't know, we might want None.
+        # However, parse_bool enforces a default. We'll stick to False as "Safe State".
+        self.inserted = parse_bool(self.inserted, default=False, name="Aperture.inserted", strict=strict,
+                                   extra=self.extra)
         self.size_index = parse_opt_int(self.size_index, name="Aperture.size_index", strict=strict, extra=self.extra)
-        # 2. Complex
         self.position = parse_model(Point, self.position, extra=self.extra, key="Aperture.position", mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -2139,29 +2213,39 @@ class MicroscopeState:
 
     Notes:
         Typically instantiated in `LENIENT` mode for logging/telemetry to preserve data despite partial failures.
+    Role: Snapshot / Structure
+    Category: B (Structures must exist) & C (State inside is nullable)
     """
-    timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
+    timestamp: Optional[str] = None
     mode: Optional[str] = None
     stage_position: Optional[StagePosition] = None
     beam: Optional[BeamState] = None
-    apertures: Dict[str, Aperture] = field(default_factory=dict)
-    detectors: Dict[str, DetectorState] = field(default_factory=dict)
-    active_detector_ids: List[str] = field(default_factory=list)
+    apertures: Optional[Dict[str, Aperture]] = None
+    detectors: Optional[Dict[str, DetectorState]] = None
+    active_detector_ids: Optional[List[str]] = None
     primary_detector_id: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeState")
-        # 1. Scalars
-        self.timestamp = parse_opt_str(self.timestamp, name="MicroscopeState.timestamp", strict=False, extra=self.extra) or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        # Category A: Default to Now
+        _ts = parse_opt_str(self.timestamp, name="MicroscopeState.timestamp", strict=False, extra=self.extra)
+        self.timestamp = _ts if _ts is not None else datetime.datetime.now(datetime.timezone.utc).isoformat()
+
         self.mode = parse_opt_str(self.mode, name="MicroscopeState.mode", strict=strict, extra=self.extra)
         self.primary_detector_id = parse_opt_id(self.primary_detector_id, name="MicroscopeState.primary_detector_id", strict=strict, extra=self.extra)
-        # 2. Lists
+
+        # Category B: Structural Defaults (Lists/Dicts/Obj must exist)
         self.active_detector_ids = parse_str_list(self.active_detector_ids, name="MicroscopeState.active_detector_ids", strict=strict, extra=self.extra)
-        # 3. Complex
-        self.stage_position = parse_model(StagePosition, self.stage_position, mode=mode, extra=self.extra, key="MicroscopeState.stage_position") or StagePosition(_mode=mode)
-        self.beam = parse_model(BeamState, self.beam, mode=mode, extra=self.extra, key="MicroscopeState.beam") or BeamState(_mode=mode)
+
+        # Ensure we always have containers, even if they are empty
+        _pos = parse_model(StagePosition, self.stage_position, mode=mode, extra=self.extra, key="MicroscopeState.stage_position")
+        self.stage_position = _pos if _pos is not None else StagePosition(_mode=mode)
+
+        _beam = parse_model(BeamState, self.beam, mode=mode, extra=self.extra, key="MicroscopeState.beam")
+        self.beam = _beam if _beam is not None else BeamState(_mode=mode)
+
         self.apertures = parse_keyed_map(Aperture, self.apertures, "aperture_id", "MicroscopeState.apertures", mode, self.extra)
         self.detectors = parse_keyed_map(DetectorState, self.detectors, "detector_id", "MicroscopeState.detectors", mode, self.extra)
 
@@ -2225,8 +2309,12 @@ class MicroscopeState:
 
 @dataclass
 class MicroscopeImageMetadata:
-    version: str = str(METADATA_VERSION)
-    created_at: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
+    """
+        Role: Metadata / State
+        Category: C (Preserve None)
+        """
+    version: Optional[str] = None
+    created_at: Optional[str] = None
     magnification: Optional[float] = None
     camera_length_mm: Optional[float] = None
     pixel_size_nm: Optional[Tuple[float, float]] = None
@@ -2240,18 +2328,34 @@ class MicroscopeImageMetadata:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeImageMetadata")
-        # 1. Scalars
-        self.version = parse_opt_str(self.version, name="MicroscopeImageMetadata.version", strict=False, extra=self.extra) or str(METADATA_VERSION)
-        self.created_at = parse_opt_str(self.created_at, name="MicroscopeImageMetadata.created_at", strict=False, extra=self.extra) or datetime.datetime.now(datetime.timezone.utc).isoformat()
-        self.magnification = parse_opt_float(self.magnification, name="MicroscopeImageMetadata.magnification", strict=strict, extra=self.extra)
-        self.camera_length_mm = parse_opt_float(self.camera_length_mm, unit="mm", name="MicroscopeImageMetadata.camera_length_mm", strict=strict, extra=self.extra)
-        self.accelerating_voltage_kv = parse_opt_float(self.accelerating_voltage_kv, unit="kV", name="MicroscopeImageMetadata.accelerating_voltage_kv", strict=strict, extra=self.extra)
-        self.beam_current_na = parse_opt_float(self.beam_current_na, unit="nA", name="MicroscopeImageMetadata.beam_current_na", strict=strict, extra=self.extra)
-        self.exposure_ms = parse_opt_float(self.exposure_ms, unit="ms", name="MicroscopeImageMetadata.exposure_ms", strict=strict, extra=self.extra)
-        self.pixel_size_nm = parse_opt_pair_float(self.pixel_size_nm, name="MicroscopeImageMetadata.pixel_size_nm", strict=strict, extra=self.extra)
-        self.image_size_px = parse_opt_pair_int(self.image_size_px, name="MicroscopeImageMetadata.image_size_px", strict=strict, extra=self.extra)
-        # 2. Complex
-        self.microscope_state = parse_model(MicroscopeState, self.microscope_state, mode=mode, extra=self.extra, key="MicroscopeImageMetadata.microscope_state")
+        # Category A: Meta Defaults
+        _ver = parse_opt_str(self.version, name="MicroscopeImageMetadata.version", strict=False, extra=self.extra)
+        self.version = _ver or str(METADATA_VERSION)
+
+        _created = parse_opt_str(self.created_at, name="MicroscopeImageMetadata.created_at", strict=False,
+                                 extra=self.extra)
+        self.created_at = _created or datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        # Category C: Preserve None
+        self.magnification = parse_opt_float(self.magnification, name="MicroscopeImageMetadata.magnification",
+                                             strict=strict, extra=self.extra)
+        self.camera_length_mm = parse_opt_float(self.camera_length_mm, unit="mm",
+                                                name="MicroscopeImageMetadata.camera_length_mm", strict=strict,
+                                                extra=self.extra)
+        self.accelerating_voltage_kv = parse_opt_float(self.accelerating_voltage_kv, unit="kV",
+                                                       name="MicroscopeImageMetadata.accelerating_voltage_kv",
+                                                       strict=strict, extra=self.extra)
+        self.beam_current_na = parse_opt_float(self.beam_current_na, unit="nA",
+                                               name="MicroscopeImageMetadata.beam_current_na", strict=strict,
+                                               extra=self.extra)
+        self.exposure_ms = parse_opt_float(self.exposure_ms, unit="ms", name="MicroscopeImageMetadata.exposure_ms",
+                                           strict=strict, extra=self.extra)
+        self.pixel_size_nm = parse_opt_pair_float(self.pixel_size_nm, name="MicroscopeImageMetadata.pixel_size_nm",
+                                                  strict=strict, extra=self.extra)
+        self.image_size_px = parse_opt_pair_int(self.image_size_px, name="MicroscopeImageMetadata.image_size_px",
+                                                strict=strict, extra=self.extra)
+        self.microscope_state = parse_model(MicroscopeState, self.microscope_state, mode=mode, extra=self.extra,
+                                            key="MicroscopeImageMetadata.microscope_state")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -2466,15 +2570,17 @@ class SystemInfo:
 
     Notes:
         Defaults to "Unknown" to prevent logging crashes on missing data.
+    Role: Info / Config
+    Category: A (Strict Runtime Defaults)
     """
-    name: str = "Unknown"
-    ip_address: str = "Unknown"
-    manufacturer: str = "Unknown"
-    model: str = "Unknown"
-    serial_number: str = "Unknown"
-    hardware_version: str = "Unknown"
-    software_version: str = "Unknown"
-    supertem_version: str = __version__
+    name: Optional[str] = None
+    ip_address: Optional[str] = None
+    manufacturer: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    hardware_version: Optional[str] = None
+    software_version: Optional[str] = None
+    supertem_version: Optional[str] = None
     application: Optional[str] = None
     application_version: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
@@ -2482,16 +2588,36 @@ class SystemInfo:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "SystemInfo")
-        self.name = parse_opt_str(self.name, name="SystemInfo.name", strict=strict, extra=self.extra) or "Unknown"
-        self.ip_address = parse_opt_str(self.ip_address, name="SystemInfo.ip_address", strict=strict, extra=self.extra) or "Unknown"
-        self.manufacturer = parse_opt_str(self.manufacturer, name="SystemInfo.manufacturer", strict=strict, extra=self.extra) or "Unknown"
-        self.model = parse_opt_str(self.model, name="SystemInfo.model", strict=strict, extra=self.extra) or "Unknown"
-        self.serial_number = parse_opt_str(self.serial_number, name="SystemInfo.serial_number", strict=strict, extra=self.extra) or "Unknown"
-        self.hardware_version = parse_opt_str(self.hardware_version, name="SystemInfo.hardware_version", strict=strict, extra=self.extra) or "Unknown"
-        self.software_version = parse_opt_str(self.software_version, name="SystemInfo.software_version", strict=strict, extra=self.extra) or "Unknown"
-        self.supertem_version = parse_opt_str(self.supertem_version, name="SystemInfo.supertem_version", strict=strict, extra=self.extra) or __version__
-        self.application = parse_opt_str(self.application, name="SystemInfo.application", strict=strict, extra=self.extra) or "Unknown"
-        self.application_version = parse_opt_str(self.application_version, name="SystemInfo.application_version", strict=strict, extra=self.extra) or "Unknown"
+        # Category A: Apply Defaults ("Unknown") safely
+        _name = parse_opt_str(self.name, name="SystemInfo.name", strict=strict, extra=self.extra)
+        self.name = _name or "Unknown"
+
+        _ip = parse_opt_str(self.ip_address, name="SystemInfo.ip_address", strict=strict, extra=self.extra)
+        self.ip_address = _ip or "Unknown"
+
+        _man = parse_opt_str(self.manufacturer, name="SystemInfo.manufacturer", strict=strict, extra=self.extra)
+        self.manufacturer = _man or "Unknown"
+
+        _mod = parse_opt_str(self.model, name="SystemInfo.model", strict=strict, extra=self.extra)
+        self.model = _mod or "Unknown"
+
+        _sn = parse_opt_str(self.serial_number, name="SystemInfo.serial_number", strict=strict, extra=self.extra)
+        self.serial_number = _sn or "Unknown"
+
+        _hw = parse_opt_str(self.hardware_version, name="SystemInfo.hardware_version", strict=strict, extra=self.extra)
+        self.hardware_version = _hw or "Unknown"
+
+        _sw = parse_opt_str(self.software_version, name="SystemInfo.software_version", strict=strict, extra=self.extra)
+        self.software_version = _sw or "Unknown"
+
+        _st = parse_opt_str(self.supertem_version, name="SystemInfo.supertem_version", strict=strict, extra=self.extra)
+        self.supertem_version = _st or __version__
+
+        _app = parse_opt_str(self.application, name="SystemInfo.application", strict=strict, extra=self.extra)
+        self.application = _app or "Unknown"
+
+        _appv = parse_opt_str(self.application_version, name="SystemInfo.application_version", strict=strict, extra=self.extra)
+        self.application_version = _appv or "Unknown"
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -2559,6 +2685,8 @@ class SystemSettings:
         beam_system: Settings and limits for the electron column.
         detector_system: Settings and capabilities for all detectors.
         info: Static system identity metadata.
+    Role: Root Structure
+    Category: B (Must instantiate children)
     """
     stage_system: Optional[StageSystemSettings] = None
     beam_system: Optional[BeamSystemSettings] = None
@@ -2569,10 +2697,18 @@ class SystemSettings:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "SystemSettings")
-        self.stage_system = parse_model(StageSystemSettings, self.stage_system, mode=mode, extra=self.extra, key="SystemSettings.stage_system") or StageSystemSettings(_mode=mode)
-        self.beam_system = parse_model(BeamSystemSettings, self.beam_system, mode=mode, extra=self.extra, key="SystemSettings.beam_system") or BeamSystemSettings(_mode=mode)
-        self.detector_system = parse_model(DetectorSystemSettings, self.detector_system, mode=mode, extra=self.extra, key="SystemSettings.detector_system") or DetectorSystemSettings(_mode=mode)
-        self.info = parse_model(SystemInfo, self.info, mode=mode, extra=self.extra, key="SystemSettings.info") or SystemInfo(_mode=mode)
+        # Category B: Structural Defaults
+        _stg = parse_model(StageSystemSettings, self.stage_system, mode=mode, extra=self.extra, key="SystemSettings.stage_system")
+        self.stage_system = _stg if _stg is not None else StageSystemSettings(_mode=mode)
+
+        _beam = parse_model(BeamSystemSettings, self.beam_system, mode=mode, extra=self.extra, key="SystemSettings.beam_system")
+        self.beam_system = _beam if _beam is not None else BeamSystemSettings(_mode=mode)
+
+        _det = parse_model(DetectorSystemSettings, self.detector_system, mode=mode, extra=self.extra, key="SystemSettings.detector_system")
+        self.detector_system = _det if _det is not None else DetectorSystemSettings(_mode=mode)
+
+        _info = parse_model(SystemInfo, self.info, mode=mode, extra=self.extra, key="SystemSettings.info")
+        self.info = _info if _info is not None else SystemInfo(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -2616,17 +2752,24 @@ class MicroscopeSettings:
         system: Hardware configuration (Stage, Beam, Detectors).
         image: Global defaults for image output (Format, Path).
         protocol: Dictionary for experimental protocol parameters.
+    Role: Root Config
+    Category: B (Must instantiate children)
     """
     system: Optional[SystemSettings] = None
     image: Optional[ImageOutputSettings] = None
-    protocol: dict = field(default_factory=lambda: {"name": "demo"})
+    protocol: Optional[dict] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "MicroscopeSettings")
-        self.system = parse_model(SystemSettings, self.system, mode=mode, extra=self.extra, key="MicroscopeSettings.system") or SystemSettings(_mode=mode)
-        self.image = parse_model(ImageOutputSettings, self.image, mode=mode, extra=self.extra, key="MicroscopeSettings.image") or ImageOutputSettings(_mode=mode)
+        # Category B: Structural Defaults
+        _sys = parse_model(SystemSettings, self.system, mode=mode, extra=self.extra, key="MicroscopeSettings.system")
+        self.system = _sys if _sys is not None else SystemSettings(_mode=mode)
+
+        _img = parse_model(ImageOutputSettings, self.image, mode=mode, extra=self.extra, key="MicroscopeSettings.image")
+        self.image = _img if _img is not None else ImageOutputSettings(_mode=mode)
+
         if not isinstance(self.protocol, dict): self.protocol = {"name": "demo"}
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -2672,6 +2815,8 @@ class AcquisitionRequest:
     Notes:
         In `STRICT` mode, this object requires a valid `detector_id` to be instantiated.
         It enforces consistency between the outer `detector_id` and the inner `detector.detector_id`.
+    Role: Request / Structure
+    Category: B (Children must exist) & D (Request ID is nullable)
     """
     detector_id: Optional[str] = None
     detector: Optional[DetectorSettings] = None
@@ -2681,10 +2826,17 @@ class AcquisitionRequest:
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "AcquisitionRequest")
+        # Category D: Preserve None
         self.detector_id = parse_opt_id(self.detector_id, name="AcquisitionRequest.detector_id", strict=strict, extra=self.extra)
-        self.detector = parse_model(DetectorSettings, self.detector, mode=mode, extra=self.extra, key="AcquisitionRequest.detector") or DetectorSettings(_mode=mode)
-        self.image = parse_model(ImageOutputSettings, self.image, mode=mode, extra=self.extra, key="AcquisitionRequest.image") or ImageOutputSettings(_mode=mode)
 
+        # Category B: Structural Defaults
+        _det = parse_model(DetectorSettings, self.detector, mode=mode, extra=self.extra, key="AcquisitionRequest.detector")
+        self.detector = _det if _det is not None else DetectorSettings(_mode=mode)
+
+        _img = parse_model(ImageOutputSettings, self.image, mode=mode, extra=self.extra, key="AcquisitionRequest.image")
+        self.image = _img if _img is not None else ImageOutputSettings(_mode=mode)
+
+        # Sync Logic
         if self.detector_id is None and self.detector.detector_id is not None:
             self.detector_id = self.detector.detector_id
         elif self.detector.detector_id is None and self.detector_id is not None:
@@ -2746,22 +2898,31 @@ class StageMoveRequest:
        settle_time: Optional duration to wait.
                  If None, uses StageSystemSettings.settle_time.
                  If 0, settles immediately (no wait).
+    Role: Request
+    Category: D (Tristate Logic) / B (Target structure)
     """
     target: Optional[StagePosition] = None
-    relative: bool = False
-    backlash_correction: bool = True
-    wait_for_settle: bool = True
+    relative: Optional[bool] = None
+    backlash_correction: Optional[bool] = None
+    wait_for_settle: Optional[bool] = None
     settle_time: Optional["Quantity"] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "StageMoveRequest")
+
+        # Category A: Boolean options usually default to Safe Values (False/True)
         self.relative = parse_bool(self.relative, default=False, name="StageMoveRequest.relative", strict=strict, extra=self.extra)
         self.backlash_correction = parse_bool(self.backlash_correction, default=True, name="StageMoveRequest.backlash_correction", strict=strict, extra=self.extra)
         self.wait_for_settle = parse_bool(self.wait_for_settle, default=True, name="StageMoveRequest.wait_for_settle", strict=strict, extra=self.extra)
+
+        # Category D: Request parameter (Preserve None)
         self.settle_time = parse_opt_quantity(self.settle_time, "seconds", name="StageMoveRequest.settle_time", strict=strict, extra=self.extra)
-        self.target = parse_model(StagePosition, self.target, mode=mode, extra=self.extra, key="StageMoveRequest.target") or StagePosition(_mode=mode)
+
+        # Category B: Structural Default
+        _tgt = parse_model(StagePosition, self.target, mode=mode, extra=self.extra, key="StageMoveRequest.target")
+        self.target = _tgt if _tgt is not None else StagePosition(_mode=mode)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
