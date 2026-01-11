@@ -1300,13 +1300,34 @@ class StageSystemSettings:
         mode = ParseMode.LENIENT
 
         # 1. Resolve Absolute Target
-        # If relative, we MUST have current to know where we end up.
         if relative:
+            # Must have a container for current position
             if current is None:
                 note_or_raise(self.extra, "StageSystemSettings.Safety.relative_no_current",
                               ValueError("Cannot validate relative move without current position"), mode=mode)
                 return False
-            # Resolve the final destination
+
+            # [PATCH] CRITICAL SAFETY CHECK:
+            # Ensure we know the starting point for every axis we intend to move.
+            # If current.x is None (unknown) and target.x is 50 (move), we must reject it.
+            axes_to_check = [
+                ("x", target.x, current.x),
+                ("y", target.y, current.y),
+                ("z", target.z, current.z),
+                ("r", target.r, current.r),
+                ("tilt_x", target.tilt_x, current.tilt_x),
+                ("tilt_y", target.tilt_y, current.tilt_y),
+            ]
+
+            for axis_name, delta, start_val in axes_to_check:
+                if delta is not None and start_val is None:
+                    note_or_raise(self.extra, f"StageSystemSettings.Safety.unknown_start_{axis_name}",
+                                  ValueError(
+                                      f"Cannot perform relative move on '{axis_name}': current position is unknown (None)."),
+                                  mode=mode)
+                    return False
+
+            # Resolve the final destination (Now guaranteed safe from 'None' propagation on active axes)
             abs_target = current + target
             # For relative moves, the 'target' IS the step vector
             step_vector = target
@@ -1318,6 +1339,9 @@ class StageSystemSettings:
 
         # 2. Check Static Limits (Boundaries) using abs_target
         def check_bound(val, lims, name):
+            # Note: If val is None (wildcard), we skip the check.
+            # This is safe for Absolute moves (None=Don't Move),
+            # and now safe for Relative moves (we proved val is not None above if it mattered).
             if val is not None and lims:
                 if not (lims[0] <= val <= lims[1]):
                     note_or_raise(self.extra, f"StageSystemSettings.Safety.{name}_limit",
