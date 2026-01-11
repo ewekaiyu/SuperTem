@@ -169,9 +169,10 @@ final internal state depends on the object's semantic category.
 Universal Rule: All domain-data input fields are typed as `Optional[T] = None`.
 (Internal control fields like `_mode` and `extra` are excluded from this rule).
 
-Category A: Configuration & System Limits (Strict Runtime)
-  - Definition: Definitions of behavior (limits, timeouts, file formats).
-  - Constraint: Hardware drivers cannot accept None; they need concrete numbers.
+Category A: Configuration & Mandatory Parameters (Strict Runtime)
+  - Definition: Operational constants required for logic to function (timeouts,
+                max step sizes, image formats, ROI dimensions).
+  - Constraint: Drivers/Logic cannot accept None; they need concrete numbers.
   - Action:     Aggressive Defaulting. Fill "holes" with safe defaults.
   - Pattern:    `self.val = parsed if parsed is not None else SAFE_DEFAULT`
 
@@ -181,9 +182,10 @@ Category B: Structural Containers (Strict Runtime)
   - Action:     Structural Defaulting. Never leave as None.
   - Pattern:    `self.child = parsed if parsed is not None else ChildClass()`
 
-Category C: Measured State (Nullable Runtime)
-  - Definition: Snapshots of reality (current voltage, position).
-  - Constraint: None != 0. None means "Sensor Read Failed."
+Category C: Measured State & Optional Boundaries (Nullable Runtime)
+  - Definition: Snapshots of reality (current voltage) OR permissive boundaries
+                (limits where None implies "Unlimited").
+  - Constraint: None != 0. None means "Sensor Read Failed" or "No Constraint".
   - Action:     Preserve None.
   - Pattern:    `self.val = parsed` (keep None if input was None)
 
@@ -199,14 +201,14 @@ The "Zero Trap" Warning:
          `self.val = val if val is not None else 10`
 
 Summary Reference Table:
-+----------------+---------------------+-------------------+------------------+
-| Role           | Examples            | Runtime State     | Action           |
-+================+=====================+===================+==================+
-| Config/Limits  | timeout, ROI.width  | Strict (Non-None) | Apply Default    |
-| Structure      | stage_system, lists | Strict (Non-None) | Apply Empty()    |
-| Measured State | voltage, position   | Nullable          | Preserve None    |
-| User Request   | target, settle_time | Nullable          | Preserve None    |
-+----------------+---------------------+-------------------+------------------+
++------------------+---------------------+-------------------+------------------+
+| Role             | Examples            | Runtime State     | Action           |
++==================+=====================+===================+==================+
+| Mandatory Param  | timeout, max_step   | Strict (Non-None) | Apply Default    |
+| Structure        | stage_system, lists | Strict (Non-None) | Apply Empty()    |
+| State/Boundaries | voltage, x_limits   | Nullable          | Preserve None    |
+| User Request     | target, exposure    | Nullable          | Preserve None    |
++------------------+---------------------+-------------------+------------------+
 
 ===============================================================================
 V. Extras: Preservation and Diagnostics
@@ -3050,30 +3052,34 @@ class ApertureControlRequest:
     Category: B / D (Structure / Intent)
 
     Attributes:
-        aperture_id (Optional[str]): The mechanism to target (e.g., 'objective', 'condenser_2').
-            None Behavior: Required for execution (Strict).
+        aperture_id (Optional[str]): The mechanism to target (e.g., 'objective').
+            None Behavior: Required for execution.
         state (Optional[Aperture]): The desired configuration changes.
             None Behavior: Structural Default (Empty Aperture object).
+        relative (Optional[bool]): If True, position coordinates are treated as a delta.
+            None Behavior: Defaulted to False.
     """
     aperture_id: Optional[str] = None
     state: Optional[Aperture] = None
+    relative: Optional[bool] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         mode, strict, self.extra = _setup_init(self, self._mode, "ApertureControlRequest")
 
-        # Category A/D: Identity (Required for routing)
         self.aperture_id = parse_opt_id(self.aperture_id, name="ApertureControlRequest.aperture_id", strict=strict,
                                         extra=self.extra)
 
-        # Category B: Structural Default
-        # We MUST default to an empty Aperture() so users can safely access .state.inserted
-        # without checking for None first. The 'Intent' (None) lives inside the fields of 'state'.
+        # Standard Boolean Defaulting (Category A/D)
+        self.relative = parse_bool(self.relative, default=False, name="ApertureControlRequest.relative", strict=strict,
+                                   extra=self.extra)
+
+        # Structural Default for State
         _st = parse_model(Aperture, self.state, mode=mode, extra=self.extra, key="ApertureControlRequest.state")
         self.state = _st if _st is not None else Aperture(_mode=mode)
 
-        # Sync Logic (Mirroring AcquisitionRequest pattern):
+        # Sync Logic
         if self.aperture_id is None and self.state.aperture_id is not None:
             self.aperture_id = self.state.aperture_id
         elif self.state.aperture_id is None and self.aperture_id is not None:
@@ -3083,28 +3089,30 @@ class ApertureControlRequest:
         mode, strict = _setup_validate(self._mode, mode)
         ok = True
 
-        # Rule 1: Routing Identity is mandatory
         if not self.aperture_id:
             note_or_raise(self.extra, "ApertureControlRequest.aperture_id", ValueError("aperture_id is required"),
                           mode=mode)
             ok = False
 
-        # Rule 2: Inner object logic
         if not self.state.validate(mode=mode):
             ok = False
 
-        # Rule 3: Cross-field Consistency (Split-Brain Check)
         if self.state.aperture_id and self.aperture_id and self.state.aperture_id != self.aperture_id:
             note_or_raise(self.extra, "ApertureControlRequest.id_mismatch", ValueError(
-                f"Ambiguous IDs: Request targets '{self.aperture_id}' but state payload specifies '{self.state.aperture_id}'"),
-                          mode=mode)
+                f"Ambiguous IDs: '{self.aperture_id}' vs '{self.state.aperture_id}'"), mode=mode)
             if strict:
                 ok = False
             else:
                 self.state.aperture_id = self.aperture_id
 
-        # Rule 4: "No-Op" Detection
-        # Tristate Logic Check: A request is only valid if it actually requests *something*.
+        # Validation Logic specific to the Wrapper:
+        # You cannot do a "relative" update if you aren't moving the position.
+        if self.relative and self.state.position is None:
+            note_or_raise(self.extra, "ApertureControlRequest.relative_no_pos",
+                          ValueError("Relative mode requires a position vector"), mode=mode)
+            if strict: ok = False
+
+        # No-Op Check
         has_intent = (
                 self.state.inserted is not None or
                 self.state.size_index is not None or
@@ -3112,16 +3120,15 @@ class ApertureControlRequest:
         )
         if not has_intent:
             note_or_raise(self.extra, "ApertureControlRequest.empty_payload",
-                          ValueError("Request contains no changes (inserted, size, or position are all None)"),
-                          mode=mode)
-            if strict:
-                ok = False
+                          ValueError("Request contains no changes"), mode=mode)
+            if strict: ok = False
 
         return ok
 
     def to_dict(self) -> dict:
         d = {
             "aperture_id": self.aperture_id,
+            "relative": self.relative,
             "state": self.state.to_dict(),
         }
         return _finish_to_dict(d, self.extra)
@@ -3130,13 +3137,14 @@ class ApertureControlRequest:
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureControlRequest":
         d_dict, mode, extra = _setup_from_dict(
             ApertureControlRequest, d, mode,
-            known_keys=("aperture_id", "state", "extra"),
+            known_keys=("aperture_id", "state", "relative", "extra"),
             aliases=("aperture",)
         )
         if d_dict is None: return replace(d, _mode=mode)
 
         return ApertureControlRequest(
             aperture_id=d_dict.get("aperture_id"),
+            relative=d_dict.get("relative"),
             state=d_dict.get("state", d_dict.get("aperture")),
             extra=extra, _mode=mode
         )
