@@ -310,6 +310,7 @@ from pathlib import Path
 from copy import deepcopy
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union, Iterable, TypeVar, Type
+from collections.abc import Mapping
 import numpy as np
 from PIL import Image
 import tifffile as tff
@@ -630,6 +631,7 @@ def parse_opt_float(value: Any, *, name: str, unit: Optional[str] = None, strict
         if q is not None: return float(q.magnitude)
     try:
         if isinstance(value, Quantity) and not unit:
+            if extra is not None: _extra_put_raw(extra, name, value)
             if strict: raise ValueError(f"{name} is a Quantity but no target unit defined.")
             return None
         if isinstance(value, (int, float, np.number)): return float(value)
@@ -788,6 +790,19 @@ def parse_keyed_map(target_cls: Type[T], raw_map: Optional[Dict[str, Any]], id_f
                     if not strict: setattr(obj, id_field, key_norm)
             out[key_norm] = obj
     return out
+
+def parse_opt_dict(value: Any, *, name: str, strict: bool = False, extra: Any = None) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, Mapping):
+        return dict(value)
+    if extra is not None:
+        _extra_put_raw(extra, name, value)
+    if strict:
+        raise TypeError(f"{name} must be dict-like, got {type(value)}")
+    return None
 
 # =============================================================================
 # Helpers
@@ -1039,15 +1054,12 @@ class StagePosition:
 
     def __add__(self, other: 'StagePosition') -> 'StagePosition':
         if not isinstance(other, StagePosition): return NotImplemented
-        def add(a, b, u):
-            if a is None and b is None: return None
-            val_a = a if a is not None else Q_(0, u)
-            val_b = b if b is not None else Q_(0, u)
-            return val_a + val_b
+        def add(a, b):
+            return (a + b) if (a is not None and b is not None) else None
         return StagePosition(
             name=self.name,
-            x=add(self.x, other.x, "nm"), y=add(self.y, other.y, "nm"), z=add(self.z, other.z, "nm"),
-            r=add(self.r, other.r, "degree"), tilt_x=add(self.tilt_x, other.tilt_x, "degree"), tilt_y=add(self.tilt_y, other.tilt_y, "degree"),
+            x=add(self.x, other.x), y=add(self.y, other.y), z=add(self.z, other.z),
+            r=add(self.r, other.r), tilt_x=add(self.tilt_x, other.tilt_x), tilt_y=add(self.tilt_y, other.tilt_y),
             coordinate_system=self.coordinate_system,
             _mode=self._mode
         )
@@ -2822,7 +2834,8 @@ class MicroscopeSettings:
         _img = parse_model(ImageOutputSettings, self.image, mode=mode, extra=self.extra, key="MicroscopeSettings.image")
         self.image = _img if _img is not None else ImageOutputSettings(_mode=mode)
 
-        if not isinstance(self.protocol, dict): self.protocol = {"name": "demo"}
+        _pro = parse_opt_dict(self.protocol, name="MicroscopeSettings.protocol", strict=strict, extra=self.extra)
+        self.protocol = _pro if _pro is not None else {"name": "demo"}
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         mode, strict = _setup_validate(self._mode, mode)
@@ -3026,3 +3039,105 @@ class StageMoveRequest:
             settle_time=d_dict.get("settle_time", d_dict.get("settle_time_s")),
             extra=extra, _mode=mode
         )
+
+@dataclass
+class ApertureControlRequest:
+    """
+    Intent to mechanically modify an aperture's state.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: B / D (Structure / Intent)
+
+    Attributes:
+        aperture_id (Optional[str]): The mechanism to target (e.g., 'objective', 'condenser_2').
+            None Behavior: Required for execution (Strict).
+        state (Optional[Aperture]): The desired configuration changes.
+            None Behavior: Structural Default (Empty Aperture object).
+    """
+    aperture_id: Optional[str] = None
+    state: Optional[Aperture] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        mode, strict, self.extra = _setup_init(self, self._mode, "ApertureControlRequest")
+
+        # Category A/D: Identity (Required for routing)
+        self.aperture_id = parse_opt_id(self.aperture_id, name="ApertureControlRequest.aperture_id", strict=strict,
+                                        extra=self.extra)
+
+        # Category B: Structural Default
+        # We MUST default to an empty Aperture() so users can safely access .state.inserted
+        # without checking for None first. The 'Intent' (None) lives inside the fields of 'state'.
+        _st = parse_model(Aperture, self.state, mode=mode, extra=self.extra, key="ApertureControlRequest.state")
+        self.state = _st if _st is not None else Aperture(_mode=mode)
+
+        # Sync Logic (Mirroring AcquisitionRequest pattern):
+        if self.aperture_id is None and self.state.aperture_id is not None:
+            self.aperture_id = self.state.aperture_id
+        elif self.state.aperture_id is None and self.aperture_id is not None:
+            self.state.aperture_id = self.aperture_id
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        mode, strict = _setup_validate(self._mode, mode)
+        ok = True
+
+        # Rule 1: Routing Identity is mandatory
+        if not self.aperture_id:
+            note_or_raise(self.extra, "ApertureControlRequest.aperture_id", ValueError("aperture_id is required"),
+                          mode=mode)
+            ok = False
+
+        # Rule 2: Inner object logic
+        if not self.state.validate(mode=mode):
+            ok = False
+
+        # Rule 3: Cross-field Consistency (Split-Brain Check)
+        if self.state.aperture_id and self.aperture_id and self.state.aperture_id != self.aperture_id:
+            note_or_raise(self.extra, "ApertureControlRequest.id_mismatch", ValueError(
+                f"Ambiguous IDs: Request targets '{self.aperture_id}' but state payload specifies '{self.state.aperture_id}'"),
+                          mode=mode)
+            if strict:
+                ok = False
+            else:
+                self.state.aperture_id = self.aperture_id
+
+        # Rule 4: "No-Op" Detection
+        # Tristate Logic Check: A request is only valid if it actually requests *something*.
+        has_intent = (
+                self.state.inserted is not None or
+                self.state.size_index is not None or
+                self.state.position is not None
+        )
+        if not has_intent:
+            note_or_raise(self.extra, "ApertureControlRequest.empty_payload",
+                          ValueError("Request contains no changes (inserted, size, or position are all None)"),
+                          mode=mode)
+            if strict:
+                ok = False
+
+        return ok
+
+    def to_dict(self) -> dict:
+        d = {
+            "aperture_id": self.aperture_id,
+            "state": self.state.to_dict(),
+        }
+        return _finish_to_dict(d, self.extra)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureControlRequest":
+        d_dict, mode, extra = _setup_from_dict(
+            ApertureControlRequest, d, mode,
+            known_keys=("aperture_id", "state", "extra"),
+            aliases=("aperture",)
+        )
+        if d_dict is None: return replace(d, _mode=mode)
+
+        return ApertureControlRequest(
+            aperture_id=d_dict.get("aperture_id"),
+            state=d_dict.get("state", d_dict.get("aperture")),
+            extra=extra, _mode=mode
+        )
+
