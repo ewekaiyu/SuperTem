@@ -458,7 +458,6 @@ def _jsonable(obj: Any) -> Any:
         pass
     return str(obj)
 
-
 def note_or_raise(extra: Optional[Extras], key: str, exc: Exception, *, mode: Union[ParseMode, str],
                   raw: Any = None) -> None:
     """Handle validation error based on Strict/Lenient mode."""
@@ -470,14 +469,12 @@ def note_or_raise(extra: Optional[Extras], key: str, exc: Exception, *, mode: Un
     except Exception:
         pass
 
-
 def _extra_put_raw(extra: Any, key: str, value: Any) -> None:
     if extra is None: return
     if isinstance(extra, Extras):
         extra.raw[key] = _jsonable(value)
     elif isinstance(extra, dict):
         extra[f"{key}_raw"] = _jsonable(value)
-
 
 def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
     """Coerce arbitrary input into a Pint Quantity with the target unit."""
@@ -522,24 +519,8 @@ def _check_data_format(data: np.ndarray) -> bool:
         elif data.shape[2] == 1: data = data[:, :, 0]
     return (data.ndim == 2) and (data.dtype.kind == "u") and (data.dtype.itemsize in (1, 2))
 
-
 def drop_none_keys(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
-
-def collect_extra(d: Optional[Dict[str, Any]], known: Iterable[str], *, owner: str = "unknown") -> Extras:
-    """Harvest unknown keys from a source dict into an Extras object.
-
-    This ensures forward compatibility: if the hardware sends new fields we don't
-    recognize yet, we preserve them in 'unknown' rather than discarding them.
-    """
-    if not isinstance(d, dict): return Extras()
-    known_set = set(known)
-    ex = normalize_extra_lenient(d.get("extra"), owner)
-    for k, v in d.items():
-        if k != "extra" and k not in known_set:
-            try: ex.unknown[str(k)] = deepcopy(v)
-            except Exception: ex.unknown[str(k)] = repr(v)
-    return ex
 
 def add_extra_if_any(out: Dict[str, Any], extra: Any) -> Dict[str, Any]:
     if extra is None: return out
@@ -549,7 +530,6 @@ def add_extra_if_any(out: Dict[str, Any], extra: Any) -> Dict[str, Any]:
     clean_payload = {k: v for k, v in payload.items() if v}
     if clean_payload: out["extra"] = clean_payload
     return out
-
 
 def _finish_to_dict(payload: Dict[str, Any], extra: Any) -> Dict[str, Any]:
     add_extra_if_any(payload, extra)
@@ -588,7 +568,6 @@ def _setup_from_dict(cls: Type, data: Any, mode: Union[ParseMode, str, None], kn
                 extra.raw[f"{cls.__name__}.unknown.{k}"] = repr(v)
     return data, mode, extra
 
-
 def _setup_validate(obj_mode: Any, override_mode: Any) -> Tuple[ParseMode, bool]:
     mode = as_parse_mode(obj_mode if override_mode is None else override_mode)
     return mode, is_strict(mode)
@@ -596,6 +575,7 @@ def _setup_validate(obj_mode: Any, override_mode: Any) -> Tuple[ParseMode, bool]
 # =============================================================================
 # The FieldParser
 # =============================================================================
+
 T = TypeVar("T")
 
 class FieldParser:
@@ -612,10 +592,9 @@ class FieldParser:
         # Initialize Extras immediately
         raw_extra = getattr(obj, "extra", None)
         if self.strict:
-            self.extra = Extras.from_any(raw_extra,
-                                         owner=owner_name)  # Strictly, we usually expect None or valid Extras
+            self.extra = normalize_extra(raw_extra)
         else:
-            self.extra = Extras.from_any(raw_extra, owner=owner_name)
+            self.extra = normalize_extra_lenient(raw_extra, owner_name)
 
         # Attach the normalized container back to the object
         obj.extra = self.extra
