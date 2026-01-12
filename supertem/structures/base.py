@@ -145,14 +145,20 @@ separation of concerns across three distinct lifecycles:
 -------------------------------------------------------------------------------
    GOAL:    Integrity of Action (Runtime Safety & Hardware Compatibility)
    INPUT:   An external "Request" object (e.g., StagePosition, BeamSettings)
-   OUTPUT:  Boolean allowed/rejected flag.
+   OUTPUT:  Transient `SafetyCheck` result (Allowed/Rejected + Reasons).
 
    Rules:
    A. Configs are Guardrails, Requests are Intent.
       The SystemSettings object acts as the Gatekeeper. It validates *external*
       requests against its *internal* limits.
 
-   B. Specificity over Genericity.
+   B. NO State Modification (Anti-Leak Policy).
+      Gatekeeping checks happen frequently (e.g. inside UI polling loops).
+      Writing failure logs to `self.extra.notes` would cause infinite memory growth.
+      Safety methods MUST return a transient result object and MUST NOT modify
+      the persistent settings object.
+
+   C. Specificity over Genericity.
       Use specific method names that describe the risk:
       - `is_safe_move(target)`: Checks collision/travel limits (Stage).
       - `is_safe_beam(target)`: Checks voltage/optical limits (Beam).
@@ -195,18 +201,23 @@ The "Zero Trap" Warning:
   Use:   `self.val = p.int(..., default=10)` <-- SAFE. Parser handles 0 vs None.
 
 ===============================================================================
-V. Extras: Preservation and Diagnostics
+V. Extras: Preservation vs. Transient Logic
 ===============================================================================
 
-`Extras` is the structured container for non-canonical information:
+`Extras` is the structured container for **persistent** non-canonical information:
   - vendor: vendor-specific extension payloads (namespaced by vendor key)
   - unknown: unknown top-level keys swept during from_dict (forward compatibility)
   - raw: raw values replaced/rejected during normalization
-  - notes: structured diagnostics produced by normalization/validation
+  - notes: structured diagnostics produced by **normalization** or **validation**
 
 Conventions:
   - Use namespaced note keys, e.g. "DetectorSettings.roi_invalid_shape".
   - LENIENT mode should preserve information rather than discard it.
+
+Anti-Pattern Warning:
+  Do NOT use `Extras` to store transient errors from high-frequency checks
+  (e.g., safety polling). `Extras` travels with the object lifecycle; filling it
+  with runtime logs causes memory leaks. Use `SafetyCheck` return values instead.
 
 ===============================================================================
 VI. Serialization Contract: to_dict Must Be JSON-Capable
@@ -442,6 +453,32 @@ class Extras:
                     except:
                         ex.raw[f"{owner}.extra.{k}"] = repr(v)
         return ex
+
+
+@dataclass
+class SafetyCheck:
+    """
+    Transient result of a safety or capability check.
+    Does not modify persistent state (Extras) to prevent memory leaks during polling.
+    """
+    allowed: bool
+    reasons: List[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        """Allows direct boolean usage: if settings.is_safe(...):"""
+        return self.allowed
+
+    @classmethod
+    def success(cls) -> "SafetyCheck":
+        return cls(allowed=True)
+
+    @classmethod
+    def failure(cls, reason: str) -> "SafetyCheck":
+        return cls(allowed=False, reasons=[reason])
+
+    def add_reason(self, reason: str):
+        self.allowed = False
+        self.reasons.append(reason)
 
 
 def _jsonable(obj: Any) -> Any:
@@ -1203,96 +1240,70 @@ class StageSystemSettings:
         return ok
 
     def is_safe_move(self, target: StagePosition, current: Optional[StagePosition] = None,
-                     relative: bool = False) -> bool:
+                     relative: bool = False) -> SafetyCheck:
         """
         RUNTIME CHECK: External Safety.
-        Checks if a specific request complies with the validated limits.
-
+        Returns a SafetyCheck object (True/False + reasons) without modifying self.extra.
         Args:
-            target: The desired position (absolute) or movement vector (relative).
-            current: The current stage position (required for relative checks or step size calc).
-            relative: If True, 'target' is treated as a delta to 'current'.
+                target: The desired position (absolute) or movement vector (relative).
+                current: The current stage position (required for relative checks or step size calc).
+                relative: If True, 'target' is treated as a delta to 'current'.
         """
-        mode = ParseMode.LENIENT
+        reasons = []
 
         # 1. Resolve Absolute Target
+        abs_target = target
+        step_vector = None
+
         if relative:
-            # Must have a container for current position
             if current is None:
-                note_or_raise(self.extra, "StageSystemSettings.Safety.relative_no_current",
-                              ValueError("Cannot validate relative move without current position"), mode=mode)
-                return False
+                return SafetyCheck.failure("Cannot perform relative move without current position")
 
-            # [PATCH] CRITICAL SAFETY CHECK:
-            # Ensure we know the starting point for every axis we intend to move.
-            # If current.x is None (unknown) and target.x is 50 (move), we must reject it.
+            # Check if we know where we are starting from
             axes_to_check = [
-                ("x", target.x, current.x),
-                ("y", target.y, current.y),
-                ("z", target.z, current.z),
-                ("r", target.r, current.r),
-                ("tilt_x", target.tilt_x, current.tilt_x),
-                ("tilt_y", target.tilt_y, current.tilt_y),
+                ("x", target.x, current.x), ("y", target.y, current.y),
+                ("z", target.z, current.z), ("r", target.r, current.r),
+                ("tilt_x", target.tilt_x, current.tilt_x), ("tilt_y", target.tilt_y, current.tilt_y),
             ]
-
             for axis_name, delta, start_val in axes_to_check:
                 if delta is not None and start_val is None:
-                    note_or_raise(self.extra, f"StageSystemSettings.Safety.unknown_start_{axis_name}",
-                                  ValueError(
-                                      f"Cannot perform relative move on '{axis_name}': current position is unknown (None)."),
-                                  mode=mode)
-                    return False
+                    return SafetyCheck.failure(
+                        f"Relative move on '{axis_name}' impossible: current position is unknown.")
 
-            # Resolve the final destination (Now guaranteed safe from 'None' propagation on active axes)
             abs_target = current + target
-            # For relative moves, the 'target' IS the step vector
             step_vector = target
         else:
-            # For absolute moves, the target is the destination
-            abs_target = target
-            # The step vector is the difference (if current is known)
             step_vector = (target - current) if current else None
 
-        # 2. Check Static Limits (Boundaries) using abs_target
+        # 2. Check Static Limits (Boundaries)
         def check_bound(val, lims, name):
-            # Note: If val is None (wildcard), we skip the check.
-            # This is safe for Absolute moves (None=Don't Move),
-            # and now safe for Relative moves (we proved val is not None above if it mattered).
             if val is not None and lims:
                 if not (lims[0] <= val <= lims[1]):
-                    note_or_raise(self.extra, f"StageSystemSettings.Safety.{name}_limit",
-                                  ValueError(f"Target {val} outside limits {lims}"), mode=mode)
-                    return False
-            return True
+                    reasons.append(f"{name} target {val} outside limits {lims}")
 
-        ok = True
-        ok = check_bound(abs_target.x, self.x_limits, "x") and ok
-        ok = check_bound(abs_target.y, self.y_limits, "y") and ok
-        ok = check_bound(abs_target.z, self.z_limits, "z") and ok
-        ok = check_bound(abs_target.r, self.r_limits, "r") and ok
-        ok = check_bound(abs_target.tilt_x, self.tilt_x_limits, "tilt_x") and ok
-        ok = check_bound(abs_target.tilt_y, self.tilt_y_limits, "tilt_y") and ok
+        check_bound(abs_target.x, self.x_limits, "x")
+        check_bound(abs_target.y, self.y_limits, "y")
+        check_bound(abs_target.z, self.z_limits, "z")
+        check_bound(abs_target.r, self.r_limits, "r")
+        check_bound(abs_target.tilt_x, self.tilt_x_limits, "tilt_x")
+        check_bound(abs_target.tilt_y, self.tilt_y_limits, "tilt_y")
 
-        # 3. Check Dynamic Limits (Step Size) using step_vector
+        # 3. Check Dynamic Limits (Step Size)
         if step_vector is not None:
             dx = step_vector.x or Q_(0, Units.NM)
             dy = step_vector.y or Q_(0, Units.NM)
             distance = (dx.to(Units.NM).magnitude ** 2 + dy.to(Units.NM).magnitude ** 2) ** 0.5
             max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
+
             if distance > max_dist_nm:
-                note_or_raise(self.extra, "StageSystemSettings.Safety.max_step_distance",
-                              ValueError(f"XY step {distance} exceeds limit {max_dist_nm:.1f}nm"),
-                              mode=mode)
-                ok = False
+                reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
 
             if step_vector.tilt_x is not None:
                 d_tilt = abs(step_vector.tilt_x)
                 if d_tilt > self.max_step_angle:
-                    note_or_raise(self.extra, "StageSystemSettings.Safety.max_step_angle",
-                                  ValueError(f"Tilt X step {d_tilt} exceeds limit {self.max_step_angle}"), mode=mode)
-                    ok = False
+                    reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_angle}")
 
-        return ok
+        return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
     def to_dict(self) -> dict:
         def _sl(v, u): return [serialize_quantity(x, u) for x in v] if v else None
@@ -1521,31 +1532,30 @@ class BeamSystemSettings:
         ok = _check(self.spot_size_limits, "spot_size_limits") and ok
         return ok
 
-    def is_safe_beam(self, target: BeamSettings) -> bool:
+
+
+    def is_safe_beam(self, target: BeamSettings) -> SafetyCheck:
         """
         Runtime Gatekeeper: Checks if a target beam configuration respects system limits.
         """
-        mode = ParseMode.LENIENT
+        reasons = []
 
         def _check(val, limit_tuple, name):
-            if val is None or limit_tuple is None: return True
-            min_lim, max_lim = limit_tuple
-            if not (min_lim <= val <= max_lim):
-                note_or_raise(self.extra, f"BeamSystemSettings.Safety.beam_{name}",
-                              ValueError(f"{name} {val} outside limits {limit_tuple}"), mode=mode)
-                return False
-            return True
-        ok = True
-        ok = _check(target.voltage, self.voltage_limits, "voltage") and ok
-        ok = _check(target.beam_current, self.beam_current_limits, "current") and ok
-        ok = _check(target.convergence_angle, self.convergence_angle_limits, "convergence") and ok
+            if val is not None and limit_tuple is not None:
+                min_lim, max_lim = limit_tuple
+                if not (min_lim <= val <= max_lim):
+                    reasons.append(f"Beam {name} {val} outside limits {limit_tuple}")
+
+        _check(target.voltage, self.voltage_limits, "voltage")
+        _check(target.beam_current, self.beam_current_limits, "current")
+        _check(target.convergence_angle, self.convergence_angle_limits, "convergence")
+
         if target.spot_size is not None and self.spot_size_limits:
             min_s, max_s = self.spot_size_limits
             if not (min_s <= target.spot_size <= max_s):
-                note_or_raise(self.extra, "BeamSystemSettings.Safety.beam_spot",
-                              ValueError(f"Spot size {target.spot_size} outside {self.spot_size_limits}"), mode=mode)
-                ok = False
-        return ok
+                reasons.append(f"Spot size {target.spot_size} outside {self.spot_size_limits}")
+
+        return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
     def to_dict(self) -> dict:
         def _sl(v, u): return [serialize_quantity(x, u) for x in v] if v else None
@@ -1817,28 +1827,122 @@ class DetectorCapabilities:
 
         return ok
 
-    def supports(self, settings: DetectorSettings) -> bool:
-        if settings.binning_xy:
+    def supports(self, settings: DetectorSettings) -> SafetyCheck:
+        """
+        Validates if the requested settings are supported by this specific detector hardware.
+        Returns a SafetyCheck object containing all rejection reasons.
+        """
+        reasons = []
+
+        # --- 1. Binning Checks ---
+        if settings.binning_xy is not None:
             bx, by = settings.binning_xy
+
+            # Feature Flag
+            if self.can_binning is False and (bx > 1 or by > 1):
+                reasons.append(f"Binning XY ({bx}, {by}) requested, but 'can_binning' is False.")
+
+            # Ranges
+            if self.binning_xy_min:
+                min_x, min_y = self.binning_xy_min
+                if bx < min_x or by < min_y:
+                    reasons.append(f"Binning XY ({bx}, {by}) below limit {self.binning_xy_min}.")
+
             if self.binning_xy_max:
                 max_x, max_y = self.binning_xy_max
-                if bx > max_x or by > max_y: return False
-            if self.can_binning is False and (bx > 1 or by > 1): return False
+                if bx > max_x or by > max_y:
+                    reasons.append(f"Binning XY ({bx}, {by}) exceeds limit {self.binning_xy_max}.")
 
         if settings.binning_index is not None:
-            if self.can_binning is False and settings.binning_index > 1: return False
-            if self.binning_index_min and settings.binning_index < self.binning_index_min: return False
-            if self.binning_index_max and settings.binning_index > self.binning_index_max: return False
+            bi = settings.binning_index
 
+            if self.can_binning is False and bi > 1:
+                reasons.append(f"Binning Index {bi} requested, but 'can_binning' is False.")
+
+            if self.binning_index_min is not None and bi < self.binning_index_min:
+                reasons.append(f"Binning Index {bi} below limit {self.binning_index_min}.")
+
+            if self.binning_index_max is not None and bi > self.binning_index_max:
+                reasons.append(f"Binning Index {bi} exceeds limit {self.binning_index_max}.")
+
+        # --- 2. Exposure Checks ---
         if settings.exposure is not None:
-            if self.exposure_min is not None and settings.exposure < self.exposure_min: return False
-            if self.exposure_max is not None and settings.exposure > self.exposure_max: return False
+            # Note: settings.exposure is a Quantity (Units.MS)
+            if self.exposure_min is not None and settings.exposure < self.exposure_min:
+                reasons.append(f"Exposure {settings.exposure} below limit {self.exposure_min}.")
 
-        if settings.digital_rotation_deg is not None and self.can_digital_rotation:
-             if self.digital_rotation_min is not None and settings.digital_rotation_deg < self.digital_rotation_min: return False
-             if self.digital_rotation_max is not None and settings.digital_rotation_deg > self.digital_rotation_max: return False
+            if self.exposure_max is not None and settings.exposure > self.exposure_max:
+                reasons.append(f"Exposure {settings.exposure} exceeds limit {self.exposure_max}.")
 
-        return True
+        # --- 3. Frame Integration ---
+        if settings.frame_integration is not None:
+            fi = settings.frame_integration
+            if self.frame_integration_min is not None and fi < self.frame_integration_min:
+                reasons.append(f"Frame Integration {fi} below limit {self.frame_integration_min}.")
+
+            if self.frame_integration_max is not None and fi > self.frame_integration_max:
+                reasons.append(f"Frame Integration {fi} exceeds limit {self.frame_integration_max}.")
+
+        # --- 4. Gain & Offset ---
+        if settings.gain_index is not None:
+            gi = settings.gain_index
+            if self.can_gain is False and gi != 0:
+                reasons.append(f"Gain Index {gi} requested, but 'can_gain' is False.")
+
+            if self.gain_index_min is not None and gi < self.gain_index_min:
+                reasons.append(f"Gain Index {gi} below limit {self.gain_index_min}.")
+
+            if self.gain_index_max is not None and gi > self.gain_index_max:
+                reasons.append(f"Gain Index {gi} exceeds limit {self.gain_index_max}.")
+
+        if settings.offset_index is not None:
+            oi = settings.offset_index
+            if self.can_offset is False and oi != 0:
+                reasons.append(f"Offset Index {oi} requested, but 'can_offset' is False.")
+
+            if self.offset_index_min is not None and oi < self.offset_index_min:
+                reasons.append(f"Offset Index {oi} below limit {self.offset_index_min}.")
+
+            if self.offset_index_max is not None and oi > self.offset_index_max:
+                reasons.append(f"Offset Index {oi} exceeds limit {self.offset_index_max}.")
+
+        # --- 5. Digital Rotation ---
+        if settings.digital_rotation_deg is not None:
+            rot_val = settings.digital_rotation_deg
+
+            if self.can_digital_rotation is False and rot_val != 0.0:
+                reasons.append(f"Digital Rotation {rot_val}° requested, but 'can_digital_rotation' is False.")
+
+            # Helper to extract magnitude safely for comparison
+            # (Settings uses float deg, Capabilities uses Quantity)
+            def _get_deg(q):
+                return q.to(Units.DEG).magnitude if hasattr(q, 'to') else q
+
+            if self.digital_rotation_min is not None:
+                min_r = _get_deg(self.digital_rotation_min)
+                if rot_val < min_r:
+                    reasons.append(f"Digital Rotation {rot_val}° below limit {self.digital_rotation_min}.")
+
+            if self.digital_rotation_max is not None:
+                max_r = _get_deg(self.digital_rotation_max)
+                if rot_val > max_r:
+                    reasons.append(f"Digital Rotation {rot_val}° exceeds limit {self.digital_rotation_max}.")
+
+        # --- 6. ROI Checks ---
+        if settings.roi is not None:
+            w, h = settings.roi.width, settings.roi.height
+
+            if self.roi_size_min:
+                min_w, min_h = self.roi_size_min
+                if w < min_w or h < min_h:
+                    reasons.append(f"ROI size {w}x{h} below limit {self.roi_size_min}.")
+
+            if self.roi_size_max:
+                max_w, max_h = self.roi_size_max
+                if w > max_w or h > max_h:
+                    reasons.append(f"ROI size {w}x{h} exceeds limit {self.roi_size_max}.")
+
+        return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
     def to_dict(self) -> dict:
         d = {
@@ -1965,10 +2069,17 @@ class DetectorSystemSettings:
         for cap in self.capabilities_by_id.values(): ok = cap.validate(mode=mode) and ok
         return ok
 
-    def is_supported(self, settings: DetectorSettings) -> bool:
-        if not settings.detector_id: return False
+    def is_supported(self, settings: DetectorSettings) -> SafetyCheck:
+        if not settings.detector_id:
+            return SafetyCheck.failure("No detector_id specified in settings")
+
         caps = self.capabilities_by_id.get(settings.detector_id)
-        return caps.supports(settings) if caps else True
+        if not caps:
+            # If we don't know the capabilities, do we fail safe or fail open?
+            # Usually fail open (True) if lenient, but here explicit is better.
+            return SafetyCheck.success()
+
+        return caps.supports(settings)
 
     def to_dict(self) -> dict:
         d = {
