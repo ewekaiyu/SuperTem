@@ -1,3 +1,74 @@
+"""
+supertem.utils
+
+Operational Utilities, Session Lifecycle Management, and Unit-Aware I/O.
+
+This module acts as the "Glue Layer" between the abstract data structures defined
+in base.py and the physical microscope hardware. It provides the high-level
+orchestration required to initialize sessions, manage persistent storage, and
+handle media generation.
+
+===============================================================================
+I. Session Orchestration (The Setup Lifecycle)
+===============================================================================
+
+The primary entry point for any automation routine is `setup_session()`.
+This function manages the transition from static configuration to live execution:
+
+  1) Configuration Resolution
+     - Queries the central `registry` (from config.py) to locate the active
+       hardware profile and automation protocol.
+     - Ingests YAML data into `MicroscopeSettings` using STRICT mode to ensure
+       control-plane safety before hardware handoff.
+
+  2) Environment Preparation
+     - Generates unique, timestamped session directories within the system
+       log tree.
+     - Bootstraps the logging subsystem to capture multi-level diagnostics
+       (File + Console).
+
+  3) Hardware Initialization (The Factory Pattern)
+     - Maps the `manufacturer` identity to specific driver implementations
+       (e.g., JEOL vs. DEMO).
+     - Instantiates the `TemMicroscope` controller, binding the validated
+       settings to a live hardware interface.
+
+===============================================================================
+II. Unit-Aware Persistence & Serialization
+===============================================================================
+
+The utility layer provides specialized I/O handlers that respect the
+"Normalization vs. Serialization" contract defined in the base structures:
+
+- Stage Position Management: `save_positions` and `get_saved_positions` handle
+  the translation between human-readable YAML (often containing float magnitudes)
+  and the strongly-typed `StagePosition` objects used in the control plane.
+- Unit Safety: During storage, position data is serialized using `to_dict()`,
+  which strips Pint units and applies standard suffixes (e.g., `_nm`, `_deg`)
+  to ensure the resulting YAML remains portable and JSON-compatible.
+
+===============================================================================
+III. Media & Diagnostic Helpers
+===============================================================================
+
+Beyond control logic, this module provides tools for data post-processing:
+
+- MicroscopeImage Integration: Media helpers (like `create_gif`) utilize the
+  `MicroscopeImage` loading logic to interpret sidecar metadata and embedded
+  JSON headers, ensuring that even diagnostic previews maintain a link to
+  the machine state at the time of acquisition.
+- Logging: Standardized formatting for cross-module traceability, linking
+  timestamps, function names, and line numbers across the automation stack.
+
+===============================================================================
+Usage Contract
+===============================================================================
+
+- Filesystem side-effects: Many functions in this module will create directories
+  and files automatically based on `supertem.config` paths.
+- Hardware Safety: Always use `setup_session` rather than manual driver
+  instantiation to ensure that validation logic is never bypassed.
+"""
 import datetime
 import glob
 import logging
