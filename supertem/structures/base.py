@@ -36,10 +36,10 @@ The intended lifecycle for objects in this module is:
                preserved here to ensure data fidelity during ingestion.
 
   3) Validate (Integrity of Meaning)
-     - Happens in validate(mode=...)
+     - Happens in validate(mode=...) via `Validator`.
      - Goal:   Enforce domain constraints and logical invariants (Logic Safety).
-     - Action (STRICT): Raise note_or_raise(...) on any violation.
-     - Action (LENIENT): Record violation in Extras.notes and "Heal" the object
+     - Action (STRICT): Raises exceptions immediately on violation.
+     - Action (LENIENT): Records violation in Extras.notes and "Heals" the object
                (e.g., reset width=-100 -> 512, or disable the specific feature).
      - Result: The object is now guaranteed to be logically consistent.
 
@@ -119,8 +119,7 @@ separation of concerns across three distinct lifecycles:
 2. Validation (validate)
 -------------------------------------------------------------------------------
    GOAL:    Integrity of Meaning (Internal Logic & Self-Consistency)
-   INPUT:   "Clean" data (guaranteed types from step 1)
-   OUTPUT:  Boolean success flag (and populated Extras.notes)
+   TOOL:    Validator
 
    Rules:
    A. Trust the Types.
@@ -252,11 +251,10 @@ VII. Implementation Conventions & Usage
         overhead for performance, but must still normalize fields.
 
    B. validate(mode=...) (Logic & Healing)
-      - Boilerplate: Must start with `_setup_validate` to determine effective mode.
-        `mode, strict = _setup_validate(self._mode, mode)`
-      - Logic: Check physical constraints. Use `note_or_raise(self.extra, ...)`
-        to handle violations (raising in STRICT, recording in LENIENT).
-      - Healing: In LENIENT mode, auto-correct invalid values after recording them.
+      - Use `v = Validator(self, mode)`
+      - Define constraints using `v.check(condition, key, error, heal=lambda: ...)`
+      - Standard helpers: `v.check_gt_zero`, `v.check_finite`, `v.check_nested`.
+      - Return `v.valid`.
 
    C. to_dict() (Serialization)
       - Logic: Build a local dict of canonical fields.
@@ -899,6 +897,93 @@ class FieldParser:
                 out[key_norm] = obj
         return out
 
+class Validator:
+    """
+    Context-aware validation helper.
+    Encapsulates mode checking (Strict/Lenient), error recording, and healing logic.
+    """
+    def __init__(self, obj: Any, mode_override: Union[ParseMode, str, None] = None):
+        self.obj = obj
+        self.mode, self.strict = _setup_validate(obj._mode, mode_override)
+        self.extra = obj.extra
+        self.valid = True
+        self.owner = obj.__class__.__name__
+
+    def _key(self, name: str) -> str:
+        return f"{self.owner}.{name}"
+
+    def check(self, condition: bool, key_suffix: str, exc: Union[Exception, str],
+              raw: Any = None, heal: Optional[callable] = None) -> bool:
+        """
+        Generic assertion.
+        If False: raises in STRICT, logs + heals in LENIENT.
+        """
+        if condition:
+            return True
+
+        # Prepare Exception
+        e = exc if isinstance(exc, Exception) else ValueError(str(exc))
+
+        # Log or Raise
+        note_or_raise(self.extra, self._key(key_suffix), e, mode=self.mode, raw=raw)
+
+        if self.strict:
+            self.valid = False
+            return False
+
+        # Heal (Lenient only)
+        if heal:
+            try:
+                heal()
+            except Exception:
+                pass
+        return False
+
+    # --- Common specialized checks ---
+
+    def check_nested(self, child: Any) -> bool:
+        """Validates a child object if it exists."""
+        if child and hasattr(child, 'validate'):
+            if not child.validate(mode=self.mode):
+                if self.strict: self.valid = False
+                return False
+        return True
+
+    def check_nested_map(self, children: Dict[str, Any]) -> bool:
+        """Validates a dictionary of child objects."""
+        if not children: return True
+        for child in children.values():
+            self.check_nested(child)
+        return self.valid
+
+    def check_gt_zero(self, val: Any, name: str, unit_aware: bool = False,
+                      reset_to: Any = None) -> bool:
+        """Check value > 0."""
+        if val is None: return True
+        is_valid = val.magnitude > 0 if (unit_aware and isinstance(val, Quantity)) else val > 0
+        return self.check(
+            is_valid, name, f"{name} must be > 0", raw=val,
+            heal=lambda: setattr(self.obj, name.split('.')[-1], reset_to)
+        )
+
+    def check_ge_zero(self, val: Any, name: str, unit_aware: bool = False,
+                      reset_to: Any = None) -> bool:
+        """Check value >= 0."""
+        if val is None: return True
+        is_valid = val.magnitude >= 0 if (unit_aware and isinstance(val, Quantity)) else val >= 0
+        return self.check(
+            is_valid, name, f"{name} must be >= 0", raw=val,
+            heal=lambda: setattr(self.obj, name.split('.')[-1], reset_to)
+        )
+
+    def check_finite(self, val: Any, name: str, reset_to: Any = None) -> bool:
+        """Check numbers are not NaN or Inf."""
+        if val is None: return True
+        is_valid = np.isfinite(val.magnitude) if isinstance(val, Quantity) else np.isfinite(val)
+        return self.check(
+            is_valid, name, f"{name} must be finite", raw=val,
+            heal=lambda: setattr(self.obj, name.split('.')[-1], reset_to)
+        )
 
 # =============================================================================
 # Structures (Dataclasses)
@@ -931,14 +1016,10 @@ class Point:
         self.name = p.str(self.name, "name")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        if not (np.isfinite(self.x) and np.isfinite(self.y) and np.isfinite(self.z)):
-            note_or_raise(None, "Point.coordinates", ValueError(f"Coordinates must be finite"), mode=mode, raw=(self.x, self.y, self.z))
-            if strict: return False
-            self.x = 0.0 if not np.isfinite(self.x) else self.x
-            self.y = 0.0 if not np.isfinite(self.y) else self.y
-            self.z = 0.0 if not np.isfinite(self.z) else self.z
-        return True
+        v = Validator(self, mode)
+        for axis in ["x", "y", "z"]:
+            v.check_finite(getattr(self, axis), f"coordinates.{axis}", reset_to=0.0)
+        return v.valid
 
     def to_dict(self) -> dict:
         return _jsonable(drop_none_keys({"x": self.x, "y": self.y, "z": self.z, "name": self.name}))
@@ -985,17 +1066,14 @@ class ROI:
         self.height = p.int(self.height, "height", default=512)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        if self.x < 0 or self.y < 0:
-            note_or_raise(self.extra, "ROI.xy", ValueError("ROI.x/ROI.y must be >= 0"), mode=mode, raw=(self.x, self.y))
-            if strict: ok = False
-            else: self.x, self.y = max(self.x, 0), max(self.y, 0)
-        if (self.width <= 0) or (self.height <= 0):
-            note_or_raise(self.extra, "ROI.size", ValueError("ROI.width/height must be > 0"), mode=mode, raw=(self.width, self.height))
-            if strict: ok = False
-            else: self.width, self.height = max(self.width, 512), max(self.height, 512)
-        return ok
+        v = Validator(self, mode)
+        v.check(self.x >= 0, "xy", "ROI.x must be >= 0", raw=self.x, heal=lambda: setattr(self, 'x', 0))
+        v.check(self.y >= 0, "xy", "ROI.y must be >= 0", raw=self.y, heal=lambda: setattr(self, 'y', 0))
+        v.check(self.width > 0, "size", "ROI.width must be > 0", raw=self.width,
+                heal=lambda: setattr(self, 'width', 512))
+        v.check(self.height > 0, "size", "ROI.height must be > 0", raw=self.height,
+                heal=lambda: setattr(self, 'height', 512))
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {"x": self.x, "y": self.y, "width": self.width, "height": self.height}
@@ -1059,13 +1137,10 @@ class StagePosition:
         self.tilt_y = p.qty(self.tilt_y, "tilt_y", Units.DEG)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        for name, q in [("x", self.x), ("y", self.y), ("z", self.z), ("r", self.r), ("tilt_x", self.tilt_x), ("tilt_y", self.tilt_y)]:
-            if q is not None and not np.isfinite(q.magnitude):
-                note_or_raise(self.extra, f"StagePosition.{name}", ValueError(f"{name} must be finite"), mode=mode, raw=q)
-                ok = False
-        return ok
+        v = Validator(self, mode)
+        for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
+            v.check_finite(getattr(self, axis), axis)  # Default heal is no-op (preserved as None)
+        return v.valid
 
     def __add__(self, other: 'StagePosition') -> 'StagePosition':
         if not isinstance(other, StagePosition): return NotImplemented
@@ -1213,69 +1288,36 @@ class StageSystemSettings:
         self.timeout = p.qty(self.timeout, "timeout", Units.SEC, default=Q_(10.0, Units.SEC))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        def _check_limits(lims, name):
-            if lims and lims[0] > lims[1]:
-                note_or_raise(self.extra, f"StageSystemSettings.{name}", ValueError("min > max"), mode=mode)
-                if strict: return False
-                try:
-                    setattr(self, name, (lims[1], lims[0]))
-                except:
-                    pass
-            return True
+        v = Validator(self, mode)
 
-        ok = _check_limits(self.x_limits, "x_limits") and ok
-        ok = _check_limits(self.y_limits, "y_limits") and ok
-        ok = _check_limits(self.z_limits, "z_limits") and ok
-        ok = _check_limits(self.r_limits, "r_limits") and ok
-        ok = _check_limits(self.tilt_x_limits, "tilt_x_limits") and ok
-        ok = _check_limits(self.tilt_y_limits, "tilt_y_limits") and ok
+        # 1. Limit Logic (Min < Max)
+        def _validate_range(lims, name):
+            if not lims: return
+            v.check(lims[0] <= lims[1], f"{name}_limits", "min > max", raw=lims,
+                    heal=lambda: setattr(self, f"{name}_limits", (lims[1], lims[0])))
 
-        def _check_completeness(enabled: bool, limits: Any, name: str):
-            if enabled and limits is None:
-                note_or_raise(self.extra, f"StageSystemSettings.{name}_safety",
-                              ValueError(f"Axis {name} is enabled but has no safety limits defined."), mode=mode)
-                if not strict:
-                     try: setattr(self, f"can_{name}", False)
-                     except: pass
-                else:
-                     return False
-            return True
+        for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
+            _validate_range(getattr(self, f"{axis}_limits"), axis)
 
-        ok = _check_completeness(self.can_x, self.x_limits, "x") and ok
-        ok = _check_completeness(self.can_y, self.y_limits, "y") and ok
-        ok = _check_completeness(self.can_z, self.z_limits, "z") and ok
-        ok = _check_completeness(self.can_r, self.r_limits, "r") and ok
-        ok = _check_completeness(self.can_tilt_x, self.tilt_x_limits, "tilt_x") and ok
-        ok = _check_completeness(self.can_tilt_y, self.tilt_y_limits, "tilt_y") and ok
+            # 2. Consistency (Enabled -> Limits must exist)
+            is_enabled = getattr(self, f"can_{axis}")
+            has_limits = getattr(self, f"{axis}_limits") is not None
+            v.check(not (is_enabled and not has_limits), f"{axis}_safety",
+                    f"Axis {axis} enabled without limits",
+                    heal=lambda: setattr(self, f"can_{axis}", False))
 
-        if self.max_step_distance.magnitude <= 0:
-            note_or_raise(self.extra, "StageSystemSettings.max_step_distance",
-                          ValueError("max_step_distance must be > 0"), mode=mode)
-            if strict:
-                ok = False
-            else:
-                self.max_step_distance = Q_(50000.0, Units.NM)
+        # 3. Value Checks
+        v.check_gt_zero(self.max_step_distance, "max_step_distance", unit_aware=True, reset_to=Q_(50000.0, Units.NM))
+        v.check_ge_zero(self.settle_time, "settle_time", unit_aware=True, reset_to=Q_(0.2, Units.SEC))
 
+        # 4. Eucentric Check
         if self.eucentric_z is not None and self.z_limits:
             z_min, z_max = self.z_limits
-            if not (z_min <= self.eucentric_z <= z_max):
-                note_or_raise(self.extra, "StageSystemSettings.eucentric_z",
-                              ValueError(f"eucentric_z ({self.eucentric_z}) outside z_limits"), mode=mode)
-                if strict:
-                    ok = False
-                else:
-                    self.eucentric_z = None
+            v.check(z_min <= self.eucentric_z <= z_max, "eucentric_z",
+                    f"eucentric_z {self.eucentric_z} outside limits",
+                    heal=lambda: setattr(self, 'eucentric_z', None))
 
-        if self.settle_time.magnitude < 0:
-            note_or_raise(self.extra, "StageSystemSettings.settle_time",
-                          ValueError("Settle time must be >= 0"), mode=mode)
-            if strict:
-                ok = False
-            else:
-                self.settle_time = Q_(0.2, Units.SEC)
-        return ok
+        return v.valid
 
     def is_safe_move(self, target: StagePosition, current: Optional[StagePosition] = None,
                      relative: bool = False) -> SafetyCheck:
@@ -1435,31 +1477,16 @@ class BeamSettings:
         self.image_shift = p.model(Point, self.image_shift, "image_shift", default=None)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        if self.stigmation: ok = self.stigmation.validate(mode=mode) and ok
-        if self.beam_shift: ok = self.beam_shift.validate(mode=mode) and ok
-        if self.image_shift: ok = self.image_shift.validate(mode=mode) and ok
+        v = Validator(self, mode)
+        v.check_nested(self.stigmation)
+        v.check_nested(self.beam_shift)
+        v.check_nested(self.image_shift)
 
-        def _check_pos_qty(val, name, attr_name):
-            if val is not None and val.magnitude < 0:
-                note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode)
-                if strict: return False
-                setattr(self, attr_name, None)
-            return True
-
-        def _check_pos_int(val, name, attr_name):
-            if val is not None and val < 0:
-                note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode)
-                if strict: return False
-                setattr(self, attr_name, None)
-            return True
-
-        ok = _check_pos_qty(self.convergence_angle, "BeamSettings.convergence_angle", "convergence_angle") and ok
-        ok = _check_pos_qty(self.voltage, "BeamSettings.voltage", "voltage") and ok
-        ok = _check_pos_qty(self.beam_current, "BeamSettings.beam_current", "beam_current") and ok
-        ok = _check_pos_int(self.spot_size, "BeamSettings.spot_size", "spot_size") and ok
-        return ok
+        v.check_ge_zero(self.convergence_angle, "convergence_angle", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.voltage, "voltage", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.beam_current, "beam_current", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.spot_size, "spot_size", reset_to=None)
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
@@ -1539,36 +1566,33 @@ class BeamSystemSettings:
         self.default_beam = p.model(BeamSettings, self.default_beam, "default_beam", default=BeamSettings(_mode=p.mode))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = self.default_beam.validate(mode=mode)
+        v = Validator(self, mode)
+        v.check_nested(self.default_beam)
 
-        def _check(rng, name):
-            if rng:
-                mn, mx = rng
-                if mn > mx:
-                    note_or_raise(self.extra, f"BeamSystemSettings.{name}", ValueError(f"{name} invalid: min > max"), mode=mode)
-                    if strict: return False
-                    try: setattr(self, name, (mx, mn))
-                    except Exception: pass
-                    mn, mx = (mx, mn)
-                is_neg = False
-                if hasattr(mn, "magnitude"):
-                    if mn.magnitude < 0: is_neg = True
-                elif mn < 0: is_neg = True
-                if is_neg:
-                    note_or_raise(self.extra, f"BeamSystemSettings.{name}",
-                                  ValueError(f"{name} invalid: min < 0"), mode=mode)
-                    if strict: return False
-                    zero = Q_(0, mn.units) if hasattr(mn, "units") else 0
-                    try: setattr(self, name, (zero, mx))
-                    except: pass
-            return True
+        def _check_range(rng, name):
+            if not rng: return
+            mn, mx = rng
+            # 1. Range Integrity
+            v.check(mn <= mx, name, "min > max",
+                    heal=lambda: setattr(self, name, (mx, mn)))
 
-        ok = _check(self.voltage_limits, "voltage_limits") and ok
-        ok = _check(self.beam_current_limits, "beam_current_limits") and ok
-        ok = _check(self.convergence_angle_limits, "convergence_angle_limits") and ok
-        ok = _check(self.spot_size_limits, "spot_size_limits") and ok
-        return ok
+            # 2. Non-Negativity (use updated values if healed)
+            # Re-fetch in case strict=False and we swapped
+            curr_rng = getattr(self, name)
+            curr_min = curr_rng[0]
+
+            is_neg = curr_min.magnitude < 0 if hasattr(curr_min, "magnitude") else curr_min < 0
+            if is_neg:
+                zero = Q_(0, curr_min.units) if hasattr(curr_min, "units") else 0
+                v.check(False, name, "min < 0",
+                        heal=lambda: setattr(self, name, (zero, curr_rng[1])))
+
+        _check_range(self.voltage_limits, "voltage_limits")
+        _check_range(self.beam_current_limits, "beam_current_limits")
+        _check_range(self.convergence_angle_limits, "convergence_angle_limits")
+        _check_range(self.spot_size_limits, "spot_size_limits")
+
+        return v.valid
 
 
 
@@ -1670,44 +1694,23 @@ class DetectorSettings:
         self.roi = p.model(ROI, self.roi, "roi", default=None)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        if self.exposure is not None:
-             if self.exposure.magnitude <= 0:
-                 note_or_raise(self.extra, "DetectorSettings.exposure", ValueError("Exposure must be > 0"), mode=mode)
-                 if strict:
-                     ok = False
-                 else:
-                     self.exposure = None
+        v = Validator(self, mode)
+        v.check_gt_zero(self.exposure, "exposure", unit_aware=True, reset_to=None)
 
         if self.binning_xy:
-             if self.binning_xy[0] <= 0 or self.binning_xy[1] <= 0:
-                 note_or_raise(self.extra, "DetectorSettings.binning_xy", ValueError("binning_xy must be > 0"), mode=mode, raw=self.binning_xy)
-                 if strict:
-                     ok = False
-                 else:
-                     self.binning_xy = None
+            v.check(self.binning_xy[0] > 0 and self.binning_xy[1] > 0, "binning_xy", "must be > 0",
+                    raw=self.binning_xy, heal=lambda: setattr(self, 'binning_xy', None))
 
-        if self.frame_integration is not None and self.frame_integration < 1:
-            note_or_raise(self.extra, "DetectorSettings.frame_integration",
-                          ValueError(f"Frame integration must be >= 1, got {self.frame_integration}"), mode=mode)
-            if strict:
-                ok = False
-            else:
-                self.frame_integration = 1
+        v.check(self.frame_integration is None or self.frame_integration >= 1,
+                "frame_integration", "must be >= 1",
+                heal=lambda: setattr(self, 'frame_integration', 1))
 
-        if self.gain_index is not None and self.gain_index < 0:
-            note_or_raise(self.extra, "DetectorSettings.gain_index",
-                          ValueError("Gain index must be >= 0"), mode=mode)
-            if strict:
-                ok = False
-            else:
-                self.gain_index = 0
+        v.check(self.gain_index is None or self.gain_index >= 0,
+                "gain_index", "must be >= 0",
+                heal=lambda: setattr(self, 'gain_index', 0))
 
-        if self.roi:
-            if not self.roi.validate(mode=mode):
-                ok = False
-        return ok
+        v.check_nested(self.roi)
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
@@ -1810,60 +1813,38 @@ class DetectorCapabilities:
         self.digital_rotation_max = p.qty(self.digital_rotation_max, "digital_rotation_max", Units.DEG)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
+        v = Validator(self, mode)
 
-        def _check_range(min_val, max_val, name, min_attr, max_attr):
-            if min_val is not None and max_val is not None:
-                if min_val > max_val:
-                    note_or_raise(self.extra, name, ValueError(f"{name} invalid: min > max ({min_val} > {max_val})"), mode=mode)
-                    if strict: return False
-                    try:
-                        setattr(self, min_attr, max_val)
-                        setattr(self, max_attr, min_val)
-                    except Exception: pass
-            return True
-
-        def _check_pos(val, name, attr_name):
-            if val is not None:
-                is_neg = False
-                if isinstance(val, Quantity): is_neg = (val < Q_(0, val.units))
-                elif val < 0: is_neg = True
-
-                if is_neg:
-                    note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
-                    if strict: return False
-                    zero = Q_(0.0, val.units) if isinstance(val, Quantity) else 0.0
-                    setattr(self, attr_name, zero)
-            return True
+        def _check_range(min_attr, max_attr, name):
+            mn, mx = getattr(self, min_attr), getattr(self, max_attr)
+            if mn is not None and mx is not None:
+                v.check(mn <= mx, name, f"min > max ({mn} > {mx})",
+                        heal=lambda: (setattr(self, min_attr, mx), setattr(self, max_attr, mn)))
 
         # 1. Range Consistency
-        ok = _check_range(self.binning_index_min, self.binning_index_max, "DetectorCapabilities.binning_index", "binning_index_min", "binning_index_max") and ok
-        ok = _check_range(self.frame_integration_min, self.frame_integration_max, "DetectorCapabilities.frame_integration", "frame_integration_min", "frame_integration_max") and ok
-        ok = _check_range(self.gain_index_min, self.gain_index_max, "DetectorCapabilities.gain_index", "gain_index_min", "gain_index_max") and ok
-        ok = _check_range(self.offset_index_min, self.offset_index_max, "DetectorCapabilities.offset_index", "offset_index_min", "offset_index_max") and ok
-        ok = _check_range(self.exposure_min, self.exposure_max, "DetectorCapabilities.exposure", "exposure_min", "exposure_max") and ok
-        ok = _check_range(self.digital_rotation_min, self.digital_rotation_max, "DetectorCapabilities.digital_rotation", "digital_rotation_min", "digital_rotation_max") and ok
+        _check_range("binning_index_min", "binning_index_max", "binning_index")
+        _check_range("frame_integration_min", "frame_integration_max", "frame_integration")
+        _check_range("gain_index_min", "gain_index_max", "gain_index")
+        _check_range("offset_index_min", "offset_index_max", "offset_index")
+        _check_range("exposure_min", "exposure_max", "exposure")
+        _check_range("digital_rotation_min", "digital_rotation_max", "digital_rotation")
 
         # 2. Physical Non-negativity
-        ok = _check_pos(self.exposure_min, "DetectorCapabilities.exposure_min", "exposure_min") and ok
+        v.check_ge_zero(self.exposure_min, "exposure_min", unit_aware=True,
+                        reset_to=Q_(0.0, Units.MS))
 
-        # 3. Tuple consistency (ROI/Binning)
+        # 3. Tuple consistency (ROI)
         if self.roi_size_min and self.roi_size_max:
-             if self.roi_size_min[0] > self.roi_size_max[0] or self.roi_size_min[1] > self.roi_size_max[1]:
-                 note_or_raise(self.extra, "DetectorCapabilities.roi_size", ValueError("ROI size min > max"), mode=mode)
-                 if strict:
-                     ok = False
-                 else:
-                     # Heal: Swap X and Y components individually
-                     new_min_x = min(self.roi_size_min[0], self.roi_size_max[0])
-                     new_max_x = max(self.roi_size_min[0], self.roi_size_max[0])
-                     new_min_y = min(self.roi_size_min[1], self.roi_size_max[1])
-                     new_max_y = max(self.roi_size_min[1], self.roi_size_max[1])
-                     self.roi_size_min = (new_min_x, new_min_y)
-                     self.roi_size_max = (new_max_x, new_max_y)
+            min_w, min_h = self.roi_size_min
+            max_w, max_h = self.roi_size_max
+            if min_w > max_w or min_h > max_h:
+                def _heal_roi():
+                    self.roi_size_min = (min(min_w, max_w), min(min_h, max_h))
+                    self.roi_size_max = (max(min_w, max_w), max(min_h, max_h))
 
-        return ok
+                v.check(False, "roi_size", "ROI size min > max", heal=_heal_roi)
+
+        return v.valid
 
     def supports(self, settings: DetectorSettings) -> SafetyCheck:
         """
@@ -2077,35 +2058,27 @@ class DetectorSystemSettings:
         self.capabilities_by_id = p.map_model(DetectorCapabilities, self.capabilities_by_id, "capabilities_by_id")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
+        v = Validator(self, mode)
+
+        # 1. Default Existence
         ids_available = set(self.available_detector_ids)
-        ids_defaults = set(self.defaults_by_id.keys())
-        ids_caps = set(self.capabilities_by_id.keys())
-
         if self.default_detector_id:
-            known_anywhere = ids_available | ids_defaults | ids_caps
-            if known_anywhere and self.default_detector_id not in known_anywhere:
-                note_or_raise(self.extra, "DetectorSystemSettings.default_detector_id",
-                              ValueError(f"Selected default '{self.default_detector_id}' is unknown."), mode=mode)
-                if strict:
-                    ok = False
-                else:
-                    self.default_detector_id = None
+            known = ids_available | set(self.defaults_by_id.keys()) | set(self.capabilities_by_id.keys())
+            v.check(self.default_detector_id in known, "default_detector_id",
+                    f"Default '{self.default_detector_id}' is unknown",
+                    heal=lambda: setattr(self, 'default_detector_id', None))
 
-        missing_defaults = ids_available - ids_defaults
-        if missing_defaults:
-            note_or_raise(self.extra, "DetectorSystemSettings.completeness",
-                          ValueError(f"Available detectors missing default settings: {missing_defaults}"), mode=mode)
-            if strict: ok = False
-        missing_caps = ids_available - ids_caps
-        if missing_caps:
-            note_or_raise(self.extra, "DetectorSystemSettings.completeness",
-                          ValueError(f"Available detectors missing capabilities: {missing_caps}"), mode=mode)
-            if strict: ok = False
-        for ds in self.defaults_by_id.values(): ok = ds.validate(mode=mode) and ok
-        for cap in self.capabilities_by_id.values(): ok = cap.validate(mode=mode) and ok
-        return ok
+        # 2. Completeness (Strict only logic in original)
+        missing_defaults = ids_available - set(self.defaults_by_id.keys())
+        v.check(not missing_defaults, "completeness", f"Missing defaults for: {missing_defaults}")
+
+        missing_caps = ids_available - set(self.capabilities_by_id.keys())
+        v.check(not missing_caps, "completeness", f"Missing capabilities for: {missing_caps}")
+
+        # 3. Recursive Checks
+        v.check_nested_map(self.defaults_by_id)
+        v.check_nested_map(self.capabilities_by_id)
+        return v.valid
 
     def is_supported(self, settings: DetectorSettings) -> SafetyCheck:
         if not settings.detector_id:
@@ -2174,12 +2147,11 @@ class ImageOutputSettings:
         self.path = p.str(self.path, "path")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        if self.file_format not in {"tiff", "tif", "png", "jpg", "jpeg", "bmp"}:
-            note_or_raise(self.extra, "ImageOutputSettings.file_format", ValueError(f"Unsupported format: {self.file_format}"), mode=mode)
-            if strict: return False
-            self.file_format = "tiff"
-        return True
+        v = Validator(self, mode)
+        v.check(self.file_format in {"tiff", "tif", "png", "jpg", "jpeg", "bmp"},
+                "file_format", f"Unsupported format: {self.file_format}",
+                heal=lambda: setattr(self, 'file_format', "tiff"))
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {"file_format": self.file_format, "path": self.path}
@@ -2225,26 +2197,15 @@ class Aperture:
         self.position = p.model(Point, self.position, "position")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        if self.size_index is not None and self.size_index < 0:
-            note_or_raise(self.extra, "Aperture.size_index",
-                          ValueError(f"size_index must be >= 0, got {self.size_index}"), mode=mode, raw=self.size_index)
-            if strict:
-                ok = False
-            else:
-                self.size_index = None
+        v = Validator(self, mode)
+        v.check(self.size_index is None or self.size_index >= 0, "size_index", "must be >= 0",
+                raw=self.size_index, heal=lambda: setattr(self, 'size_index', None))
 
-        if self.position is not None:
-            if not self.position.validate(mode=mode):
-                note_or_raise(self.extra, "Aperture.position", ValueError("Invalid aperture position coordinates"),
-                              mode=mode)
-                if strict:
-                    ok = False
-                else:
-                    self.position = None
-
-        return ok
+        if self.position:
+            if not self.position.validate(mode=v.mode):
+                v.check(False, "position", "Invalid aperture position",
+                        heal=lambda: setattr(self, 'position', None))
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
@@ -2312,23 +2273,21 @@ class MicroscopeState:
         self.detectors = p.map_model(DetectorState, self.detectors, "detectors", "detector_id")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        ok = self.stage_position.validate(mode=mode) and ok
-        ok = self.beam.validate(mode=mode) and ok
-        for ds in self.detectors.values(): ok = ds.validate(mode=mode) and ok
-        for ap in self.apertures.values(): ok = ap.validate(mode=mode) and ok
+        v = Validator(self, mode)
+        v.check_nested(self.stage_position)
+        v.check_nested(self.beam)
+        v.check_nested_map(self.apertures)
+        v.check_nested_map(self.detectors)
 
         valid_ids = []
         for det_id in self.active_detector_ids:
-            if det_id not in self.detectors:
-                note_or_raise(self.extra, "MicroscopeState.active_detector_ids",
-                              ValueError(f"Active detector '{det_id}' not found in detectors list"), mode=mode)
-                if strict: ok = False
-            else:
-                valid_ids.append(det_id)
-        if not strict: self.active_detector_ids = valid_ids
-        return ok
+            if not v.check(det_id in self.detectors, "active_detector_ids",
+                           f"Active detector '{det_id}' not found"):
+                continue  # Skip adding to valid_ids if check failed
+            valid_ids.append(det_id)
+
+        if not v.strict: self.active_detector_ids = valid_ids
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
@@ -2408,22 +2367,12 @@ class MicroscopeImageMetadata:
         self.microscope_state = p.model(MicroscopeState, self.microscope_state, "microscope_state")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        if self.microscope_state:
-            ok = self.microscope_state.validate(mode=mode) and ok
-
-        def _check_pos(val, name, attr_name):
-            if val is not None and val < 0:
-                note_or_raise(self.extra, name, ValueError(f"{name} must be >= 0"), mode=mode, raw=val)
-                if strict: return False
-                setattr(self, attr_name, None)
-            return True
-
-        ok = _check_pos(self.magnification, "magnification", "magnification") and ok
-        ok = _check_pos(self.exposure_ms, "exposure_ms", "exposure_ms") and ok
-        ok = _check_pos(self.accelerating_voltage_kv, "accelerating_voltage_kv", "accelerating_voltage_kv") and ok
-        return ok
+        v = Validator(self, mode)
+        v.check_nested(self.microscope_state)
+        v.check_ge_zero(self.magnification, "magnification", reset_to=None)
+        v.check_ge_zero(self.exposure_ms, "exposure_ms", reset_to=None)
+        v.check_ge_zero(self.accelerating_voltage_kv, "accelerating_voltage_kv", reset_to=None)
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
@@ -2641,17 +2590,14 @@ class SystemInfo:
         self.application_version = p.str(self.application_version, "application_version", default="Unknown")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ip = self.ip_address.strip()
-        if ip and ip != "Unknown":
+        v = Validator(self, mode)
+        if self.ip_address and self.ip_address != "Unknown":
             try:
-                ipaddress.ip_address(ip)
+                ipaddress.ip_address(self.ip_address.strip())
             except Exception:
-                note_or_raise(self.extra, "SystemInfo.ip_address", ValueError(f"Invalid IP: {self.ip_address!r}"), mode=mode, raw=self.ip_address)
-                if strict:
-                    return False
-                self.ip_address = "Unknown"
-        return True
+                v.check(False, "ip_address", f"Invalid IP: {self.ip_address}",
+                        raw=self.ip_address, heal=lambda: setattr(self, 'ip_address', "Unknown"))
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
@@ -2730,11 +2676,12 @@ class SystemSettings:
         self.info = p.model(SystemInfo, self.info, "info", default=SystemInfo(_mode=p.mode))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        return (self.stage_system.validate(mode=mode) and
-                self.beam_system.validate(mode=mode) and
-                self.detector_system.validate(mode=mode) and
-                self.info.validate(mode=mode))
+        v = Validator(self, mode)
+        v.check_nested(self.stage_system)
+        v.check_nested(self.beam_system)
+        v.check_nested(self.detector_system)
+        v.check_nested(self.info)
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
@@ -2790,16 +2737,10 @@ class MicroscopeSettings:
         self.protocol = p.dict(self.protocol, "protocol", default={"name": "demo"})
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        return self.system.validate(mode=mode) and self.image.validate(mode=mode)
-
-    def to_dict(self) -> dict:
-        d = {
-            "system": self.system.to_dict(),
-            "image": self.image.to_dict(),
-            "protocol": self.protocol,
-        }
-        return _finish_to_dict(d, self.extra)
+        v = Validator(self, mode)
+        v.check_nested(self.system)
+        v.check_nested(self.image)
+        return v.valid
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeSettings":
@@ -2852,28 +2793,17 @@ class AcquisitionRequest:
             self.detector.detector_id = self.detector_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
+        v = Validator(self, mode)
+        v.check(bool(self.detector_id), "detector_id", "detector_id is required")
+        v.check_nested(self.detector)
+        v.check_nested(self.image)
 
-        # Rule 1: Must have an ID to execute
-        if not self.detector_id:
-            note_or_raise(self.extra, "AcquisitionRequest.detector_id", ValueError("detector_id is required"), mode=mode)
-            ok = False
-
-        # Rule 2: Sub-objects must be valid
-        ok = self.detector.validate(mode=mode) and ok
-        ok = self.image.validate(mode=mode) and ok
-
-        # Rule 3: Cross-field consistency (The Conflict Case)
+        # Cross-field consistency
         if self.detector.detector_id and self.detector_id and self.detector.detector_id != self.detector_id:
-            note_or_raise(self.extra, "AcquisitionRequest.id_mismatch", ValueError(
-                f"Ambiguous detector IDs: outer={self.detector_id}, inner={self.detector.detector_id}"), mode=mode)
-            if strict:
-                ok = False
-            else:
-                self.detector.detector_id = self.detector_id
-
-        return ok
+            v.check(False, "id_mismatch",
+                    f"Ambiguous IDs: outer={self.detector_id}, inner={self.detector.detector_id}",
+                    heal=lambda: setattr(self.detector, 'detector_id', self.detector_id))
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
@@ -2926,26 +2856,15 @@ class StageMoveRequest:
         self.target = p.model(StagePosition, self.target, "target", default=StagePosition(_mode=p.mode))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        if not self.target.validate(mode=mode): ok = False
+        v = Validator(self, mode)
+        v.check_nested(self.target)
+
+        # Check emptiness of target
         axes = [self.target.x, self.target.y, self.target.z, self.target.r, self.target.tilt_x, self.target.tilt_y]
-        if all(a is None for a in axes):
-            note_or_raise(self.extra, "StageMoveRequest.empty",
-                          ValueError("StageMoveRequest has no target coordinates"),
-                          mode=mode)
-            if strict: ok = False
+        v.check(any(a is not None for a in axes), "empty", "StageMoveRequest has no target coordinates")
 
-        # Check for negative time
-        if self.settle_time is not None and self.settle_time.magnitude < 0:
-            note_or_raise(self.extra, "StageMoveRequest.settle_time",
-                          ValueError("Settle time cannot be negative"), mode=mode)
-            if strict:
-                ok = False
-            else:
-                self.settle_time = None
-
-        return ok
+        v.check_ge_zero(self.settle_time, "settle_time", unit_aware=True, reset_to=None)
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
@@ -3007,40 +2926,26 @@ class ApertureControlRequest:
             self.state.aperture_id = self.aperture_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        mode, strict = _setup_validate(self._mode, mode)
-        ok = True
-        if not self.aperture_id:
-            note_or_raise(self.extra, "ApertureControlRequest.aperture_id", ValueError("aperture_id is required"),
-                          mode=mode)
-            ok = False
-        if not self.state.validate(mode=mode): ok = False
-        if self.state.aperture_id and self.aperture_id and self.state.aperture_id != self.aperture_id:
-            note_or_raise(self.extra, "ApertureControlRequest.id_mismatch", ValueError(
-                f"Ambiguous IDs: '{self.aperture_id}' vs '{self.state.aperture_id}'"), mode=mode)
-            if strict:
-                ok = False
-            else:
-                self.state.aperture_id = self.aperture_id
+        v = Validator(self, mode)
+        v.check(bool(self.aperture_id), "aperture_id", "aperture_id is required")
+        v.check_nested(self.state)
 
-        # Validation Logic specific to the Wrapper:
-        # You cannot do a "relative" update if you aren't moving the position.
-        if self.relative and self.state.position is None:
-            note_or_raise(self.extra, "ApertureControlRequest.relative_no_pos",
-                          ValueError("Relative mode requires a position vector"), mode=mode)
-            if strict: ok = False
+        # ID Mismatch
+        if self.state.aperture_id and self.aperture_id and self.state.aperture_id != self.aperture_id:
+            v.check(False, "id_mismatch",
+                    f"Ambiguous IDs: '{self.aperture_id}' vs '{self.state.aperture_id}'",
+                    heal=lambda: setattr(self.state, 'aperture_id', self.aperture_id))
+
+        # Relative logic check
+        if self.relative:
+            v.check(self.state.position is not None, "relative_no_pos", "Relative mode requires a position vector")
 
         # No-Op Check
         has_intent = (
-                self.state.inserted is not None or
-                self.state.size_index is not None or
-                self.state.position is not None
-        )
-        if not has_intent:
-            note_or_raise(self.extra, "ApertureControlRequest.empty_payload",
-                          ValueError("Request contains no changes"), mode=mode)
-            if strict: ok = False
+                self.state.inserted is not None or self.state.size_index is not None or self.state.position is not None)
+        v.check(has_intent, "empty_payload", "Request contains no changes")
 
-        return ok
+        return v.valid
 
     def to_dict(self) -> dict:
         d = {
