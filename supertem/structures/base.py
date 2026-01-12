@@ -666,7 +666,7 @@ class FieldParser:
         if exc:
             note_or_raise(self.extra, self._key(name), exc, mode=self.mode, raw=value)
         elif self.extra is not None:
-            _extra_put_raw(self.extra, name, value)
+            _extra_put_raw(self.extra, self._key(name), value)
 
     # --- Primitives ---
 
@@ -747,7 +747,7 @@ class FieldParser:
             self._record(name, val, TypeError(f"{name} must be str"))
             return default
         if isinstance(val, bool):
-            self._record(name, val)
+            self._record(name, val, TypeError(f"{name} cannot be bool"))
             return default
         try:
             s = str(val).strip()
@@ -940,8 +940,15 @@ class Validator:
         if heal:
             try:
                 heal()
+                # If heal succeeds, we consider the object "repaired" (validity preserved)
+                return False
             except Exception:
-                pass
+                # If healing crashes, the object is definitely broken
+                self.valid = False
+        else:
+            # If there is no way to heal the violation, the object remains invalid
+            self.valid = False
+
         return False
 
     # --- Common specialized checks ---
@@ -1125,14 +1132,12 @@ class Point:
     Role:     Structure
     Context:  Both (Data-plane / Control-plane)
     Category: A (Config)
-
-    Note:
-    - This class is lightweight and does not include the `Extras` container.
     """
     x: Optional[float] = None
     y: Optional[float] = None
     z: Optional[float] = None
     name: Optional[str] = None
+    extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
@@ -1190,11 +1195,11 @@ class ROI:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check(self.x >= 0, "xy", "ROI.x must be >= 0", raw=self.x, heal=lambda: setattr(self, 'x', 0))
-        v.check(self.y >= 0, "xy", "ROI.y must be >= 0", raw=self.y, heal=lambda: setattr(self, 'y', 0))
-        v.check(self.width > 0, "size", "ROI.width must be > 0", raw=self.width,
+        v.check(self.x >= 0, "x", "ROI.x must be >= 0", raw=self.x, heal=lambda: setattr(self, 'x', 0))
+        v.check(self.y >= 0, "y", "ROI.y must be >= 0", raw=self.y, heal=lambda: setattr(self, 'y', 0))
+        v.check(self.width > 0, "width", "ROI.width must be > 0", raw=self.width,
                 heal=lambda: setattr(self, 'width', 512))
-        v.check(self.height > 0, "size", "ROI.height must be > 0", raw=self.height,
+        v.check(self.height > 0, "height", "ROI.height must be > 0", raw=self.height,
                 heal=lambda: setattr(self, 'height', 512))
         return v.valid
 
@@ -1335,7 +1340,7 @@ class StageSystemSettings:
         settle_time (Optional[Quantity]): Time to wait for vibration damping. Units: seconds.
             None Behavior: Defaulted to 0.2 seconds.
         x_limits, y_limits, z_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
-            None Behavior: Preserved as None (implies 'Unlimited').
+            None Behavior: Invalid if axis is enabled (Limits are MANDATORY).
     """
     enabled: Optional[bool] = None
     can_x: Optional[bool] = None
@@ -1351,7 +1356,7 @@ class StageSystemSettings:
     tilt_x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     tilt_y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     max_step_distance: Optional["Quantity"] = None
-    max_step_angle: Optional["Quantity"] = None
+    max_step_deg: Optional["Quantity"] = None
     eucentric_z: Optional["Quantity"] = None
     settle_time: Optional["Quantity"] = None
     timeout: Optional["Quantity"] = None
@@ -1361,13 +1366,13 @@ class StageSystemSettings:
     _UNITS = {
         "x_limits": Units.NM, "y_limits": Units.NM, "z_limits": Units.NM,
         "r_limits": Units.DEG, "tilt_x_limits": Units.DEG, "tilt_y_limits": Units.DEG,
-        "max_step_distance": Units.NM, "max_step_angle": Units.DEG,
+        "max_step_distance": Units.NM, "max_step_deg": Units.DEG,
         "eucentric_z": Units.NM, "settle_time": Units.SEC, "timeout": Units.SEC
     }
 
     _KEYS = {
         "max_step_distance": "max_step_nm",
-        "max_step_angle": "max_step_deg"
+        "max_step_deg": "max_step_deg"
     }
 
     def __post_init__(self):
@@ -1392,7 +1397,7 @@ class StageSystemSettings:
         # Category A: Apply Defaults (Safety Settings)
         self.max_step_distance = p.qty(self.max_step_distance, "max_step_distance", Units.NM,
                                        default=Q_(50000.0, Units.NM))
-        self.max_step_angle = p.qty(self.max_step_angle, "max_step_angle", Units.DEG, default=Q_(1.0, Units.DEG))
+        self.max_step_deg = p.qty(self.max_step_deg, "max_step_deg", Units.DEG, default=Q_(1.0, Units.DEG))
         self.eucentric_z = p.qty(self.eucentric_z, "eucentric_z", Units.NM)
         self.settle_time = p.qty(self.settle_time, "settle_time", Units.SEC, default=Q_(0.2, Units.SEC))
         self.timeout = p.qty(self.timeout, "timeout", Units.SEC, default=Q_(10.0, Units.SEC))
@@ -1480,8 +1485,8 @@ class StageSystemSettings:
 
         # 3. Check Dynamic Limits (Step Size)
         if step_vector is not None:
-            dx = step_vector.x or Q_(0, Units.NM)
-            dy = step_vector.y or Q_(0, Units.NM)
+            dx = step_vector.x if step_vector.x is not None else Q_(0, Units.NM)
+            dy = step_vector.y if step_vector.y is not None else Q_(0, Units.NM)
             distance = (dx.to(Units.NM).magnitude ** 2 + dy.to(Units.NM).magnitude ** 2) ** 0.5
             max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
 
@@ -1490,8 +1495,8 @@ class StageSystemSettings:
 
             if step_vector.tilt_x is not None:
                 d_tilt = abs(step_vector.tilt_x)
-                if d_tilt > self.max_step_angle:
-                    reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_angle}")
+                if d_tilt > self.max_step_deg:
+                    reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_deg}")
 
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
@@ -1503,7 +1508,7 @@ class StageSystemSettings:
         return _auto_from_dict(StageSystemSettings, d, mode, alias_map={
             "x_limits": "x_limits_nm", "y_limits": "y_limits_nm", "z_limits": "z_limits_nm",
             "r_limits": "r_limits_deg", "tilt_x_limits": "tilt_x_limits_deg", "tilt_y_limits": "tilt_y_limits_deg",
-            "max_step_distance": "max_step_nm", "max_step_angle": "max_step_deg",
+            "max_step_distance": "max_step_nm", "max_step_deg": "max_step_angle",
             "eucentric_z": "eucentric_z_nm", "settle_time": "settle_time_s", "timeout": "timeout_s"
         })
 
