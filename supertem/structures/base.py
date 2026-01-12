@@ -293,6 +293,61 @@ VII. Implementation Conventions & Usage
        is correctly parsed into a Quantity object.
 
 ===============================================================================
+VIII. The Request Pattern (Control Plane Intents)
+===============================================================================
+
+While `Settings` objects define "Configuration" (static parameters) and `State`
+objects define "Snapshot" (telemetry), `Request` objects define "Intent."
+
+They are the vehicles for the Control Plane. A Request encapsulates a user's
+command to change the microscope's state.
+
+1. Anatomy of a Request
+-------------------------------------------------------------------------------
+   A Request typically consists of three components:
+   A. Target Identity (Mandatory)
+      - "Which hardware device?" (e.g., `detector_id`, `aperture_id`).
+      - Unlike Settings objects (which can be generic/reusable presets), Requests
+        MUST bind to a specific physical device before execution.
+
+   B. The Payload (The "What")
+      - Usually reuses a Domain Object (e.g., `StagePosition`, `DetectorSettings`).
+      - Fields are `Optional`. A value of `None` means "Do not change."
+      - This allows for precise partial updates (e.g., "Change only Exposure").
+
+   C. Modifiers (The "How")
+      - Execution flags that don't fit in the domain object.
+      - Examples: `relative=True`, `wait_for_settle=True`, `force=False`.
+
+2. The Usage Contract
+-------------------------------------------------------------------------------
+   A. Construct Strict by Default
+      Requests are code-driven commands. They default to `ParseMode.STRICT` because
+      ambiguity in a command is dangerous.
+
+   B. Validate Before Sending
+      A Request is invalid until `validate()` returns True.
+      - It must have a Target ID.
+      - It must have a non-empty Payload (no-op requests are rejected).
+      - It must satisfy cross-field logic (e.g. relative moves need coordinates).
+
+   C. Ephemeral Lifecycle
+      Requests are transient. They are created, validated, executed by the
+      Manager/Driver, and then discarded. They are rarely stored long-term.
+
+3. How to Write a New Request
+-------------------------------------------------------------------------------
+   1. Define the class with `_mode: ParseMode = ParseMode.STRICT`.
+   2. Include the ID field (e.g. `beam_id`) and validate its presence.
+   3. Include a `payload` or specific fields (use Category D: default=None).
+   4. Implement `validate()` to ensure the intent is executable.
+
+   Example:
+     req = StageMoveRequest(target=StagePosition(x=Q_(10, 'um')), relative=True)
+     if req.validate():
+         microscope.stage.move(req)
+
+===============================================================================
 Rationale
 ===============================================================================
 
@@ -877,7 +932,10 @@ class FieldParser:
     def map_model(self, cls: Type[T], val: Any, name: str, id_field: Optional[str] = None) -> Dict[str, T]:
         """Parses {key: Object} map."""
         out: Dict[str, T] = {}
-        if not val or not isinstance(val, dict): return out
+        if val is None: return out
+        if not isinstance(val, dict):
+            self._record(name, val, TypeError(f"{name} must be dict, got {type(val).__name__}"))
+            return out
         for k, v in val.items():
             key_norm = self.id(k, f"{name}.key")
             if key_norm is None: continue
@@ -1516,6 +1574,14 @@ class StageSystemSettings:
                 if distance > max_dist_nm:
                     reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
 
+            # Z Step Limit
+            if step_vector.z is not None:
+                d_z = abs(step_vector.z.to(Units.NM).magnitude)
+                max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
+
+                if d_z > max_dist_nm:
+                    reasons.append(f"Z step {d_z:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
+
             # Tilt Step Limits
             if step_vector.tilt_x is not None:
                 d_tilt = abs(step_vector.tilt_x)
@@ -1732,7 +1798,8 @@ class DetectorSettings:
 
     Attributes:
         detector_id (Optional[str]): The identifier of the camera to use.
-            None Behavior: Required for routing; error in Strict mode.
+            None Behavior: Allowed for generic presets. Must be resolved/populated
+                           before execution (e.g. by AcquisitionRequest).
         exposure (Optional[Quantity]): Integration time. Units: ms.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
         roi (Optional[ROI]): Pixel-coordinate window on the sensor.
@@ -2089,9 +2156,7 @@ class DetectorSystemSettings:
 
         caps = self.capabilities_by_id.get(settings.detector_id)
         if not caps:
-            # If we don't know the capabilities, do we fail safe or fail open?
-            # Usually fail open (True) if lenient, but here explicit is better.
-            return SafetyCheck.success()
+            return SafetyCheck.failure(f"Unknown capabilities for detector '{settings.detector_id}'")
 
         return caps.supports(settings)
 
