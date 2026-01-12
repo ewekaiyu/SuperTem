@@ -1,5 +1,5 @@
 """
-supertem.structure.base
+supertem.structures.base
 
 Dataclass-based structures for TEM automation, covering:
   - settings (beam / detector / stage / acquisition outputs)
