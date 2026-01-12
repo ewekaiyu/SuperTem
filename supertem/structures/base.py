@@ -227,9 +227,12 @@ All to_dict() methods must return JSON-serializable output:
   - enums -> str
   - tuples -> lists
   - quantities/units -> plain numbers.
-    *CONVENTION*: To maintain clarity after stripping units, keys for Quantities
-    MUST include unit suffixes (e.g., `_nm`, `_ms`, `_kv`, `_deg`).
-  - any non-JSON-native objects must be converted via jsonable helpers
+
+  *AUTOMATION*: Unit stripping and key renaming are handled by `_auto_to_dict`.
+  - Standard Rule: Fields with units are stripped to floats, and the key is
+    suffixed with the unit (e.g., field `x` + unit `nm` -> key `x_nm`).
+  - Override Rule: Specific keys can be manually renamed via `_KEYS` if the
+    standard suffix pattern is insufficient.
 
 If a value cannot be expressed safely as JSON, preserve a safe representation in
 Extras.raw and record a diagnostic note.
@@ -257,10 +260,12 @@ VII. Implementation Conventions & Usage
       - Return `v.valid`.
 
    C. to_dict() (Serialization)
-      - Logic: Build a local dict of canonical fields.
-      - Boilerplate: Must return via `_finish_to_dict` to inject extras and
-        ensure JSON safety.
-        `return _finish_to_dict(d, self.extra)`
+      - Mechanism: Use `_auto_to_dict(self, unit_map=..., key_map=...)`.
+      - Configuration: Define `_UNITS` dict mapping fields to target units.
+        (e.g. `{"x": Units.NM}` results in key `x_nm` and float value).
+      - Overrides: Define `_KEYS` dict only if renaming fields beyond standard
+        suffixes (e.g. `{"settle_time": "settle_time_s"}`).
+      - Behavior: Automatically handles recursion, list serialization, and extras injection.
 
    D. from_dict(data, mode=...) (Ingestion)
       - Boilerplate: Must use `_setup_from_dict` to validate input type and
@@ -298,6 +303,7 @@ import datetime
 import json
 import os
 import ipaddress
+import dataclasses
 from dataclasses import dataclass, field, replace, is_dataclass
 from pathlib import Path
 from copy import deepcopy
@@ -358,16 +364,16 @@ class ParseMode(str, Enum):
 
 
 class Units:
-    """Centralized definition of physical units to prevent magic-string typos."""
+    """Centralized definition of physical units."""
     NM = "nm"
     UM = "um"
     MM = "mm"
     KV = "kV"
     NA = "nA"
     MRAD = "mrad"
-    DEG = "degree"
-    MS = "ms"
-    SEC = "seconds"
+    DEG = "deg"      # Pint alias for 'degree'
+    MS = "ms"        # Pint alias for 'millisecond'
+    SEC = "s"
 
 
 def as_parse_mode(mode: Union["ParseMode", str, None]) -> "ParseMode":
@@ -626,6 +632,67 @@ def _setup_from_dict(cls: Type, data: Any, mode: Union[ParseMode, str, None], kn
 def _setup_validate(obj_mode: Any, override_mode: Any) -> Tuple[ParseMode, bool]:
     mode = as_parse_mode(obj_mode if override_mode is None else override_mode)
     return mode, is_strict(mode)
+
+
+def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, str] = None) -> Dict[str, Any]:
+    """
+    Automatically converts a dataclass to a dict using introspection and mapping rules.
+
+    Args:
+        obj: The dataclass instance.
+        unit_map: Dict mapping field names to target units (e.g. {"x": "nm"}).
+                  Resulting key will be "{field}_{unit}" (e.g. "x_nm").
+        key_map:  Dict for explicit renaming (e.g. {"exposure_min": "exposure_ms_min"}).
+                  Overrides default unit suffix naming if present.
+    """
+    if unit_map is None: unit_map = {}
+    if key_map is None: key_map = {}
+
+    out = {}
+
+    # Iterate over all fields defined in the dataclass
+    for field in dataclasses.fields(obj):
+        name = field.name
+        val = getattr(obj, name)
+
+        # Skip internals and None values
+        if name.startswith("_") or name == "extra" or val is None:
+            continue
+
+        # Determine Output Key
+        key = name
+        target_unit = unit_map.get(name)
+
+        if name in key_map:
+            key = key_map[name]
+        elif target_unit:
+            # Default convention: append unit suffix
+            key = f"{name}_{target_unit}"
+
+        # Serialize Value
+        if target_unit:
+            # Handle List of Quantities vs Scalar Quantity
+            if isinstance(val, (list, tuple)):
+                out[key] = [serialize_quantity(v, target_unit) for v in val]
+            else:
+                out[key] = serialize_quantity(val, target_unit)
+
+        elif hasattr(val, "to_dict"):
+            out[key] = val.to_dict()
+
+        elif isinstance(val, (list, tuple)):
+            # Recurse on list items
+            out[key] = [v.to_dict() if hasattr(v, "to_dict") else _jsonable(v) for v in val]
+
+        elif isinstance(val, dict):
+            # Recurse on dict values
+            out[key] = {k: (v.to_dict() if hasattr(v, "to_dict") else _jsonable(v)) for k, v in val.items()}
+
+        else:
+            out[key] = _jsonable(val)
+
+    # Inject Extras
+    return _finish_to_dict(out, getattr(obj, "extra", None))
 
 # =============================================================================
 # The FieldParser
@@ -1022,7 +1089,7 @@ class Point:
         return v.valid
 
     def to_dict(self) -> dict:
-        return _jsonable(drop_none_keys({"x": self.x, "y": self.y, "z": self.z, "name": self.name}))
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Point":
@@ -1076,8 +1143,7 @@ class ROI:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {"x": self.x, "y": self.y, "width": self.width, "height": self.height}
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ROI":
@@ -1123,6 +1189,11 @@ class StagePosition:
     coordinate_system: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
+
+    _UNITS = {
+        "x": Units.NM, "y": Units.NM, "z": Units.NM,
+        "r": Units.DEG, "tilt_x": Units.DEG, "tilt_y": Units.DEG
+    }
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "StagePosition")
@@ -1190,15 +1261,7 @@ class StagePosition:
                 chk(self.tilt_y, other.tilt_y, Units.DEG, tol_deg))
 
     def to_dict(self) -> dict:
-        d = {
-            "name": self.name,
-            "x_nm": serialize_quantity(self.x, Units.NM), "y_nm": serialize_quantity(self.y, Units.NM),
-            "z_nm": serialize_quantity(self.z, Units.NM), "r_deg": serialize_quantity(self.r, Units.DEG),
-            "tilt_x_deg": serialize_quantity(self.tilt_x, Units.DEG),
-            "tilt_y_deg": serialize_quantity(self.tilt_y, Units.DEG),
-            "coordinate_system": self.coordinate_system,
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self, unit_map=self._UNITS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> 'StagePosition':
@@ -1259,6 +1322,18 @@ class StageSystemSettings:
     timeout: Optional["Quantity"] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "x_limits": Units.NM, "y_limits": Units.NM, "z_limits": Units.NM,
+        "r_limits": Units.DEG, "tilt_x_limits": Units.DEG, "tilt_y_limits": Units.DEG,
+        "max_step_distance": Units.NM, "max_step_angle": Units.DEG,
+        "eucentric_z": Units.NM, "settle_time": Units.SEC, "timeout": Units.SEC
+    }
+
+    _KEYS = {
+        "max_step_distance": "max_step_nm",
+        "max_step_angle": "max_step_deg"
+    }
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "StageSystemSettings")
@@ -1386,22 +1461,7 @@ class StageSystemSettings:
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
     def to_dict(self) -> dict:
-        def _sl(v, u): return [serialize_quantity(x, u) for x in v] if v else None
-        d = {
-            "enabled": self.enabled,
-            "can_x": self.can_x, "can_y": self.can_y, "can_z": self.can_z,
-            "can_r": self.can_r, "can_tilt_x": self.can_tilt_x, "can_tilt_y": self.can_tilt_y,
-            "x_limits_nm": _sl(self.x_limits, Units.NM), "y_limits_nm": _sl(self.y_limits, Units.NM),
-            "z_limits_nm": _sl(self.z_limits, Units.NM), "r_limits_deg": _sl(self.r_limits, Units.DEG),
-            "tilt_x_limits_deg": _sl(self.tilt_x_limits, Units.DEG),
-            "tilt_y_limits_deg": _sl(self.tilt_y_limits, Units.DEG),
-            "max_step_nm": serialize_quantity(self.max_step_distance, Units.NM),
-            "max_step_deg": serialize_quantity(self.max_step_angle, Units.DEG),
-            "eucentric_z_nm": serialize_quantity(self.eucentric_z, Units.NM),
-            "settle_time_s": serialize_quantity(self.settle_time, Units.SEC),
-            "timeout_s": serialize_quantity(self.timeout, Units.SEC)
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self, unit_map=self._UNITS, key_map=self._KEYS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageSystemSettings":
@@ -1463,6 +1523,12 @@ class BeamSettings:
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
+    _UNITS = {
+        "voltage": Units.KV, "beam_current": Units.NA,
+        "convergence_angle": Units.MRAD, "defocus": Units.NM,
+        "scan_rotation": Units.DEG
+    }
+
     def __post_init__(self):
         p = FieldParser(self, self._mode, "BeamSettings")
         self.spot_size = p.int(self.spot_size, "spot_size")
@@ -1489,18 +1555,7 @@ class BeamSettings:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "voltage_kv": serialize_quantity(self.voltage, Units.KV),
-            "beam_current_na": serialize_quantity(self.beam_current, Units.NA),
-            "convergence_angle_mrad": serialize_quantity(self.convergence_angle, Units.MRAD),
-            "defocus_nm": serialize_quantity(self.defocus, Units.NM),
-            "scan_rotation_deg": serialize_quantity(self.scan_rotation, Units.DEG),
-            "spot_size": self.spot_size,
-            "stigmation": self.stigmation.to_dict() if self.stigmation else None,
-            "beam_shift": self.beam_shift.to_dict() if self.beam_shift else None,
-            "image_shift": self.image_shift.to_dict() if self.image_shift else None,
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self, unit_map=self._UNITS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSettings":
@@ -1553,6 +1608,11 @@ class BeamSystemSettings:
     convergence_angle_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "voltage_limits": Units.KV, "beam_current_limits": Units.NA,
+        "convergence_angle_limits": Units.MRAD
+    }
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "BeamSystemSettings")
@@ -1620,16 +1680,7 @@ class BeamSystemSettings:
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
     def to_dict(self) -> dict:
-        def _sl(v, u): return [serialize_quantity(x, u) for x in v] if v else None
-        d = {
-            "enabled": self.enabled,
-            "default_beam": self.default_beam.to_dict(),
-            "voltage_limits_kv": _sl(self.voltage_limits, Units.KV),
-            "beam_current_limits_na": _sl(self.beam_current_limits, Units.NA),
-            "spot_size_limits": self.spot_size_limits,
-            "convergence_angle_limits_mrad": _sl(self.convergence_angle_limits, Units.MRAD),
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self, unit_map=self._UNITS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSystemSettings":
@@ -1680,6 +1731,8 @@ class DetectorSettings:
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
+    _UNITS = {"exposure": Units.MS}
+
     def __post_init__(self):
         p = FieldParser(self, self._mode, "DetectorSettings")
         self.detector_id = p.id(self.detector_id, "detector_id")
@@ -1713,18 +1766,7 @@ class DetectorSettings:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "detector_id": self.detector_id,
-            "exposure_ms": serialize_quantity(self.exposure, Units.MS),
-            "binning_index": self.binning_index,
-            "binning_xy": self.binning_xy,
-            "frame_integration": self.frame_integration,
-            "gain_index": self.gain_index,
-            "offset_index": self.offset_index,
-            "digital_rotation_deg": self.digital_rotation_deg,
-            "roi": self.roi.to_dict() if self.roi else None
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self, unit_map=self._UNITS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSettings":
@@ -1788,6 +1830,18 @@ class DetectorCapabilities:
     digital_rotation_max: Optional["Quantity"] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
+
+    # Capabilities have unconventional naming (infix units like exposure_ms_min)
+    # We map them explicitly to preserve your API contract.
+    _UNITS = {
+        "exposure_min": Units.MS, "exposure_max": Units.MS,
+        "digital_rotation_min": Units.DEG, "digital_rotation_max": Units.DEG
+    }
+    _KEYS = {
+        "exposure_min": "exposure_ms_min", "exposure_max": "exposure_ms_max",
+        "digital_rotation_min": "digital_rotation_deg_min",
+        "digital_rotation_max": "digital_rotation_deg_max",
+    }
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "DetectorCapabilities")
@@ -1964,28 +2018,7 @@ class DetectorCapabilities:
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
     def to_dict(self) -> dict:
-        d = {
-            "can_binning": self.can_binning,
-            "binning_index_min": self.binning_index_min,
-            "binning_index_max": self.binning_index_max,
-            "binning_xy_min": list(self.binning_xy_min) if self.binning_xy_min else None,
-            "binning_xy_max": list(self.binning_xy_max) if self.binning_xy_max else None,
-            "exposure_ms_min": serialize_quantity(self.exposure_min, Units.MS),
-            "exposure_ms_max": serialize_quantity(self.exposure_max, Units.MS),
-            "frame_integration_min": self.frame_integration_min, "frame_integration_max": self.frame_integration_max,
-            "roi_size_min": list(self.roi_size_min) if self.roi_size_min else None,
-            "roi_size_max": list(self.roi_size_max) if self.roi_size_max else None,
-            "can_gain": self.can_gain,
-            "gain_index_min": self.gain_index_min,
-            "gain_index_max": self.gain_index_max,
-            "can_offset": self.can_offset,
-            "offset_index_min": self.offset_index_min,
-            "offset_index_max": self.offset_index_max,
-            "can_digital_rotation": self.can_digital_rotation,
-            "digital_rotation_deg_min": serialize_quantity(self.digital_rotation_min, Units.DEG),
-            "digital_rotation_deg_max": serialize_quantity(self.digital_rotation_max, Units.DEG),
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self, unit_map=self._UNITS, key_map=self._KEYS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "DetectorCapabilities":
@@ -2093,14 +2126,7 @@ class DetectorSystemSettings:
         return caps.supports(settings)
 
     def to_dict(self) -> dict:
-        d = {
-            "enabled": self.enabled,
-            "default_detector_id": self.default_detector_id,
-            "available_detector_ids": self.available_detector_ids,
-            "defaults_by_id": {k: v.to_dict() for k, v in self.defaults_by_id.items()},
-            "capabilities_by_id": {k: v.to_dict() for k, v in self.capabilities_by_id.items()},
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSystemSettings":
@@ -2154,8 +2180,7 @@ class ImageOutputSettings:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {"file_format": self.file_format, "path": self.path}
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ImageOutputSettings":
@@ -2208,13 +2233,7 @@ class Aperture:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "aperture_id": self.aperture_id,
-            "inserted": self.inserted,
-            "size_index": self.size_index,
-            "position": self.position.to_dict() if self.position else None
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Aperture":
@@ -2290,17 +2309,7 @@ class MicroscopeState:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "timestamp": self.timestamp,
-            "mode": self.mode,
-            "stage_position": self.stage_position.to_dict(),
-            "beam": self.beam.to_dict(),
-            "apertures": {k: v.to_dict() for k, v in self.apertures.items()},
-            "detectors": {k: v.to_dict() for k, v in self.detectors.items()},
-            "active_detector_ids": self.active_detector_ids,
-            "primary_detector_id": self.primary_detector_id
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeState":
@@ -2375,19 +2384,9 @@ class MicroscopeImageMetadata:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "version": self.version,
-            "created_at": self.created_at,
-            "magnification": self.magnification,
-            "camera_length_mm": self.camera_length_mm,
-            "pixel_size_nm": self.pixel_size_nm,
-            "image_size_px": self.image_size_px,
-            "accelerating_voltage_kv": self.accelerating_voltage_kv,
-            "beam_current_na": self.beam_current_na,
-            "exposure_ms": self.exposure_ms,
-            "microscope_state": self.microscope_state.to_dict() if self.microscope_state else None
-        }
-        return _finish_to_dict(d, self.extra)
+        # Since fields like 'exposure_ms' are already floats (parsed via p.float)
+        # and named correctly, we can just use default export.
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeImageMetadata":
@@ -2600,19 +2599,7 @@ class SystemInfo:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "name": self.name,
-            "ip_address": self.ip_address,
-            "manufacturer": self.manufacturer,
-            "model": self.model,
-            "serial_number": self.serial_number,
-            "hardware_version": self.hardware_version,
-            "software_version": self.software_version,
-            "supertem_version": self.supertem_version,
-            "application": self.application,
-            "application_version": self.application_version,
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemInfo":
@@ -2684,13 +2671,7 @@ class SystemSettings:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "stage_system": self.stage_system.to_dict(),
-            "beam_system": self.beam_system.to_dict(),
-            "detector_system": self.detector_system.to_dict(),
-            "info": self.info.to_dict(),
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemSettings":
@@ -2741,6 +2722,9 @@ class MicroscopeSettings:
         v.check_nested(self.system)
         v.check_nested(self.image)
         return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeSettings":
@@ -2806,12 +2790,7 @@ class AcquisitionRequest:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "detector_id": self.detector_id,
-            "detector": self.detector.to_dict(),
-            "image": self.image.to_dict(),
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
@@ -2847,6 +2826,8 @@ class StageMoveRequest:
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
+    _UNITS = {"settle_time": Units.SEC}
+
     def __post_init__(self):
         p = FieldParser(self, self._mode, "StageMoveRequest")
         self.relative = p.bool(self.relative, "relative", default=False)
@@ -2867,14 +2848,7 @@ class StageMoveRequest:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "target": self.target.to_dict(),
-            "relative": self.relative,
-            "backlash_correction": self.backlash_correction,
-            "wait_for_settle": self.wait_for_settle,
-            "settle_time_s": serialize_quantity(self.settle_time, Units.SEC),
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self, unit_map=self._UNITS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageMoveRequest":
@@ -2948,12 +2922,7 @@ class ApertureControlRequest:
         return v.valid
 
     def to_dict(self) -> dict:
-        d = {
-            "aperture_id": self.aperture_id,
-            "relative": self.relative,
-            "state": self.state.to_dict(),
-        }
-        return _finish_to_dict(d, self.extra)
+        return _auto_to_dict(self)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureControlRequest":
