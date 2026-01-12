@@ -514,28 +514,48 @@ def _extra_put_raw(extra: Any, key: str, value: Any) -> None:
         extra[f"{key}_raw"] = _jsonable(value)
 
 def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
-    """Coerce arbitrary input into a Pint Quantity with the target unit."""
+    """
+    Coerce arbitrary input into a Pint Quantity with the target unit.
+
+    Returns:
+        Quantity: If conversion is successful.
+        None: If the input value is None.
+
+    Raises:
+        TypeError: If input is boolean or incompatible type.
+        ValueError: If string parsing fails.
+        pint.errors.UndefinedUnitError: If units are unknown (e.g. 'lightyears').
+        pint.errors.DimensionalityError: If units are incompatible (e.g. '10 ms' for 'nm').
+    """
     if value is None: return None
-    if isinstance(value, (bool, np.bool_)): return None
+    # Explicitly reject booleans (True == 1.0, but semantically invalid for physical quantities)
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"Cannot coerce boolean {value} to Quantity")
+
     if isinstance(value, (int, float, np.number)): return Q_(float(value), unit)
 
-    try:
-        if isinstance(value, Quantity):
-            return Q_(value.magnitude, str(value.units)).to(unit)
-        if isinstance(value, dict):
-            mag = value.get("magnitude", value.get("value"))
-            u = value.get("unit", value.get("units"))
-            if mag is None: return None
-            return Q_(mag, u or unit).to(unit)
-        if isinstance(value, str):
-            s = value.strip()
-            if not s: return None
-            try: return Q_(float(s), unit).to(unit)
-            except Exception: pass
+    # Remove the outer try/except block to let specific errors bubble up
+    if isinstance(value, Quantity):
+        return Q_(value.magnitude, str(value.units)).to(unit)
+
+    if isinstance(value, dict):
+        mag = value.get("magnitude", value.get("value"))
+        u = value.get("unit", value.get("units"))
+        if mag is None: return None  # Or raise ValueError("Dict missing magnitude")
+        return Q_(mag, u or unit).to(unit)
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s: return None
+        # This might raise pint.UndefinedUnitError or ValueError
+        try:
+            return Q_(float(s), unit).to(unit)
+        except ValueError:
+            # If standard float conversion fails, try parsing as a Quantity string (e.g., "10 nm")
             return Q_(s).to(unit)
-        return Q_(float(value), unit).to(unit)
-    except Exception:
-        return None
+
+    # Fallback for unexpected types
+    return Q_(float(value), unit).to(unit)
 
 def serialize_quantity(q: Optional["Quantity"], target_unit: str) -> Optional[float]:
     """Convert a Quantity to a plain float magnitude in the target unit.
@@ -696,8 +716,13 @@ class FieldParser:
             return default
 
         if unit:
-            q = ensure_quantity(val, unit)
-            if q is not None: return float(q.magnitude)
+            try:
+                q = ensure_quantity(val, unit)
+                if q is not None: return float(q.magnitude)
+            except Exception:
+                # If quantity parsing fails (e.g. "10 lightyears"), ignore and fall through
+                # to standard float parsing below, which will catch the error and record it.
+                pass
 
         try:
             if isinstance(val, Quantity) and not unit:
@@ -744,11 +769,24 @@ class FieldParser:
     # --- Quantities ---
 
     def qty(self, val: Any, name: str, unit: str, default: Optional[Quantity] = None) -> Optional[Quantity]:
-        """Parses Pint Quantity."""
-        q = ensure_quantity(val, unit)
-        if q is not None: return q
+        """
+        Parses Pint Quantity.
+
+        Captures underlying Pint/ValueError exceptions and records them in
+        Extras.notes before returning the default value.
+        """
+        try:
+            q = ensure_quantity(val, unit)
+            if q is not None: return q
+        except Exception as e:
+            # Capture the specific error (e.g. UndefinedUnitError, DimensionalityError)
+            self._record(name, val, exc=e)
+            return default
+
+        # Handle the case where val was not None but ensure_quantity returned None (e.g., empty string)
         if val is not None:
             self._record(name, val, ValueError(f"'{name}' must be {unit}, got {val!r}"))
+
         return default
 
     def pair_qty(self, val: Any, name: str, unit: str) -> Optional[Tuple[Quantity, Quantity]]:
