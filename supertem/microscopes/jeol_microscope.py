@@ -84,17 +84,7 @@ class JeolMicroscope(TemMicroscope):
         self._image_settings = settings.image
         self.logger = logger_ or logging.getLogger(__name__)
 
-        # TEM3 controllers
-        self.apt = TEM3.Apt3()
-        self.deflector = TEM3.Def3()
-        self.detector = TEM3.Detector3()
-        self.eos = TEM3.EOS3()
-        self.feg = TEM3.FEG3()
-        self.gun = TEM3.GUN3()
-        self.ht = TEM3.HT3()
-        self.lens = TEM3.Lens3()
-        self.stage = TEM3.Stage3()
-        self.vac = TEM3.VACUUM3()
+
 
         # Cached "software state" for features TEM3 doesn't report back reliably
         self._selected_aperture: Optional[str] = None
@@ -113,6 +103,17 @@ class JeolMicroscope(TemMicroscope):
         try:
             TEM3.connect()
             self._log_event("Connected via TEM3.connect()")
+            # TEM3 controllers
+            self.apt = TEM3.Apt3()
+            self.deflector = TEM3.Def3()
+            self.detector = TEM3.Detector3()
+            self.eos = TEM3.EOS3()
+            self.feg = TEM3.FEG3()
+            self.gun = TEM3.GUN3()
+            self.ht = TEM3.HT3()
+            self.lens = TEM3.Lens3()
+            self.stage = TEM3.Stage3()
+            self.vac = TEM3.VACUUM3()
         except Exception:
             self._log_event("Unable to connect via TEM3.connect()")
 
