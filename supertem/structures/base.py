@@ -760,6 +760,8 @@ class FieldParser:
         """Parses identifier. Logs specific error for empty strings."""
         if val is None: return None
         if isinstance(val, str) and not val.strip():
+            if self.strict:
+                raise ValueError(f"Field '{name}' cannot be an empty string")
             self._record(name, val)
             if hasattr(self.extra, "notes"):
                 self.extra.notes.setdefault(f"{self._key(name)}.empty", []).append({
@@ -941,7 +943,7 @@ class Validator:
             try:
                 heal()
                 # If heal succeeds, we consider the object "repaired" (validity preserved)
-                return False
+                return True
             except Exception:
                 # If healing crashes, the object is definitely broken
                 self.valid = False
@@ -957,16 +959,18 @@ class Validator:
         """Validates a child object if it exists."""
         if child and hasattr(child, 'validate'):
             if not child.validate(mode=self.mode):
-                if self.strict: self.valid = False
+                self.valid = False
                 return False
         return True
 
     def check_nested_map(self, children: Dict[str, Any]) -> bool:
         """Validates a dictionary of child objects."""
         if not children: return True
+        all_valid = True
         for child in children.values():
-            self.check_nested(child)
-        return self.valid
+            if not self.check_nested(child):
+                all_valid = False
+        return all_valid
 
     def check_gt_zero(self, val: Any, name: str, unit_aware: bool = False,
                       reset_to: Any = None) -> bool:
@@ -1011,6 +1015,8 @@ def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, 
     if unit_map is None: unit_map = {}
     if key_map is None: key_map = {}
 
+    is_strict_mode = hasattr(obj, "_mode") and is_strict(obj._mode)
+
     out = {}
 
     # Iterate over all fields defined in the dataclass
@@ -1018,43 +1024,45 @@ def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, 
         name = field.name
         val = getattr(obj, name)
 
-        # Skip internals and None values
         if name.startswith("_") or name == "extra" or val is None:
             continue
 
-        # Determine Output Key
-        key = name
+        key = key_map.get(name, name)
         target_unit = unit_map.get(name)
 
-        if name in key_map:
-            key = key_map[name]
-        elif target_unit:
-            # Default convention: append unit suffix
-            key = f"{name}_{target_unit}"
-
-        # Serialize Value
+        # 1. Happy Path: Field is in _UNITS
         if target_unit:
-            # Handle List of Quantities vs Scalar Quantity
+            key = f"{key}_{target_unit}" if name not in key_map else key
             if isinstance(val, (list, tuple)):
                 out[key] = [serialize_quantity(v, target_unit) for v in val]
             else:
                 out[key] = serialize_quantity(val, target_unit)
 
+        # 2. The Guard: Field is a Quantity BUT MISSING from _UNITS
+        elif isinstance(val, Quantity):
+            msg = f"Serialization Error: Field '{obj.__class__.__name__}.{name}' is a Quantity but is missing from _UNITS."
+
+            if is_strict_mode:
+                # Ruthless: Crash the control plane
+                raise ValueError(msg)
+            else:
+                # Lenient: Record the shame, save as object, and continue
+                if hasattr(obj, "extra") and isinstance(obj.extra, Extras):
+                    obj.extra.notes.setdefault("serialization_warnings", []).append(msg)
+
+                # Fallback to {magnitude: x, unit: y}
+                out[key] = _jsonable(val)
+
+        # 3. Standard Recursion
         elif hasattr(val, "to_dict"):
             out[key] = val.to_dict()
-
         elif isinstance(val, (list, tuple)):
-            # Recurse on list items
             out[key] = [v.to_dict() if hasattr(v, "to_dict") else _jsonable(v) for v in val]
-
         elif isinstance(val, dict):
-            # Recurse on dict values
             out[key] = {k: (v.to_dict() if hasattr(v, "to_dict") else _jsonable(v)) for k, v in val.items()}
-
         else:
             out[key] = _jsonable(val)
 
-    # Inject Extras
     return _finish_to_dict(out, getattr(obj, "extra", None))
 
 def _auto_from_dict(
@@ -1386,7 +1394,7 @@ class StageSystemSettings:
         self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=False)
         self.can_tilt_y = p.bool(self.can_tilt_y, "can_tilt_y", default=False)
 
-        # Category C: Limits (Nullable - If None, it implies 'Unlimited')
+        # Category C: Limits (If None, axis will be disabled during validation)
         self.x_limits = p.pair_qty(self.x_limits, "x_limits", Units.NM)
         self.y_limits = p.pair_qty(self.y_limits, "y_limits", Units.NM)
         self.z_limits = p.pair_qty(self.z_limits, "z_limits", Units.NM)
@@ -1439,14 +1447,30 @@ class StageSystemSettings:
         """
         RUNTIME CHECK: External Safety.
         Returns a SafetyCheck object (True/False + reasons) without modifying self.extra.
-        Args:
-                target: The desired position (absolute) or movement vector (relative).
-                current: The current stage position (required for relative checks or step size calc).
-                relative: If True, 'target' is treated as a delta to 'current'.
+
+        Checks:
+        1. Is the axis enabled? (can_x, can_tilt_x, etc.)
+        2. Is the destination within absolute limits? (x_limits, etc.)
+        3. Is the step size within dynamic limits? (max_step_distance, etc.)
         """
         reasons = []
 
-        # 1. Resolve Absolute Target
+        # --- 1. Validate Axis Availability (Intents vs Capabilities) ---
+        # If the user intends to move an axis (value is not None), that axis MUST be enabled.
+        axes_map = {
+            "x": self.can_x, "y": self.can_y, "z": self.can_z,
+            "r": self.can_r, "tilt_x": self.can_tilt_x, "tilt_y": self.can_tilt_y
+        }
+
+        for axis, is_enabled in axes_map.items():
+            if getattr(target, axis) is not None and not is_enabled:
+                reasons.append(f"Movement requested on disabled axis: '{axis}'")
+
+        # If we already failed basic capability checks, return early to avoid math errors
+        if reasons:
+            return SafetyCheck(allowed=False, reasons=reasons)
+
+        # --- 2. Resolve Absolute Target & Step Vector ---
         abs_target = target
         step_vector = None
 
@@ -1454,23 +1478,20 @@ class StageSystemSettings:
             if current is None:
                 return SafetyCheck.failure("Cannot perform relative move without current position")
 
-            # Check if we know where we are starting from
-            axes_to_check = [
-                ("x", target.x, current.x), ("y", target.y, current.y),
-                ("z", target.z, current.z), ("r", target.r, current.r),
-                ("tilt_x", target.tilt_x, current.tilt_x), ("tilt_y", target.tilt_y, current.tilt_y),
-            ]
-            for axis_name, delta, start_val in axes_to_check:
-                if delta is not None and start_val is None:
-                    return SafetyCheck.failure(
-                        f"Relative move on '{axis_name}' impossible: current position is unknown.")
+            # Check if we have a valid starting point for all requested deltas
+            for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
+                if getattr(target, axis) is not None and getattr(current, axis) is None:
+                    return SafetyCheck.failure(f"Relative move on '{axis}' impossible: current position unknown.")
 
             abs_target = current + target
             step_vector = target
         else:
-            step_vector = (target - current) if current else None
+            # Absolute move
+            if current:
+                step_vector = target - current
+            # If current is None, we can still check absolute limits, but skip step checks
 
-        # 2. Check Static Limits (Boundaries)
+        # --- 3. Check Static Limits (Boundaries) ---
         def check_bound(val, lims, name):
             if val is not None and lims:
                 if not (lims[0] <= val <= lims[1]):
@@ -1483,20 +1504,28 @@ class StageSystemSettings:
         check_bound(abs_target.tilt_x, self.tilt_x_limits, "tilt_x")
         check_bound(abs_target.tilt_y, self.tilt_y_limits, "tilt_y")
 
-        # 3. Check Dynamic Limits (Step Size)
+        # --- 4. Check Dynamic Limits (Step Size) ---
         if step_vector is not None:
-            dx = step_vector.x if step_vector.x is not None else Q_(0, Units.NM)
-            dy = step_vector.y if step_vector.y is not None else Q_(0, Units.NM)
-            distance = (dx.to(Units.NM).magnitude ** 2 + dy.to(Units.NM).magnitude ** 2) ** 0.5
-            max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
+            # XY Euclidian Distance
+            if step_vector.x is not None or step_vector.y is not None:
+                dx = step_vector.x if step_vector.x is not None else Q_(0, Units.NM)
+                dy = step_vector.y if step_vector.y is not None else Q_(0, Units.NM)
+                distance = (dx.to(Units.NM).magnitude ** 2 + dy.to(Units.NM).magnitude ** 2) ** 0.5
+                max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
 
-            if distance > max_dist_nm:
-                reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
+                if distance > max_dist_nm:
+                    reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
 
+            # Tilt Step Limits
             if step_vector.tilt_x is not None:
                 d_tilt = abs(step_vector.tilt_x)
                 if d_tilt > self.max_step_deg:
                     reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_deg}")
+
+            if step_vector.tilt_y is not None:
+                d_tilt = abs(step_vector.tilt_y)
+                if d_tilt > self.max_step_deg:
+                    reasons.append(f"Tilt Y step {d_tilt} exceeds limit {self.max_step_deg}")
 
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
@@ -1717,11 +1746,11 @@ class DetectorSettings:
     frame_integration: Optional[int] = None
     gain_index: Optional[int] = None
     offset_index: Optional[int] = None
-    digital_rotation_deg: Optional[float] = None
+    digital_rotation: Optional["Quantity"] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
-    _UNITS = {"exposure": Units.MS}
+    _UNITS = {"exposure": Units.MS, "digital_rotation": Units.DEG}
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "DetectorSettings")
@@ -1731,7 +1760,7 @@ class DetectorSettings:
         self.frame_integration = p.int(self.frame_integration, "frame_integration")
         self.gain_index = p.int(self.gain_index, "gain_index")
         self.offset_index = p.int(self.offset_index, "offset_index")
-        self.digital_rotation_deg = p.float(self.digital_rotation_deg, "digital_rotation_deg")
+        self.digital_rotation = p.qty(self.digital_rotation, "digital_rotation", Units.DEG)
         self.exposure = p.qty(self.exposure, "exposure", Units.MS)
         # ROI is preserved as None if missing (tristate)
         self.roi = p.model(ROI, self.roi, "roi", default=None)
@@ -1953,27 +1982,21 @@ class DetectorCapabilities:
             if self.offset_index_max is not None and oi > self.offset_index_max:
                 reasons.append(f"Offset Index {oi} exceeds limit {self.offset_index_max}.")
 
-        # --- 5. Digital Rotation ---
-        if settings.digital_rotation_deg is not None:
-            rot_val = settings.digital_rotation_deg
+        # --- 5. Digital Rotation (Cleaned Up) ---
+        if settings.digital_rotation is not None:
+            rot_val = settings.digital_rotation
 
-            if self.can_digital_rotation is False and rot_val != 0.0:
-                reasons.append(f"Digital Rotation {rot_val}° requested, but 'can_digital_rotation' is False.")
+            if self.can_digital_rotation is False:
+                # Check if rotation is non-zero (using magnitude for safety against -0.0)
+                if abs(rot_val.magnitude) > 1e-6:
+                    reasons.append(
+                        f"Digital Rotation {rot_val} requested, but 'can_digital_rotation' is False.")
 
-            # Helper to extract magnitude safely for comparison
-            # (Settings uses float deg, Capabilities uses Quantity)
-            def _get_deg(q):
-                return q.to(Units.DEG).magnitude if hasattr(q, 'to') else q
+            if self.digital_rotation_min is not None and rot_val < self.digital_rotation_min:
+                reasons.append(f"Digital Rotation {rot_val} below limit {self.digital_rotation_min}.")
 
-            if self.digital_rotation_min is not None:
-                min_r = _get_deg(self.digital_rotation_min)
-                if rot_val < min_r:
-                    reasons.append(f"Digital Rotation {rot_val}° below limit {self.digital_rotation_min}.")
-
-            if self.digital_rotation_max is not None:
-                max_r = _get_deg(self.digital_rotation_max)
-                if rot_val > max_r:
-                    reasons.append(f"Digital Rotation {rot_val}° exceeds limit {self.digital_rotation_max}.")
+            if self.digital_rotation_max is not None and rot_val > self.digital_rotation_max:
+                reasons.append(f"Digital Rotation {rot_val} exceeds limit {self.digital_rotation_max}.")
 
         # --- 6. ROI Checks ---
         if settings.roi is not None:
@@ -2050,10 +2073,10 @@ class DetectorSystemSettings:
 
         # 2. Completeness (Strict only logic in original)
         missing_defaults = ids_available - set(self.defaults_by_id.keys())
-        v.check(not missing_defaults, "completeness", f"Missing defaults for: {missing_defaults}")
+        v.check(not missing_defaults, "completeness.defaults", f"Missing defaults for: {missing_defaults}")
 
         missing_caps = ids_available - set(self.capabilities_by_id.keys())
-        v.check(not missing_caps, "completeness", f"Missing capabilities for: {missing_caps}")
+        v.check(not missing_caps, "completeness.capabilities", f"Missing capabilities for: {missing_caps}")
 
         # 3. Recursive Checks
         v.check_nested_map(self.defaults_by_id)
