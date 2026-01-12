@@ -268,12 +268,16 @@ VII. Implementation Conventions & Usage
       - Behavior: Automatically handles recursion, list serialization, and extras injection.
 
    D. from_dict(data, mode=...) (Ingestion)
-      - Boilerplate: Must use `_setup_from_dict` to validate input type and
-        harvest unknown keys into specific Extras.
-        `d, mode, extra = _setup_from_dict(Cls, data, mode, known_keys=...)`
-      - Fallback: If `d` is None (e.g. input was already an object), return
-        `replace(data, _mode=mode)`.
-      - Construction: Pass cleaned data and `extra` into the constructor.
+      - Mechanism: Use `_auto_from_dict(cls, data, mode, alias_map=...)`.
+      - Configuration: Define `alias_map` to map incoming keys to internal field names.
+        (e.g., `{"x": "x_nm"}` allows input key `x_nm` to populate field `x`).
+        Supports strings (1:1 alias) or lists (priority fallback aliases).
+      - Behavior:
+        1. Introspects dataclass fields to identify valid targets.
+        2. Validates input type and harvests unknown keys into `Extras.unknown`.
+        3. STRICT Precedence: Direct Key > Alias > Missing.
+           (Explicit `None` in input is preserved and not overwritten by an alias).
+        4. Passes arguments to constructor; `__post_init__` handles default application.
 
 2. External Usage: Immutability by Policy
 -------------------------------------------------------------------------------
@@ -297,7 +301,6 @@ configs, historical logs). Strict parsing everywhere makes metadata pipelines
 brittle; lenient parsing everywhere makes control paths unsafe. This module
 provides a consistent lifecycle to be both robust (LENIENT ingestion/storage)
 and safe (STRICT validation/execution).
-
 """
 import datetime
 import json
@@ -353,6 +356,7 @@ except Exception:
     except ImportError:
         # Fallback for very old/new structures if facets path changes
         Quantity = type(Q_(1, "nm"))
+
 # =============================================================================
 # Constants & Enums
 # =============================================================================
@@ -361,7 +365,6 @@ class ParseMode(str, Enum):
     """Defines the strictness level for data ingestion."""
     STRICT = "strict"  # Raise errors immediately (Control Plane / Execution)
     LENIENT = "lenient"  # Log errors to Extras and continue (Data Plane / Logging)
-
 
 class Units:
     """Centralized definition of physical units."""
@@ -375,7 +378,6 @@ class Units:
     MS = "ms"        # Pint alias for 'millisecond'
     SEC = "s"
 
-
 def as_parse_mode(mode: Union["ParseMode", str, None]) -> "ParseMode":
     if isinstance(mode, ParseMode): return mode
     if isinstance(mode, str):
@@ -388,6 +390,7 @@ def is_strict(mode: Union["ParseMode", str, None]) -> bool:
     """Helper to check if the effective mode is STRICT."""
     return as_parse_mode(mode) == ParseMode.STRICT
 
+T = TypeVar("T")
 
 # =============================================================================
 # Extras & Core Helpers
@@ -458,7 +461,6 @@ class Extras:
                         ex.raw[f"{owner}.extra.{k}"] = repr(v)
         return ex
 
-
 @dataclass
 class SafetyCheck:
     """
@@ -483,7 +485,6 @@ class SafetyCheck:
     def add_reason(self, reason: str):
         self.allowed = False
         self.reasons.append(reason)
-
 
 def _jsonable(obj: Any) -> Any:
     """Recursively convert object to JSON-safe primitives."""
@@ -633,72 +634,9 @@ def _setup_validate(obj_mode: Any, override_mode: Any) -> Tuple[ParseMode, bool]
     mode = as_parse_mode(obj_mode if override_mode is None else override_mode)
     return mode, is_strict(mode)
 
-
-def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, str] = None) -> Dict[str, Any]:
-    """
-    Automatically converts a dataclass to a dict using introspection and mapping rules.
-
-    Args:
-        obj: The dataclass instance.
-        unit_map: Dict mapping field names to target units (e.g. {"x": "nm"}).
-                  Resulting key will be "{field}_{unit}" (e.g. "x_nm").
-        key_map:  Dict for explicit renaming (e.g. {"exposure_min": "exposure_ms_min"}).
-                  Overrides default unit suffix naming if present.
-    """
-    if unit_map is None: unit_map = {}
-    if key_map is None: key_map = {}
-
-    out = {}
-
-    # Iterate over all fields defined in the dataclass
-    for field in dataclasses.fields(obj):
-        name = field.name
-        val = getattr(obj, name)
-
-        # Skip internals and None values
-        if name.startswith("_") or name == "extra" or val is None:
-            continue
-
-        # Determine Output Key
-        key = name
-        target_unit = unit_map.get(name)
-
-        if name in key_map:
-            key = key_map[name]
-        elif target_unit:
-            # Default convention: append unit suffix
-            key = f"{name}_{target_unit}"
-
-        # Serialize Value
-        if target_unit:
-            # Handle List of Quantities vs Scalar Quantity
-            if isinstance(val, (list, tuple)):
-                out[key] = [serialize_quantity(v, target_unit) for v in val]
-            else:
-                out[key] = serialize_quantity(val, target_unit)
-
-        elif hasattr(val, "to_dict"):
-            out[key] = val.to_dict()
-
-        elif isinstance(val, (list, tuple)):
-            # Recurse on list items
-            out[key] = [v.to_dict() if hasattr(v, "to_dict") else _jsonable(v) for v in val]
-
-        elif isinstance(val, dict):
-            # Recurse on dict values
-            out[key] = {k: (v.to_dict() if hasattr(v, "to_dict") else _jsonable(v)) for k, v in val.items()}
-
-        else:
-            out[key] = _jsonable(val)
-
-    # Inject Extras
-    return _finish_to_dict(out, getattr(obj, "extra", None))
-
 # =============================================================================
-# The FieldParser
+# FieldParser, Validator and auto to_dict/from_dict helper functions
 # =============================================================================
-
-T = TypeVar("T")
 
 class FieldParser:
     """
@@ -1052,6 +990,129 @@ class Validator:
             heal=lambda: setattr(self.obj, name.split('.')[-1], reset_to)
         )
 
+def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, str] = None) -> Dict[str, Any]:
+    """
+    Automatically converts a dataclass to a dict using introspection and mapping rules.
+
+    Args:
+        obj: The dataclass instance.
+        unit_map: Dict mapping field names to target units (e.g. {"x": "nm"}).
+                  Resulting key will be "{field}_{unit}" (e.g. "x_nm").
+        key_map:  Dict for explicit renaming (e.g. {"exposure_min": "exposure_ms_min"}).
+                  Overrides default unit suffix naming if present.
+    """
+    if unit_map is None: unit_map = {}
+    if key_map is None: key_map = {}
+
+    out = {}
+
+    # Iterate over all fields defined in the dataclass
+    for field in dataclasses.fields(obj):
+        name = field.name
+        val = getattr(obj, name)
+
+        # Skip internals and None values
+        if name.startswith("_") or name == "extra" or val is None:
+            continue
+
+        # Determine Output Key
+        key = name
+        target_unit = unit_map.get(name)
+
+        if name in key_map:
+            key = key_map[name]
+        elif target_unit:
+            # Default convention: append unit suffix
+            key = f"{name}_{target_unit}"
+
+        # Serialize Value
+        if target_unit:
+            # Handle List of Quantities vs Scalar Quantity
+            if isinstance(val, (list, tuple)):
+                out[key] = [serialize_quantity(v, target_unit) for v in val]
+            else:
+                out[key] = serialize_quantity(val, target_unit)
+
+        elif hasattr(val, "to_dict"):
+            out[key] = val.to_dict()
+
+        elif isinstance(val, (list, tuple)):
+            # Recurse on list items
+            out[key] = [v.to_dict() if hasattr(v, "to_dict") else _jsonable(v) for v in val]
+
+        elif isinstance(val, dict):
+            # Recurse on dict values
+            out[key] = {k: (v.to_dict() if hasattr(v, "to_dict") else _jsonable(v)) for k, v in val.items()}
+
+        else:
+            out[key] = _jsonable(val)
+
+    # Inject Extras
+    return _finish_to_dict(out, getattr(obj, "extra", None))
+
+def _auto_from_dict(
+        cls: Type[T],
+        data: Any,
+        mode: Union[ParseMode, str, None],
+        alias_map: Optional[Dict[str, Union[str, List[str]]]] = None
+) -> T:
+    """
+    Automates instantiation from a dict with strict precedence rules:
+    1. Direct key present (even if None) -> Use it.
+    2. Direct key missing -> Check aliases.
+    3. Both missing -> Pass nothing (let __post_init__ apply defaults).
+    """
+    alias_map = alias_map or {}
+
+    # 1. Introspect class to find all valid field names
+    cls_fields = {f.name for f in dataclasses.fields(cls) if not f.name.startswith('_')}
+
+    # 2. Flatten aliases for known-key exclusions
+    all_aliases = set()
+    for v in alias_map.values():
+        if isinstance(v, str):
+            all_aliases.add(v)
+        else:
+            all_aliases.update(v)
+
+    # 3. Setup / Validation / Harvesting Unknowns
+    d_dict, mode, extra = _setup_from_dict(
+        cls, data, mode,
+        known_keys=cls_fields,
+        aliases=all_aliases
+    )
+
+    if d_dict is None:
+        return replace(data, _mode=mode)
+
+    # 4. Build Arguments
+    kwargs = {}
+    for name in cls_fields:
+        if name == "extra": continue
+
+        # PRIORITY 1: Exact Match
+        # We check existence (name in d_dict) to preserve explicit None values.
+        if name in d_dict:
+            kwargs[name] = d_dict[name]
+
+        # PRIORITY 2: Alias Match (Only if primary key is COMPLETELY MISSING)
+        elif name in alias_map:
+            param = alias_map[name]
+            if isinstance(param, str):
+                # Single alias
+                if param in d_dict:
+                    kwargs[name] = d_dict[param]
+            else:
+                # List of aliases (first found wins)
+                for alias in param:
+                    if alias in d_dict:
+                        kwargs[name] = d_dict[alias]
+                        break
+
+    # Note: If a field is missing from kwargs, the dataclass __init__
+    # uses its defined default (usually None), which FieldParser then handles.
+    return cls(**kwargs, extra=extra, _mode=mode)
+
 # =============================================================================
 # Structures (Dataclasses)
 # =============================================================================
@@ -1093,14 +1154,9 @@ class Point:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Point":
-        mode = as_parse_mode(mode)
-        if isinstance(d, Point): return replace(d, _mode=mode)
         if isinstance(d, (list, tuple)) and len(d) in (2, 3):
-            return Point(x=d[0], y=d[1], z=d[2] if len(d) == 3 else 0.0, _mode=mode)
-        if not isinstance(d, dict):
-            if is_strict(mode) and d is not None: raise TypeError("Point expects dict/list")
-            return Point(_mode=mode)
-        return Point(x=d.get("x"), y=d.get("y"), z=d.get("z"), name=d.get("name"), _mode=mode)
+            return Point(x=d[0], y=d[1], z=d[2] if len(d) == 3 else 0.0, _mode=as_parse_mode(mode))
+        return _auto_from_dict(Point, d, mode)
 
 @dataclass
 class ROI:
@@ -1151,18 +1207,10 @@ class ROI:
             m = as_parse_mode(mode)
             ex = Extras() if is_strict(m) else normalize_extra_lenient(None, "ROI")
             return ROI(x=d[0], y=d[1], width=d[2], height=d[3], extra=ex, _mode=m)
-        d_dict, mode, extra = _setup_from_dict(
-            ROI, d, mode,
-            known_keys=("x", "y", "width", "height", "extra"),
-            aliases=("w", "h")
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return ROI(
-            x=d_dict.get("x"), y=d_dict.get("y"),
-            width=d_dict.get("width", d_dict.get("w")),
-            height=d_dict.get("height", d_dict.get("h")),
-            extra=extra, _mode=mode,
-        )
+
+        return _auto_from_dict(ROI, d, mode, alias_map={
+            "width": "w", "height": "h"
+        })
 
 @dataclass
 class StagePosition:
@@ -1265,23 +1313,10 @@ class StagePosition:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> 'StagePosition':
-        d_dict, mode, extra = _setup_from_dict(
-            StagePosition, d, mode,
-            known_keys=("name", "x", "y", "z", "r", "tilt_x", "tilt_y", "coordinate_system", "extra"),
-            aliases=("x_nm", "y_nm", "z_nm", "r_deg", "tilt_x_deg", "tilt_y_deg")
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return StagePosition(
-            name=d_dict.get("name"),
-            x=d_dict.get("x", d_dict.get("x_nm")),
-            y=d_dict.get("y", d_dict.get("y_nm")),
-            z=d_dict.get("z", d_dict.get("z_nm")),
-            r=d_dict.get("r", d_dict.get("r_deg")),
-            tilt_x=d_dict.get("tilt_x", d_dict.get("tilt_x_deg")),
-            tilt_y=d_dict.get("tilt_y", d_dict.get("tilt_y_deg")),
-            coordinate_system=d_dict.get("coordinate_system"),
-            extra=extra, _mode=mode,
-        )
+        return _auto_from_dict(StagePosition, d, mode, alias_map={
+            "x": "x_nm", "y": "y_nm", "z": "z_nm",
+            "r": "r_deg", "tilt_x": "tilt_x_deg", "tilt_y": "tilt_y_deg"
+        })
 
 @dataclass
 class StageSystemSettings:
@@ -1465,34 +1500,12 @@ class StageSystemSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageSystemSettings":
-        d_dict, mode, extra = _setup_from_dict(
-            StageSystemSettings, d, mode,
-            known_keys=("enabled", "can_x", "can_y", "can_z", "can_r", "can_tilt_x", "can_tilt_y",
-                        "x_limits", "y_limits", "z_limits", "r_limits", "tilt_x_limits", "tilt_y_limits",
-                        "max_step_distance", "max_step_angle", "eucentric_z", "settle_time", "timeout", "extra"),
-            aliases=("x_limits_nm", "y_limits_nm", "z_limits_nm", "r_limits_deg", "tilt_x_limits_deg",
-                     "tilt_y_limits_deg",
-                     "max_step_nm", "max_step_deg", "eucentric_z_nm", "settle_time_s", "timeout_s")
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return StageSystemSettings(
-            enabled=d_dict.get("enabled", True),
-            can_x=d_dict.get("can_x", True), can_y=d_dict.get("can_y", True), can_z=d_dict.get("can_z", True),
-            can_r=d_dict.get("can_r", False), can_tilt_x=d_dict.get("can_tilt_x", False),
-            can_tilt_y=d_dict.get("can_tilt_y", False),
-            x_limits=d_dict.get("x_limits", d_dict.get("x_limits_nm")),
-            y_limits=d_dict.get("y_limits", d_dict.get("y_limits_nm")),
-            z_limits=d_dict.get("z_limits", d_dict.get("z_limits_nm")),
-            r_limits=d_dict.get("r_limits", d_dict.get("r_limits_deg")),
-            tilt_x_limits=d_dict.get("tilt_x_limits", d_dict.get("tilt_x_limits_deg")),
-            tilt_y_limits=d_dict.get("tilt_y_limits", d_dict.get("tilt_y_limits_deg")),
-            max_step_distance=d_dict.get("max_step_distance", d_dict.get("max_step_nm")),
-            max_step_angle=d_dict.get("max_step_angle", d_dict.get("max_step_deg")),
-            eucentric_z=d_dict.get("eucentric_z", d_dict.get("eucentric_z_nm")),
-            settle_time=d_dict.get("settle_time", d_dict.get("settle_time_s")),
-            timeout=d_dict.get("timeout", d_dict.get("timeout_s")),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(StageSystemSettings, d, mode, alias_map={
+            "x_limits": "x_limits_nm", "y_limits": "y_limits_nm", "z_limits": "z_limits_nm",
+            "r_limits": "r_limits_deg", "tilt_x_limits": "tilt_x_limits_deg", "tilt_y_limits": "tilt_y_limits_deg",
+            "max_step_distance": "max_step_nm", "max_step_angle": "max_step_deg",
+            "eucentric_z": "eucentric_z_nm", "settle_time": "settle_time_s", "timeout": "timeout_s"
+        })
 
 @dataclass
 class BeamSettings:
@@ -1559,24 +1572,11 @@ class BeamSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSettings":
-        d_dict, mode, extra = _setup_from_dict(
-            BeamSettings, d, mode,
-            known_keys=("voltage", "beam_current", "spot_size", "convergence_angle", "defocus", "scan_rotation",
-                        "stigmation", "beam_shift", "image_shift", "extra"),
-            aliases=("voltage_kv", "beam_current_na", "convergence_angle_mrad", "defocus_nm", "scan_rotation_deg")
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return BeamSettings(
-            voltage=d_dict.get("voltage", d_dict.get("voltage_kv")),
-            beam_current=d_dict.get("beam_current", d_dict.get("beam_current_na")),
-            spot_size=d_dict.get("spot_size"),
-            convergence_angle=d_dict.get("convergence_angle", d_dict.get("convergence_angle_mrad")),
-            defocus=d_dict.get("defocus", d_dict.get("defocus_nm")),
-            scan_rotation=d_dict.get("scan_rotation", d_dict.get("scan_rotation_deg")),
-            stigmation=d_dict.get("stigmation"), beam_shift=d_dict.get("beam_shift"),
-            image_shift=d_dict.get("image_shift"),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(BeamSettings, d, mode, alias_map={
+            "voltage": "voltage_kv", "beam_current": "beam_current_na",
+            "convergence_angle": "convergence_angle_mrad", "defocus": "defocus_nm",
+            "scan_rotation": "scan_rotation_deg"
+        })
 
 # Alias for semantic clarity in Read-Only contexts
 BeamState = BeamSettings
@@ -1654,8 +1654,6 @@ class BeamSystemSettings:
 
         return v.valid
 
-
-
     def is_safe_beam(self, target: BeamSettings) -> SafetyCheck:
         """
         Runtime Gatekeeper: Checks if a target beam configuration respects system limits.
@@ -1684,23 +1682,10 @@ class BeamSystemSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSystemSettings":
-        d_dict, mode, extra = _setup_from_dict(
-            BeamSystemSettings, d, mode,
-            known_keys=("enabled", "default_beam", "voltage_limits", "beam_current_limits",
-                        "spot_size_limits", "convergence_angle_limits", "extra"),
-            aliases=("voltage_limits_kv", "beam_current_limits_na", "convergence_angle_limits_mrad")
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return BeamSystemSettings(
-            enabled=d_dict.get("enabled", True),
-            default_beam=d_dict.get("default_beam"),
-            voltage_limits=d_dict.get("voltage_limits", d_dict.get("voltage_limits_kv")),
-            beam_current_limits=d_dict.get("beam_current_limits", d_dict.get("beam_current_limits_na")),
-            spot_size_limits=d_dict.get("spot_size_limits"),
-            convergence_angle_limits=d_dict.get("convergence_angle_limits",
-                                                d_dict.get("convergence_angle_limits_mrad")),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(BeamSystemSettings, d, mode, alias_map={
+            "voltage_limits": "voltage_limits_kv", "beam_current_limits": "beam_current_limits_na",
+            "convergence_angle_limits": "convergence_angle_limits_mrad"
+        })
 
 @dataclass
 class DetectorSettings:
@@ -1770,25 +1755,9 @@ class DetectorSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSettings":
-        d_dict, mode, extra = _setup_from_dict(
-            DetectorSettings, d, mode,
-            known_keys=("detector_id", "exposure", "binning_index", "binning_xy", "roi",
-                        "frame_integration", "gain_index", "offset_index", "digital_rotation_deg", "extra"),
-            aliases=("exposure_ms",)
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return DetectorSettings(
-            detector_id=d_dict.get("detector_id"),
-            exposure=d_dict.get("exposure", d_dict.get("exposure_ms")),
-            binning_index=d_dict.get("binning_index"),
-            binning_xy=d_dict.get("binning_xy"),
-            roi=d_dict.get("roi"),
-            frame_integration=d_dict.get("frame_integration"),
-            gain_index=d_dict.get("gain_index"),
-            offset_index=d_dict.get("offset_index"),
-            digital_rotation_deg=d_dict.get("digital_rotation_deg"),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(DetectorSettings, d, mode, alias_map={
+            "exposure": "exposure_ms"
+        })
 
 # Alias for semantic clarity in Read-Only contexts
 DetectorState = DetectorSettings
@@ -2022,39 +1991,12 @@ class DetectorCapabilities:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "DetectorCapabilities":
-        d_dict, mode, extra = _setup_from_dict(
-            DetectorCapabilities, d, mode,
-            known_keys=("can_binning", "binning_index_min", "binning_index_max", "binning_xy_min", "binning_xy_max",
-                        "exposure_ms_min", "exposure_ms_max", "frame_integration_min", "frame_integration_max",
-                        "roi_size_min", "roi_size_max", "can_gain", "gain_index_min", "gain_index_max",
-                        "can_offset", "offset_index_min", "offset_index_max",
-                        "can_digital_rotation", "digital_rotation_deg_min", "digital_rotation_deg_max", "extra"),
-            aliases=("roi_min", "roi_max")
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return DetectorCapabilities(
-            can_binning=d_dict.get("can_binning"),
-            binning_index_min=d_dict.get("binning_index_min"),
-            binning_index_max=d_dict.get("binning_index_max"),
-            binning_xy_min=d_dict.get("binning_xy_min"),
-            binning_xy_max=d_dict.get("binning_xy_max"),
-            exposure_min=d_dict.get("exposure_ms_min"),
-            exposure_max=d_dict.get("exposure_ms_max"),
-            frame_integration_min=d_dict.get("frame_integration_min"),
-            frame_integration_max=d_dict.get("frame_integration_max"),
-            roi_size_min=d_dict.get("roi_size_min", d_dict.get("roi_min")),
-            roi_size_max=d_dict.get("roi_size_max", d_dict.get("roi_max")),
-            can_gain=d_dict.get("can_gain"),
-            gain_index_min=d_dict.get("gain_index_min"),
-            gain_index_max=d_dict.get("gain_index_max"),
-            can_offset=d_dict.get("can_offset"),
-            offset_index_min=d_dict.get("offset_index_min"),
-            offset_index_max=d_dict.get("offset_index_max"),
-            can_digital_rotation=d_dict.get("can_digital_rotation"),
-            digital_rotation_min=d_dict.get("digital_rotation_deg_min"),
-            digital_rotation_max=d_dict.get("digital_rotation_deg_max"),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(DetectorCapabilities, d, mode, alias_map={
+            "roi_size_min": "roi_min", "roi_size_max": "roi_max",
+            "exposure_min": "exposure_ms_min", "exposure_max": "exposure_ms_max",
+            "digital_rotation_min": "digital_rotation_deg_min",
+            "digital_rotation_max": "digital_rotation_deg_max"
+        })
 
 @dataclass
 class DetectorSystemSettings:
@@ -2130,21 +2072,9 @@ class DetectorSystemSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSystemSettings":
-        d_dict, mode, extra = _setup_from_dict(
-            DetectorSystemSettings, d, mode,
-            known_keys=("enabled", "default_detector_id", "available_detector_ids", "defaults_by_id",
-                        "capabilities_by_id", "extra"),
-            aliases=("available_detectors",)
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return DetectorSystemSettings(
-            enabled=d_dict.get("enabled", True),
-            available_detector_ids=d_dict.get("available_detector_ids", d_dict.get("available_detectors", [])),
-            default_detector_id=d_dict.get("default_detector_id"),
-            defaults_by_id=d_dict.get("defaults_by_id"),
-            capabilities_by_id=d_dict.get("capabilities_by_id"),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(DetectorSystemSettings, d, mode, alias_map={
+            "available_detector_ids": "available_detectors"
+        })
 
 @dataclass
 class ImageOutputSettings:
@@ -2184,13 +2114,7 @@ class ImageOutputSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ImageOutputSettings":
-        d_dict, mode, extra = _setup_from_dict(ImageOutputSettings, d, mode,
-                                               known_keys=("file_format", "path", "extra"), aliases=())
-        if d_dict is None: return replace(d, _mode=mode)
-        return ImageOutputSettings(
-            file_format=d_dict.get("file_format", "tiff"),
-            path=d_dict.get("path"), extra=extra, _mode=mode
-        )
+        return _auto_from_dict(ImageOutputSettings, d, mode)
 
 @dataclass
 class Aperture:
@@ -2237,19 +2161,9 @@ class Aperture:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Aperture":
-        d_dict, mode, extra = _setup_from_dict(
-            Aperture, d, mode,
-            known_keys=("aperture_id", "inserted", "size_index", "position", "extra"),
-            aliases=("id",)
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return Aperture(
-            aperture_id=d_dict.get("aperture_id", d_dict.get("id")),
-            inserted=d_dict.get("inserted"),
-            size_index=d_dict.get("size_index"),
-            position=d_dict.get("position"),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(Aperture, d, mode, alias_map={
+            "aperture_id": "id"
+        })
 
 @dataclass
 class MicroscopeState:
@@ -2313,21 +2227,7 @@ class MicroscopeState:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeState":
-        d_dict, mode, extra = _setup_from_dict(
-            MicroscopeState, d, mode,
-            known_keys=("timestamp", "mode", "stage_position", "beam", "apertures", "detectors",
-                        "active_detector_ids", "primary_detector_id", "extra"),
-            aliases=()
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return MicroscopeState(
-            timestamp=d_dict.get("timestamp"), mode=d_dict.get("mode"),
-            stage_position=d_dict.get("stage_position"), beam=d_dict.get("beam"),
-            apertures=d_dict.get("apertures"), detectors=d_dict.get("detectors"),
-            active_detector_ids=d_dict.get("active_detector_ids"),
-            primary_detector_id=d_dict.get("primary_detector_id"),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(MicroscopeState, d, mode)
 
 @dataclass
 class MicroscopeImageMetadata:
@@ -2390,22 +2290,7 @@ class MicroscopeImageMetadata:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeImageMetadata":
-        d_dict, mode, extra = _setup_from_dict(
-            MicroscopeImageMetadata, d, mode,
-            known_keys=("version", "created_at", "magnification", "camera_length_mm", "pixel_size_nm", "image_size_px",
-                        "accelerating_voltage_kv", "beam_current_na", "exposure_ms", "microscope_state", "extra"),
-            aliases=()
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return MicroscopeImageMetadata(
-            version=d_dict.get("version", str(METADATA_VERSION)), created_at=d_dict.get("created_at"),
-            magnification=d_dict.get("magnification"), camera_length_mm=d_dict.get("camera_length_mm"),
-            pixel_size_nm=d_dict.get("pixel_size_nm"), image_size_px=d_dict.get("image_size_px"),
-            accelerating_voltage_kv=d_dict.get("accelerating_voltage_kv"),
-            beam_current_na=d_dict.get("beam_current_na"),
-            exposure_ms=d_dict.get("exposure_ms"), microscope_state=d_dict.get("microscope_state"),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(MicroscopeImageMetadata, d, mode)
 
 class MicroscopeImage:
     """
@@ -2603,28 +2488,7 @@ class SystemInfo:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemInfo":
-        d_dict, mode, extra = _setup_from_dict(
-            SystemInfo, d, mode,
-            known_keys=("name", "ip_address", "manufacturer", "model", "serial_number",
-                        "hardware_version", "software_version", "supertem_version",
-                        "application", "application_version", "extra"),
-            aliases=()
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return SystemInfo(
-            name=d_dict.get("name"),
-            ip_address=d_dict.get("ip_address"),
-            manufacturer=d_dict.get("manufacturer"),
-            model=d_dict.get("model"),
-            serial_number=d_dict.get("serial_number"),
-            hardware_version=d_dict.get("hardware_version"),
-            software_version=d_dict.get("software_version"),
-            supertem_version=d_dict.get("supertem_version", __version__),
-            application=d_dict.get("application"),
-            application_version=d_dict.get("application_version"),
-            extra=extra,
-            _mode=mode
-        )
+        return _auto_from_dict(SystemInfo, d, mode)
 
 @dataclass
 class SystemSettings:
@@ -2675,18 +2539,9 @@ class SystemSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "SystemSettings":
-        d_dict, mode, extra = _setup_from_dict(
-            SystemSettings, d, mode,
-            known_keys=("stage_system", "beam_system", "detector_system", "info", "extra"),
-            aliases=("stage", "beam", "detector")
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return SystemSettings(
-            stage_system=d_dict.get("stage_system", d_dict.get("stage")),
-            beam_system=d_dict.get("beam_system", d_dict.get("beam")),
-            detector_system=d_dict.get("detector_system", d_dict.get("detector")),
-            info=d_dict.get("info"), extra=extra, _mode=mode
-        )
+        return _auto_from_dict(SystemSettings, d, mode, alias_map={
+            "stage_system": "stage", "beam_system": "beam", "detector_system": "detector"
+        })
 
 @dataclass
 class MicroscopeSettings:
@@ -2728,15 +2583,7 @@ class MicroscopeSettings:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "MicroscopeSettings":
-        d_dict, mode, extra = _setup_from_dict(
-            MicroscopeSettings, d, mode,
-            known_keys=("system", "image", "protocol", "extra"),
-            aliases=()
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return MicroscopeSettings(system=d_dict.get("system"), image=d_dict.get("image"),
-                                  protocol=d_dict.get("protocol"), extra=extra,
-                                  _mode=mode)
+        return _auto_from_dict(MicroscopeSettings, d, mode)
 
 # =============================================================================
 # Requests
@@ -2794,14 +2641,7 @@ class AcquisitionRequest:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
-        d_dict, mode, extra = _setup_from_dict(
-            AcquisitionRequest, d, mode,
-            known_keys=("detector_id", "detector", "image", "extra"),
-            aliases=()
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return AcquisitionRequest(detector_id=d_dict.get("detector_id"), detector=d_dict.get("detector"),
-                                  image=d_dict.get("image"), extra=extra, _mode=mode)
+        return _auto_from_dict(AcquisitionRequest, d, mode)
 
 @dataclass
 class StageMoveRequest:
@@ -2852,19 +2692,9 @@ class StageMoveRequest:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageMoveRequest":
-        d_dict, mode, extra = _setup_from_dict(
-            StageMoveRequest, d, mode,
-            known_keys=("target", "relative", "backlash_correction", "wait_for_settle", "settle_time", "extra"),
-            aliases=("settle_time_s",)
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-        return StageMoveRequest(
-            target=d_dict.get("target"), relative=d_dict.get("relative"),
-            backlash_correction=d_dict.get("backlash_correction"),
-            wait_for_settle=d_dict.get("wait_for_settle"),
-            settle_time=d_dict.get("settle_time", d_dict.get("settle_time_s")),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(StageMoveRequest, d, mode, alias_map={
+            "settle_time": "settle_time_s"
+        })
 
 @dataclass
 class ApertureControlRequest:
@@ -2926,17 +2756,7 @@ class ApertureControlRequest:
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureControlRequest":
-        d_dict, mode, extra = _setup_from_dict(
-            ApertureControlRequest, d, mode,
-            known_keys=("aperture_id", "state", "relative", "extra"),
-            aliases=("aperture",)
-        )
-        if d_dict is None: return replace(d, _mode=mode)
-
-        return ApertureControlRequest(
-            aperture_id=d_dict.get("aperture_id"),
-            relative=d_dict.get("relative"),
-            state=d_dict.get("state", d_dict.get("aperture")),
-            extra=extra, _mode=mode
-        )
+        return _auto_from_dict(ApertureControlRequest, d, mode, alias_map={
+            "state": "aperture"
+        })
 
