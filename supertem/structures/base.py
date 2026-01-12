@@ -475,7 +475,21 @@ class Extras:
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-safe payload representation."""
-        return _jsonable({k: deepcopy(v) for k, v in self.__dict__.items() if v})
+
+        # We define EXACTLY what to keep
+        def _keep(val: Any) -> bool:
+            # 1. Always toss None
+            if val is None: return False
+
+            # 2. Toss empty collections (dict, list, string)
+            if isinstance(val, (dict, list, tuple, str)) and len(val) == 0:
+                return False
+
+            # 3. Keep everything else! (Numbers, Booleans, Objects)
+            return True
+
+        # Now 0 and False will survive because they are not None and not collections
+        return _jsonable({k: deepcopy(v) for k, v in self.__dict__.items() if _keep(v)})
 
     @staticmethod
     def from_any(value: Any, *, owner: str = "unknown") -> "Extras":
@@ -601,7 +615,7 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
     if isinstance(value, dict):
         mag = value.get("magnitude", value.get("value"))
         u = value.get("unit", value.get("units"))
-        if mag is None: return None  # Or raise ValueError("Dict missing magnitude")
+        if mag is None: raise ValueError(f"Quantity dict missing 'magnitude': {value}")
         return Q_(mag, u or unit).to(unit)
 
     if isinstance(value, str):
@@ -618,16 +632,14 @@ def ensure_quantity(value: Any, unit: str) -> Optional["Quantity"]:
     return Q_(float(value), unit).to(unit)
 
 def serialize_quantity(q: Optional["Quantity"], target_unit: str) -> Optional[float]:
-    """Convert a Quantity to a plain float magnitude in the target unit.
+    """Convert a Quantity to a plain float magnitude in the target unit. Raises Exception on unit mismatch.
 
     This strips the unit information for safe JSON serialization.
     Example: serialize_quantity(Q_(300, 'kV'), 'V') -> 300000.0
     """
     if q is None: return None
-    try:
-        if not isinstance(q, Quantity): return float(q)
-        return float(q.to(target_unit).magnitude)
-    except Exception: return None
+    if not isinstance(q, Quantity): return float(q)
+    return float(q.to(target_unit).magnitude)  # Let pint errors bubble up
 
 def _check_data_format(data: np.ndarray) -> bool:
     """Validate if numpy array is a valid 2D image (uint8/uint16)."""
@@ -644,8 +656,8 @@ def add_extra_if_any(out: Dict[str, Any], extra: Any) -> Dict[str, Any]:
     ex_obj = extra if isinstance(extra, Extras) else Extras.from_any(extra)
     if ex_obj.is_empty(): return out
     payload = ex_obj.to_dict()
-    clean_payload = {k: v for k, v in payload.items() if v}
-    if clean_payload: out["extra"] = clean_payload
+    if payload:
+        out["extra"] = payload
     return out
 
 def _finish_to_dict(payload: Dict[str, Any], extra: Any) -> Dict[str, Any]:
@@ -989,14 +1001,15 @@ class Validator:
         # Prepare Exception
         e = exc if isinstance(exc, Exception) else ValueError(str(exc))
 
-        # Log or Raise
+        # 1. STRICT: Raise immediately (Fail Fast)
+        if self.strict:
+            self.valid = False  # Optional, but good for state hygiene before crashing
+            raise e
+
+        # 2. LENIENT: Log and Continue
         note_or_raise(self.extra, self._key(key_suffix), e, mode=self.mode, raw=raw)
 
-        if self.strict:
-            self.valid = False
-            return False
-
-        # Heal (Lenient only)
+        # Heal
         if heal:
             try:
                 heal()
@@ -1091,10 +1104,23 @@ def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, 
         # 1. Happy Path: Field is in _UNITS
         if target_unit:
             key = f"{key}_{target_unit}" if name not in key_map else key
-            if isinstance(val, (list, tuple)):
-                out[key] = [serialize_quantity(v, target_unit) for v in val]
-            else:
-                out[key] = serialize_quantity(val, target_unit)
+            try:
+                # Try strict conversion
+                if isinstance(val, (list, tuple)):
+                    out[key] = [serialize_quantity(v, target_unit) for v in val]
+                else:
+                    out[key] = serialize_quantity(val, target_unit)
+            except Exception as e:
+                # CONVERSION FAILED
+                if is_strict_mode:
+                    raise ValueError(f"Serialization failed for {name}: {e}")
+
+                # Lenient Fallback: Keep original structure + Warning
+                out[key] = _jsonable(val)  # Dump as {magnitude: x, unit: y}
+                if hasattr(obj, "extra") and isinstance(obj.extra, Extras):
+                    obj.extra.notes.setdefault("serialization_errors", []).append(
+                        f"Field '{name}' failed conversion to {target_unit}: {e}"
+                    )
 
         # 2. The Guard: Field is a Quantity BUT MISSING from _UNITS
         elif isinstance(val, Quantity):
@@ -1297,6 +1323,9 @@ class StagePosition:
             None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
         tilt_x, tilt_y (Optional[Quantity]): Rotation/Alpha-Beta tilts. Units: degree.
             None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
+    Behavior:
+      - Manual Construction: Defaults to STRICT (Safe for control scripts).
+      - Ingestion (from_dict): Inherits mode from parent (usually LENIENT for State).
     """
     name: Optional[str] = None
     x: Optional["Quantity"] = None
@@ -1406,7 +1435,9 @@ class StageSystemSettings:
         settle_time (Optional[Quantity]): Time to wait for vibration damping. Units: seconds.
             None Behavior: Defaulted to 0.2 seconds.
         x_limits, y_limits, z_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
-            None Behavior: Invalid if axis is enabled (Limits are MANDATORY).
+            None Behavior:
+              - STRICT: Raises Validation Error (Mandatory if enabled).
+              - LENIENT: Heals by disabling the axis (can_x -> False).
     """
     enabled: Optional[bool] = None
     can_x: Optional[bool] = None
@@ -2138,12 +2169,20 @@ class DetectorSystemSettings:
                     f"Default '{self.default_detector_id}' is unknown",
                     heal=lambda: setattr(self, 'default_detector_id', None))
 
-        # 2. Completeness (Strict only logic in original)
-        missing_defaults = ids_available - set(self.defaults_by_id.keys())
-        v.check(not missing_defaults, "completeness.defaults", f"Missing defaults for: {missing_defaults}")
+            # 2. Completeness (Heal by removing the broken ID from availability)
+            def _heal_missing(missing_set):
+                # Remove the IDs that have no config from the available list
+                self.available_detector_ids = [x for x in self.available_detector_ids if x not in missing_set]
 
-        missing_caps = ids_available - set(self.capabilities_by_id.keys())
-        v.check(not missing_caps, "completeness.capabilities", f"Missing capabilities for: {missing_caps}")
+            missing_defaults = ids_available - set(self.defaults_by_id.keys())
+            v.check(not missing_defaults, "completeness.defaults",
+                    f"Missing defaults for: {missing_defaults}",
+                    heal=lambda: _heal_missing(missing_defaults))
+
+            missing_caps = ids_available - set(self.capabilities_by_id.keys())
+            v.check(not missing_caps, "completeness.capabilities",
+                    f"Missing capabilities for: {missing_caps}",
+                    heal=lambda: _heal_missing(missing_caps))
 
         # 3. Recursive Checks
         v.check_nested_map(self.defaults_by_id)
@@ -2307,7 +2346,7 @@ class MicroscopeState:
 
         valid_ids = []
         for det_id in self.active_detector_ids:
-            if not v.check(det_id in self.detectors, "active_detector_ids",
+            if not v.check(det_id in self.detectors, f"active_detector_ids.{det_id}",
                            f"Active detector '{det_id}' not found"):
                 continue  # Skip adding to valid_ids if check failed
             valid_ids.append(det_id)
