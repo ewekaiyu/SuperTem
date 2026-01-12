@@ -1,3 +1,97 @@
+"""
+supertem.config
+
+Configuration Bootstrap, Registry Management, and Default Factory.
+
+This module serves as the entry point for the application's state, responsible for:
+  - Bootstrapping the runtime environment (filesystem, logs, databases).
+  - Managing the "Registry of Configurations" (Active vs. Available profiles).
+  - Providing the "Factory Reset" defaults compliant with Schema v2.
+  - Atomic persistence of configuration changes to disk.
+
+It acts as the *Source of Truth* that feeds the `base.py` ingestion lifecycle.
+
+===============================================================================
+I. The Bootstrap Lifecycle
+===============================================================================
+
+On import, this module executes a self-healing initialization sequence:
+
+  1) Environment Validation
+     - Ensures all required directory trees exist (`log/`, `data/`, `db/`).
+     - Prevents "FileNotFound" crashes in downstream modules.
+
+  2) Default Generation (The "Safe Mode")
+     - Checks for the existence of critical YAML definitions.
+     - If missing, atomically writes the `DEFAULT_` dictionaries defined in this
+       file to disk.
+     - GOAL: The system is always runnable, even on a fresh install or after
+       user configuration corruption.
+
+  3) Registry Loading
+     - Loads the "Index" files (`microscope-config-index.yaml`).
+     - Resolves the "Active" configuration path.
+     - Fallback: If the active config is missing, reverts to the internal default.
+
+===============================================================================
+II. Schema v2: Alignment with supertem.structure.base
+===============================================================================
+
+The `DEFAULT_MICROSCOPE_CONFIGURATION_YAML` defined here is strictly typed to
+match the `MicroscopeSettings` dataclass hierarchy in `base.py`.
+
+1. Strict Hierarchy (Root -> System -> Subsystem)
+   - OLD: Flat dictionary (`stage: {}`, `beam: {}`).
+   - NEW: Nested Object Graph.
+     `MicroscopeSettings` -> `system` -> `stage_system` -> `x_limits_nm`
+   - Rationale: Separates "Hardware Limits" (System) from "User Preferences" (Image).
+
+2. Unit-Explicit Naming (The "Zero Ambiguity" Rule)
+   - Keys MUST include their unit suffix to satisfy `base.py`'s strict alias mapping.
+   - Examples:
+       `x_limits` -> `x_limits_nm`
+       `voltage`  -> `voltage_limits_kv`
+       `exposure` -> `exposure_ms`
+   - Rationale: Prevents `50` from being interpreted as "50 meters" by Pint.
+
+3. Separation of Concerns: Limits vs. State
+   - **Limits (Gatekeeping):** Defined at the `system` level (e.g., `voltage_limits_kv`).
+     These are the hard boundaries the `Validator` enforces.
+   - **State (Snapshots):** Defined in nested defaults (e.g., `default_beam`).
+     These are the values applied during a system reset or `Lens.normalize()`.
+
+4. The Detector Registry
+   - Requires explicit `available_detectors` list.
+   - Requires `capabilities_by_id` to enable `DetectorSystemSettings.is_supported()`.
+
+===============================================================================
+III. Registry & Profile Management
+===============================================================================
+
+SuperTEM supports multiple hardware profiles (e.g., "Simulated", "JEOL-2100",
+"Thermo-Krios"). This module acts as the Librarian for these profiles.
+
+- **The Index:** A YAML file mapping human-readable names to file paths.
+- **The Active Profile:** The `default` key in the index determines which file
+  is loaded by the main application logic.
+- **Atomic I/O:** All writes to index files use `_atomic_dump_yaml` (write to tmp
+  -> OS replace) to prevent corruption if the power fails during a write.
+
+===============================================================================
+IV. Usage Guide
+===============================================================================
+
+1. Accessing Configuration
+   - Do NOT import `DEFAULT_...` dicts directly for runtime logic.
+   - Use `get_microscope_config_path(name)` to load specific settings.
+   - Use `DEFAULT_CONFIGURATION_PATH` for the currently active profile.
+
+2. Modifying the Registry
+   - Use `add_microscope_config(...)` to register a new YAML file.
+   - Use `set_default_microscope_config(...)` to switch the active machine.
+   - These changes persist immediately to `microscope-config-index.yaml`.
+
+"""
 from __future__ import annotations
 
 import os
@@ -6,157 +100,153 @@ import logging
 
 import supertem
 
-METADATA_VERSION = "v1.0.0"
+# =============================================================================
+# Constants & Versions
+# =============================================================================
 
+METADATA_VERSION = "1.0.0"
 
-SUPPORTED_COORDINATE_SYSTEMS = [
-    "RAW",
-    "SPECIMEN",
-    "STAGE",
-    "Raw",
-    "raw",
-    "specimen",
-    "Specimen",
-    "Stage",
-    "stage",
-]
-
-
-REFERENCE_HFW_WIDE = 2750e-6
-REFERENCE_HFW_LOW = 900e-6
-REFERENCE_HFW_MEDIUM = 400e-6
-REFERENCE_HFW_HIGH = 150e-6
-REFERENCE_HFW_SUPER = 80e-6
-REFERENCE_HFW_ULTRA = 50e-6
-
-REFERENCE_RES_SQUARE = [1024, 1024]
-REFERENCE_RES_LOW = [768, 512]
-REFERENCE_RES_MEDIUM = [1536, 1024]
-REFERENCE_RES_HIGH = [3072, 2048]
-REFERENCE_RES_SUPER = [6144, 4096]
-
-MILL_HFW_THRESHOLD = 0.005  # 0.5% of the image
-
-BASE_PATH = os.path.dirname(
-    supertem.__path__[0]
-)  # TODO: figure out a more stable way to do this
+# Paths
+BASE_PATH = os.path.dirname(supertem.__path__[0])
 CONFIG_PATH = os.path.join(BASE_PATH, "supertem", "config")
+LOG_PATH = os.path.join(BASE_PATH, "supertem", "log")
+DATA_PATH = os.path.join(BASE_PATH, "supertem", "log", "data")
 
+# Sub-paths
 MICROSCOPE_CONFIG_INDEX_PATH = os.path.join(CONFIG_PATH, "microscope-config-index.yaml")
 PROTOCOL_INDEX_PATH = os.path.join(CONFIG_PATH, "protocol-index.yaml")
 MICROSCOPE_CONFIGURATION_PATH = os.path.join(CONFIG_PATH, "microscope-configuration.yaml")
 PROTOCOL_PATH = os.path.join(CONFIG_PATH, "protocol.yaml")
-
-LOG_PATH = os.path.join(BASE_PATH, "supertem", "log")
-DATA_PATH = os.path.join(BASE_PATH, "supertem", "log", "data")
-DATA_ML_PATH: str = os.path.join(BASE_PATH, "supertem", "log", "data", "ml")
-DATA_CC_PATH: str = os.path.join(BASE_PATH, "supertem", "log", "data", "crosscorrelation")
-DATA_TILE_PATH: str = os.path.join(DATA_PATH, "tile")
 POSITION_PATH = os.path.join(CONFIG_PATH, "positions.yaml")
+
+DATA_ML_PATH = os.path.join(DATA_PATH, "ml")
+DATA_CC_PATH = os.path.join(DATA_PATH, "crosscorrelation")
+DATA_TILE_PATH = os.path.join(DATA_PATH, "tile")
 MODELS_PATH = os.path.join(BASE_PATH, "supertem", "segmentation", "models")
-
-
-os.makedirs(LOG_PATH, exist_ok=True)
-os.makedirs(DATA_PATH, exist_ok=True)
-os.makedirs(DATA_ML_PATH, exist_ok=True)
-os.makedirs(DATA_CC_PATH, exist_ok=True)
-os.makedirs(DATA_TILE_PATH, exist_ok=True)
-
 DATABASE_PATH = os.path.join(BASE_PATH, "supertem", "db", "supertem.db")
-os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
 
 
+__DEFAULT_MANUFACTURER__ = "JEOL"
+__DEFAULT_IP_ADDRESS__ = "192.168.0.1"
+
+
+# =============================================================================
+# Default Configurations
+# =============================================================================
+
+# This structure matches supertem.structure.base.MicroscopeSettings
+DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
+    "system": {
+        "info": {
+            "name": "default-configuration",
+            "ip_address": __DEFAULT_IP_ADDRESS__,
+            "manufacturer": __DEFAULT_MANUFACTURER__,
+            "model": "Unknown",
+            "serial_number": "Unknown",
+            "hardware_version": "Unknown",
+            "software_version": "Unknown",
+        },
+        "stage_system": {
+            "enabled": True,
+            "can_x": True, "can_y": True, "can_z": True,
+            "can_r": True, "can_tilt_x": True, "can_tilt_y": False,
+
+            # Limits are required by base.py if axis is enabled
+            "x_limits_nm": [-1000000.0, 1000000.0],
+            "y_limits_nm": [-1000000.0, 1000000.0],
+            "z_limits_nm": [-100000.0, 100000.0],
+            "tilt_x_limits_deg": [-70.0, 70.0],
+            "r_limits_deg": [-360.0, 360.0],
+
+            "max_step_nm": 50000.0,
+            "max_step_angle": 1.0,
+            "settle_time_s": 0.5,
+
+            # Legacy/Custom fields go here (auto-collected into Extras)
+            "rotation_reference": 0.0,
+            "shuttle_pre_tilt": 35.0,
+        },
+        "beam_system": {
+            "enabled": True,
+            "voltage_limits_kv": [60.0, 300.0],
+            "beam_current_limits_na": [0.0, 50.0],
+
+            # Default state for resets
+            "default_beam": {
+                "voltage_kv": 200.0,
+                "beam_current_na": 0.1,
+                "spot_size": 1,
+                "defocus_nm": 0.0,
+            }
+        },
+        "detector_system": {
+            "enabled": True,
+            "available_detectors": ["SimCam"],
+            "default_detector_id": "SimCam",
+
+            # Registry of defaults per camera
+            "defaults_by_id": {
+                "SimCam": {
+                    "exposure_ms": 100.0,
+                    "binning_index": 1,
+                    "frame_integration": 1,
+                    "gain_index": 0,
+                    "roi": None  # Full frame
+                }
+            },
+            # Registry of capabilities per camera
+            "capabilities_by_id": {
+                "SimCam": {
+                    "can_binning": True,
+                    "exposure_ms_min": 0.1,
+                    "exposure_ms_max": 10000.0,
+                    "binning_index_min": 1,
+                    "binning_index_max": 4,
+                }
+            }
+        }
+    },
+    "image": {
+        "file_format": "tiff",
+        "path": os.path.join(DATA_PATH, "{date}", "images"),
+    },
+    "protocol": {
+        "name": "demo",
+        "description": "Default empty protocol",
+        "steps": [],
+    }
+}
+
+DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML = {
+    "configurations": {"default-configuration": {"path": MICROSCOPE_CONFIGURATION_PATH}},
+    "default": "default-configuration",
+}
+
+DEFAULT_PROTOCOL_YAML = {
+    "name": "demo",
+    "description": "Default protocol",
+    "steps": [],
+}
+
+DEFAULT_PROTOCOL_INDEX_YAML = {
+    "protocols": {"default-protocol": {"path": PROTOCOL_PATH}},
+    "default": "default-protocol",
+}
+
+DEFAULT_POSITIONS_YAML = []
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
 
 def load_yaml(fname: str, default=None):
-    """Load YAML from `fname`. Return `default` if missing/invalid/empty."""
     try:
         with open(fname, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         return default if data is None else data
     except (FileNotFoundError, OSError, yaml.YAMLError):
         return default
-
-
-__SUPPORTED_MANUFACTURERS__ = ["JEOL", "Demo"]
-__DEFAULT_MANUFACTURER__ = "JEOL"
-__DEFAULT_IP_ADDRESS__ = "192.168.0.1"
-__SUPPORTED_PLASMA_GASES__ = ["Argon", "Oxygen", "Nitrogen", "Xenon"]
-
-
-DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
-    "info": {
-        "name": "default-configuration",
-        "ip_address": __DEFAULT_IP_ADDRESS__,
-        "manufacturer": __DEFAULT_MANUFACTURER__,
-        "model": "Unknown",
-        "serial_number": "Unknown",
-        "hardware_version": "Unknown",
-        "software_version": "Unknown",
-        # supertem_version is optional (SystemInfo.from_dict has defaults)
-    },
-    "stage": {
-        "rotation_reference": 0.0,
-        "rotation_180": 180.0,
-        "shuttle_pre_tilt": 35.0,
-        "manipulator_height_limit": 0.0,
-        "enabled": True,
-        "rotation": True,
-        "tilt": True,
-    },
-    "beam": {
-        "enabled": True,
-        "eucentric_height": 7.0e-3,
-        "column_tilt": 0.0,
-        "plasma": False,
-        "plasma_gas": None,
-
-        # required by BeamSettings.from_dict (they are indexed, not .get)
-        "voltage": 200000.0,
-        "hfw": 400e-6,
-        "resolution": [1024, 1024],
-        "dwell_time": 1.0,
-
-        # detector settings are optional-ish but safe to include
-        "detector_id": None,
-        "exposure_ms": None,
-        "binning_index": None,
-        "binning_xy": None,
-        "roi": None,
-        "frame_integration": None,
-        "gain_index": None,
-        "offset_index": None,
-        "digital_rotation_deg": None,
-        "capabilities": None,
-        "extra": {},
-    },
-    "image": {
-        "binning": None,
-        "exposure_ms": None,
-        "dwell_us": None,
-        "file_format": "tiff",
-        "path": None,
-        "roi": None,
-    },
-    # protocol can be omitted; MicroscopeSettings.from_dict handles it
-}
-
-DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML: dict = {
-    "configurations": {"default-configuration": {"path": MICROSCOPE_CONFIGURATION_PATH}},
-    "default": "default-configuration",
-}
-
-DEFAULT_PROTOCOL_YAML: dict = {
-    "name": "demo",
-    "description": "Default protocol",
-    "steps": [],
-}
-
-DEFAULT_PROTOCOL_INDEX_YAML: dict = {
-    "protocols": {"default-protocol": {"path": PROTOCOL_PATH}},
-    "default": "default-protocol",
-}
-
-DEFAULT_POSITIONS_YAML = []  # MUST be a list (load_positions iterates a list)
 
 def _safe_makedirs(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -176,7 +266,7 @@ def _write_yaml_if_missing(path: str, data) -> None:
     _atomic_dump_yaml(path, data)
 
 def bootstrap_config_files() -> None:
-    """Ensure required directories + default YAML files exist. Safe to call repeatedly."""
+    """Ensure required directories + default YAML files exist."""
     _safe_makedirs(CONFIG_PATH)
     _safe_makedirs(LOG_PATH)
     _safe_makedirs(DATA_PATH)
@@ -194,12 +284,13 @@ def bootstrap_config_files() -> None:
     _write_yaml_if_missing(MICROSCOPE_CONFIG_INDEX_PATH, DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML)
     _write_yaml_if_missing(PROTOCOL_INDEX_PATH, DEFAULT_PROTOCOL_INDEX_YAML)
 
+# Initialize on import
 bootstrap_config_files()
 
-# changed naming user configurations to microscope config index -> move to supertem.db eventually
-# --------------------------------------------------------------------
-# Load microscope config index (registry)
-# --------------------------------------------------------------------
+
+# =============================================================================
+# Registry Logic (Microscope Configs)
+# =============================================================================
 
 MICROSCOPE_CONFIG_INDEX_YAML = load_yaml(MICROSCOPE_CONFIG_INDEX_PATH, DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML)
 if not isinstance(MICROSCOPE_CONFIG_INDEX_YAML, dict):
@@ -207,12 +298,10 @@ if not isinstance(MICROSCOPE_CONFIG_INDEX_YAML, dict):
 
 MICROSCOPE_CONFIG_INDEX_YAML.setdefault("configurations", {})
 MICROSCOPE_CONFIG_INDEX_YAML.setdefault("default", "default-configuration")
-if not isinstance(MICROSCOPE_CONFIG_INDEX_YAML["configurations"], dict):
-    MICROSCOPE_CONFIG_INDEX_YAML["configurations"] = {}
-
 MICROSCOPE_CONFIG_INDEX = MICROSCOPE_CONFIG_INDEX_YAML["configurations"]
 DEFAULT_CONFIGURATION_NAME = MICROSCOPE_CONFIG_INDEX_YAML["default"]
 
+# Ensure default exists
 MICROSCOPE_CONFIG_INDEX.setdefault("default-configuration", {"path": MICROSCOPE_CONFIGURATION_PATH})
 if DEFAULT_CONFIGURATION_NAME not in MICROSCOPE_CONFIG_INDEX:
     DEFAULT_CONFIGURATION_NAME = "default-configuration"
@@ -221,6 +310,7 @@ if DEFAULT_CONFIGURATION_NAME not in MICROSCOPE_CONFIG_INDEX:
 DEFAULT_CONFIGURATION_PATH = MICROSCOPE_CONFIG_INDEX[DEFAULT_CONFIGURATION_NAME].get("path") or MICROSCOPE_CONFIGURATION_PATH
 
 if not os.path.exists(DEFAULT_CONFIGURATION_PATH):
+    # Fallback if the file pointed to by default doesn't exist
     DEFAULT_CONFIGURATION_NAME = "default-configuration"
     MICROSCOPE_CONFIG_INDEX_YAML["default"] = DEFAULT_CONFIGURATION_NAME
     MICROSCOPE_CONFIG_INDEX[DEFAULT_CONFIGURATION_NAME]["path"] = MICROSCOPE_CONFIGURATION_PATH
@@ -228,12 +318,11 @@ if not os.path.exists(DEFAULT_CONFIGURATION_PATH):
 
 _atomic_dump_yaml(MICROSCOPE_CONFIG_INDEX_PATH, MICROSCOPE_CONFIG_INDEX_YAML)
 logging.info("Default configuration: %s", DEFAULT_CONFIGURATION_NAME)
-logging.info("Default configuration path: %s", DEFAULT_CONFIGURATION_PATH)
 
 
-# --------------------------------------------------------------------
-# Load protocol index (registry)
-# --------------------------------------------------------------------
+# =============================================================================
+# Registry Logic (Protocols)
+# =============================================================================
 
 PROTOCOL_INDEX_YAML = load_yaml(PROTOCOL_INDEX_PATH, DEFAULT_PROTOCOL_INDEX_YAML)
 if not isinstance(PROTOCOL_INDEX_YAML, dict):
@@ -241,9 +330,6 @@ if not isinstance(PROTOCOL_INDEX_YAML, dict):
 
 PROTOCOL_INDEX_YAML.setdefault("protocols", {})
 PROTOCOL_INDEX_YAML.setdefault("default", "default-protocol")
-if not isinstance(PROTOCOL_INDEX_YAML["protocols"], dict):
-    PROTOCOL_INDEX_YAML["protocols"] = {}
-
 PROTOCOL_INDEX = PROTOCOL_INDEX_YAML["protocols"]
 DEFAULT_PROTOCOL_NAME = PROTOCOL_INDEX_YAML["default"]
 
@@ -262,12 +348,11 @@ if not os.path.exists(DEFAULT_PROTOCOL_PATH):
 
 _atomic_dump_yaml(PROTOCOL_INDEX_PATH, PROTOCOL_INDEX_YAML)
 logging.info("Default protocol: %s", DEFAULT_PROTOCOL_NAME)
-logging.info("Default protocol path: %s", DEFAULT_PROTOCOL_PATH)
 
 
-# --------------------------------------------------------------------
-# Helper functions: microscope configs
-# --------------------------------------------------------------------
+# =============================================================================
+# Accessors
+# =============================================================================
 
 def list_microscope_configs():
     return sorted(MICROSCOPE_CONFIG_INDEX.keys())
@@ -292,7 +377,6 @@ def remove_microscope_config(config_name: str):
     del MICROSCOPE_CONFIG_INDEX[config_name]
     MICROSCOPE_CONFIG_INDEX_YAML["configurations"] = MICROSCOPE_CONFIG_INDEX
 
-    # If you removed the default, fall back to a known-safe default
     if MICROSCOPE_CONFIG_INDEX_YAML.get("default") == config_name:
         MICROSCOPE_CONFIG_INDEX_YAML["default"] = "default-configuration"
         MICROSCOPE_CONFIG_INDEX.setdefault("default-configuration", {"path": MICROSCOPE_CONFIGURATION_PATH})
@@ -310,10 +394,6 @@ def set_default_microscope_config(config_name: str):
     DEFAULT_CONFIGURATION_PATH = MICROSCOPE_CONFIG_INDEX[config_name]["path"]
     _atomic_dump_yaml(MICROSCOPE_CONFIG_INDEX_PATH, MICROSCOPE_CONFIG_INDEX_YAML)
 
-
-# --------------------------------------------------------------------
-# Helper functions: protocols
-# --------------------------------------------------------------------
 
 def list_protocols():
     return sorted(PROTOCOL_INDEX.keys())
@@ -337,7 +417,6 @@ def remove_protocol(protocol_name: str):
     del PROTOCOL_INDEX[protocol_name]
     PROTOCOL_INDEX_YAML["protocols"] = PROTOCOL_INDEX
 
-    # If you removed the default, fall back to a known-safe default
     if PROTOCOL_INDEX_YAML.get("default") == protocol_name:
         PROTOCOL_INDEX_YAML["default"] = "default-protocol"
         PROTOCOL_INDEX.setdefault("default-protocol", {"path": PROTOCOL_PATH})
