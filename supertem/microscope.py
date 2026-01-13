@@ -821,7 +821,7 @@ class TemMicroscope(ABC):
     def acquire_image(self, request: AcquisitionRequest) -> MicroscopeImage:
         """
         Atomic: Execute Acquisition Cycle.
-        1. Configure hardware (if request.settings provided).
+        1. Configure hardware (if request.detector / request.image provided).
         2. Expose sensor.
         3. Readout and return data.
         """
