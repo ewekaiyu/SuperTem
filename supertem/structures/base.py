@@ -348,6 +348,73 @@ command to change the microscope's state.
          microscope.stage.move(req)
 
 ===============================================================================
+IX. Architecture Overview (The "Noun-Verb" Topology)
+===============================================================================
+
+The module implements a strict Command-Query Separation (CQS) architecture.
+Interaction with the microscope is divided into "Nouns" (Data) and "Verbs" (Intents).
+
+1. The Data Plane (Nouns)
+   - State Objects: Telemetry snapshots (e.g. `MicroscopeState`, `BeamState`).
+   - Settings Objects: Configuration payloads (e.g. `BeamSettings`, `ScanSettings`).
+   - System Settings: Hardware capabilities & limits (e.g. `ScanSystemSettings`).
+
+2. The Control Plane (Verbs)
+   - Request Objects: Executable commands that wrap Settings with an intent.
+   - Naming Convention: `*ControlRequest` for hardware state management,
+     `*MoveRequest` for coordinate navigation, and `AcquisitionRequest` for data.
+
+3. Component Map
+   -----------------------------------------------------------------------
+   Subsystem   | Configuration (Noun)   | Execution (Verb)
+   -----------------------------------------------------------------------
+   Stage       | StagePosition          | StageMoveRequest (Navigation)
+               |                        | StageControlRequest (Stop/Home)
+   -----------------------------------------------------------------------
+   Beam        | BeamSettings           | BeamControlRequest
+   -----------------------------------------------------------------------
+   Scan (STEM) | ScanSettings           | ScanControlRequest
+   -----------------------------------------------------------------------
+   Detector    | DetectorSettings       | AcquisitionRequest (Capture)
+               |                        | DetectorControlRequest (Mech)
+   -----------------------------------------------------------------------
+   Vacuum      | VacuumSettings         | VacuumControlRequest
+   -----------------------------------------------------------------------
+   Aperture    | Aperture               | ApertureControlRequest
+   -----------------------------------------------------------------------
+
+===============================================================================
+X. Data Organization (The Hierarchy)
+===============================================================================
+
+The data plane is organized into two primary trees: Configuration (Static/Limits)
+and Telemetry (Dynamic/Snapshot).
+
+1. Configuration Tree (`MicroscopeSettings`)
+   Defines how the machine *should* behave and what it is *capable* of.
+
+   MicroscopeSettings
+   ├── system: SystemSettings
+   │   ├── stage_system: StageSystemSettings (Travel limits, Max speeds)
+   │   ├── beam_system: BeamSystemSettings (Voltage limits, Safety checks)
+   │   ├── scan_system: ScanSystemSettings (Dwell time limits, Scan modes)
+   │   ├── detector_system: DetectorSystemSettings (Registry of cameras)
+   │   └── info: SystemInfo (Static hardware IDs, IP addresses)
+   ├── image: ImageOutputSettings (File formats, Save paths)
+   └── protocol: Dict (User-defined automation scripts)
+
+2. Telemetry Tree (`MicroscopeState`)
+   Defines what the machine is *currently doing*. Used for logs and metadata.
+
+   MicroscopeState
+   ├── stage_position: StagePosition (x, y, z, tilt)
+   ├── beam: BeamState (Voltage, current, optical_mode)
+   ├── scan: ScanSettings (Active scan parameters)
+   ├── vacuum: VacuumSettings (Valve states, pressures)
+   ├── apertures: Dict[str, Aperture] (State of all inserted apertures)
+   └── detectors: Dict[str, DetectorState] (State of all active cameras)
+
+===============================================================================
 Rationale
 ===============================================================================
 
