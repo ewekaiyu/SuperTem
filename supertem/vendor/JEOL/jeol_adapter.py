@@ -43,11 +43,12 @@ def _jeol_roi_to_struct(x: Any) -> Optional[ROI]:
     """Convert JEOL 'ImagingArea' dict to ROI object."""
     if not isinstance(x, dict):
         return None
+    # Robust casing check: X vs x, Width vs width
     return ROI(
-        x=int(x.get("X", 0)),
-        y=int(x.get("Y", 0)),
-        width=int(x.get("Width", 512)),
-        height=int(x.get("Height", 512)),
+        x=int(x.get("X", x.get("x", 0))),
+        y=int(x.get("Y", x.get("y", 0))),
+        width=int(x.get("Width", x.get("width", 512))),
+        height=int(x.get("Height", x.get("height", 512))),
     )
 
 def _struct_to_jeol_roi(roi: Optional[ROI]) -> Optional[Dict[str, int]]:
@@ -73,30 +74,36 @@ def _jeol_bin_to_tuple(x: Any) -> Optional[Tuple[int, int]]:
 
 def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tuple[DetectorSettings, DetectorCapabilities]:
     """
-    Splits a single PyJEM detector configuration dictionary into Settings and Capabilities.
-    Unmapped keys are sorted into extras.vendor for the appropriate object.
+    Parses dictionary from Detector.get_detectorsetting().
     """
-    # Work on a copy to consume keys
     p = copy.deepcopy(payload)
 
-    # --- 1. Extract Settings Fields ---
-    # We pop keys that map directly to DetectorSettings
-    roi_data = p.pop("ImagingArea", None)
-    bin_size_data = p.pop("BinningSize", None)
+    # 1. Robust Key Extraction (Handles PascalCase and camelCase variations)
+    def _pop_any(keys, default=None):
+        for k in keys:
+            if k in p: return p.pop(k)
+        return default
+
+    # Extract Settings
+    roi_data = _pop_any(["ImagingArea", "imagingArea"])
+    bin_size_data = _pop_any(["BinningSize", "binningSize"])
+
+    # Exposure key is notoriously inconsistent across versions
+    exp_val = _pop_any(["ExposureTimeValue", "Exposure", "ExposureTime", "exposureTime"], 0.0)
 
     settings_kwargs = {
         "detector_id": detector_id,
-        "binning_index": p.pop("BinningIndex", None),
-        "frame_integration": p.pop("frameIntegration", None),
-        "gain_index": p.pop("GainIndex", None),
-        "offset_index": p.pop("OffsetIndex", None),
-        "exposure": Q_(float(p.pop("ExposureTimeValue", 0.0)), Units.MS),
+        "binning_index": _pop_any(["BinningIndex", "binningIndex"]),
+        "frame_integration": _pop_any(["frameIntegration", "AccumulationCount", "accumulationCount"]),
+        "gain_index": _pop_any(["GainIndex", "gainIndex"]),
+        "offset_index": _pop_any(["OffsetIndex", "offsetIndex"]),
+        "exposure": Q_(float(exp_val), Units.MS), # Assuming MS based on typical PyJEM
         "_mode": "lenient"
     }
 
-    # Optional fields
-    if "DigitalRotation" in p:
-        settings_kwargs["digital_rotation"] = Q_(float(p.pop("DigitalRotation")), Units.DEG)
+    rot_val = _pop_any(["DigitalRotation", "RotationAngle"])
+    if rot_val is not None:
+        settings_kwargs["digital_rotation"] = Q_(float(rot_val), Units.DEG)
 
     if roi_data:
         settings_kwargs["roi"] = _jeol_roi_to_struct(roi_data)
@@ -104,37 +111,31 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
     if bin_size_data:
         settings_kwargs["binning_xy"] = _jeol_bin_to_tuple(bin_size_data)
 
-    # Remove redundant setting representations we don't need in 'vendor' extras
-    p.pop("ExposureTimeIndex", None)
-    p.pop("ExposureTimeString", None)
+    # Cleanup redundant keys often returned by hardware
+    _pop_any(["ExposureTimeIndex", "ExposureTimeString"])
 
-    # --- 2. Extract Capability Fields ---
-    # We pop keys that map directly to DetectorCapabilities
+    # Extract Capabilities
     caps_kwargs = {
-        "can_binning": bool(p.pop("CanBinning", False)),
-        "binning_index_min": p.pop("BinningIndexMinimum", None),
-        "binning_index_max": p.pop("BinningIndexMaximum", None),
+        "can_binning": bool(_pop_any(["CanBinning", "canBinning"], False)),
+        "binning_index_min": _pop_any(["BinningIndexMinimum"]),
+        "binning_index_max": _pop_any(["BinningIndexMaximum"]),
 
-        "can_gain": bool(p.pop("CanGain", False)),
-        "gain_index_min": p.pop("GainIndexMinimum", None),
-        "gain_index_max": p.pop("GainIndexMaximum", None),
+        "can_gain": bool(_pop_any(["CanGain", "canGain"], False)),
+        "gain_index_min": _pop_any(["GainIndexMinimum"]),
+        "gain_index_max": _pop_any(["GainIndexMaximum"]),
 
-        "can_offset": bool(p.pop("CanOffset", False)),
-        "offset_index_min": p.pop("OffsetIndexMinimum", None),
-        "offset_index_max": p.pop("OffsetIndexMaximum", None),
+        "can_offset": bool(_pop_any(["CanOffset", "canOffset"], False)),
+        "offset_index_min": _pop_any(["OffsetIndexMinimum"]),
+        "offset_index_max": _pop_any(["OffsetIndexMaximum"]),
 
         "_mode": "lenient"
     }
 
-    # Handle ROI Max
-    roi_max_dict = p.pop("ImagingAreaMaximum", {})
+    roi_max_dict = _pop_any(["ImagingAreaMaximum", "imagingAreaMaximum"], {})
     if roi_max_dict:
         caps_kwargs["roi_size_max"] = (int(roi_max_dict.get("Width", 0)), int(roi_max_dict.get("Height", 0)))
 
-    # --- 3. Handle Extras ---
-    # The remaining keys in `p` are unknown vendor-specific flags.
-    # We heuristically split them: static "Max/Min" props go to Caps, others to Settings.
-
+    # Pack leftovers into Extras
     caps_extra_dict = {}
     settings_extra_dict = {}
 
@@ -144,7 +145,6 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
         else:
             settings_extra_dict[k] = v
 
-    # Construct Objects
     settings = DetectorSettings(**settings_kwargs)
     if settings_extra_dict:
         settings.extra = _pack_vendor_extras(settings_extra_dict)
@@ -158,8 +158,7 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
 
 def to_jeol_detector_config(settings: DetectorSettings) -> Dict[str, Any]:
     """
-    Convert DetectorSettings back into a PyJEM-compatible dictionary.
-    Includes any vendor-specific keys preserved in settings.extra.vendor.
+    Convert to dict for Detector.set_detectorsetting().
     """
     out = {}
 
@@ -243,35 +242,26 @@ def to_jeol_stage_args(pos: StagePosition) -> Dict[str, float]:
 def from_jeol_vacuum_stats(
     p_values: List[float],
     valve_status_flags: Optional[Dict[str, int]] = None,
-    raw_status_array: Optional[List[int]] = None
 ) -> VacuumSettings:
     """
-    Convert raw vacuum readings to VacuumSettings.
+    Maps P1-P5 from vacuum3.py to semantic pressure fields.
     """
-    # Pad list if short
     p = list(p_values) + [0.0] * (5 - len(p_values))
 
-    # Map Valves
     valves_mapped = {}
     if valve_status_flags:
         for k, v in valve_status_flags.items():
             valves_mapped[k] = "OPEN" if v == 1 else "CLOSED"
 
-    # Store raw inputs in vendor extras
-    vendor_data = {
-        "raw_pressures_pascals": p_values,
-        "raw_valve_flags": valve_status_flags,
-    }
-    if raw_status_array:
-        vendor_data["raw_status_array"] = raw_status_array
-
     return VacuumSettings(
-        gun_pressure=Q_(p[0], Units.PA),
-        column_pressure=Q_(p[1], Units.PA),
-        chamber_pressure=Q_(p[2], Units.PA),
-        camera_chamber_pressure=Q_(p[3], Units.PA),
+        gun_pressure=Q_(p[0], Units.PA),      # P1
+        column_pressure=Q_(p[1], Units.PA),   # P2
+        chamber_pressure=Q_(p[2], Units.PA),  # P3
+        extra=_pack_vendor_extras({
+            "raw_pressures_P1_to_P5": p_values,
+            "raw_valves": valve_status_flags
+        }),
         valves=valves_mapped,
-        extra=_pack_vendor_extras(vendor_data),
         _mode="lenient"
     )
 
@@ -281,23 +271,27 @@ def from_jeol_vacuum_stats(
 # =============================================================================
 
 def from_jeol_beam_stats(
-    voltage_v: float,
+    voltage_val: float,
     current_ua: float,
     spot_size_idx: int,
     alpha_idx: int,
     beam_shift_dac: Optional[Tuple[int, int]] = None,
     raw_flags: Optional[Dict[str, Any]] = None
 ) -> BeamSettings:
-    """
-    Consolidate atomic beam stats into BeamSettings.
-    """
+
+    # Heuristic: PyJEM might return V or kV.
+    # Offline ht3.py typically suggests V, but safe to check magnitude.
+    if voltage_val > 5000:
+        v_qty = Q_(voltage_val, "V").to(Units.KV)
+    else:
+        v_qty = Q_(voltage_val, Units.KV)
+
     shift_pt = None
     if beam_shift_dac:
         shift_pt = Point(x=float(beam_shift_dac[0]), y=float(beam_shift_dac[1]))
 
-    # Capture raw DACs and indices in extras
     vendor_data = {
-        "raw_voltage_v": voltage_v,
+        "raw_voltage": voltage_val,
         "raw_current_ua": current_ua,
         "spot_size_index": spot_size_idx,
         "alpha_index": alpha_idx,
@@ -307,8 +301,8 @@ def from_jeol_beam_stats(
         vendor_data.update(raw_flags)
 
     return BeamSettings(
-        beam_on=True, # Inferred, or passed in raw_flags
-        voltage=Q_(voltage_v, Units.V).to(Units.KV),
+        beam_on=True,
+        voltage=v_qty,
         current=Q_(current_ua, Units.UA).to(Units.NA),
         spot_size_index=spot_size_idx,
         convergence_angle_index=alpha_idx,
@@ -328,7 +322,8 @@ def from_jeol_scan_stats(
     scan_mode_int: Optional[int] = None
 ) -> ScanSettings:
     """
-    Convert Scan3 return values to ScanSettings.
+    Adapter for scan3.py.
+    Scan3 only provides Rotation, MagCorrection, and Mode.
     """
     vendor_data = {}
     if mag_correction:
@@ -338,7 +333,11 @@ def from_jeol_scan_stats(
 
     return ScanSettings(
         rotation=Q_(rotation_deg, Units.DEG),
-        active=False,
+        scan_mode=str(scan_mode_int) if scan_mode_int is not None else None,
+        # Fields not available in scan3.py:
+        width_px=None,
+        height_px=None,
+        pixel_dwell_time=None,
         extra=_pack_vendor_extras(vendor_data) if vendor_data else None,
         _mode="lenient"
     )
@@ -357,7 +356,6 @@ def from_jeol_aperture(
     Combine separate JEOL calls (GetExpSize, GetPosition) into an Aperture object.
     """
     is_inserted = (size_index > 0)
-
     point = None
     if pos_xy and len(pos_xy) >= 2:
         point = Point(x=float(pos_xy[0]), y=float(pos_xy[1]))
