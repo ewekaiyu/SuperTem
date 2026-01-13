@@ -2981,60 +2981,6 @@ class MicroscopeSettings:
 # =============================================================================
 
 @dataclass
-class AcquisitionRequest:
-    """
-    High-level intent to capture an image using a specific detector and settings.
-
-    Role:     Intent (User Request)
-    Context:  Control-plane
-    Category: B / D (Structure / Intent)
-
-    Attributes:
-        detector_id (Optional[str]): Targeted hardware device for capture.
-            None Behavior: Preserved as None; syncs with inner DetectorSettings.
-        detector (Optional[DetectorSettings]): Detailed camera parameters.
-            None Behavior: Structural Default (Empty DetectorSettings).
-        image (Optional[ImageOutputSettings]): Specific overrides for saving this image.
-            None Behavior: Structural Default (Empty ImageOutputSettings).
-    """
-    detector_id: Optional[str] = None
-    detector: Optional[DetectorSettings] = None
-    image: Optional[ImageOutputSettings] = None
-    extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
-
-    def __post_init__(self):
-        p = FieldParser(self, self._mode, "AcquisitionRequest")
-        self.detector_id = p.id(self.detector_id, "detector_id")
-        self.detector = p.model(DetectorSettings, self.detector, "detector", default=DetectorSettings(_mode=p.mode))
-        self.image = p.model(ImageOutputSettings, self.image, "image", default=ImageOutputSettings(_mode=p.mode))
-        # Sync Logic
-        if self.detector_id is None and self.detector.detector_id is not None:
-            self.detector_id = self.detector.detector_id
-        elif self.detector.detector_id is None and self.detector_id is not None:
-            self.detector.detector_id = self.detector_id
-
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        v = Validator(self, mode)
-        v.check(bool(self.detector_id), "detector_id", "detector_id is required")
-        v.check_nested(self.detector)
-        v.check_nested(self.image)
-
-        # Cross-field consistency
-        if self.detector.detector_id and self.detector_id and self.detector.detector_id != self.detector_id:
-            v.check(False, "id_mismatch",
-                    f"Ambiguous IDs: outer={self.detector_id}, inner={self.detector.detector_id}",
-                    heal=lambda: setattr(self.detector, 'detector_id', self.detector_id))
-        return v.valid
-
-    def to_dict(self) -> dict:
-        return _auto_to_dict(self)
-
-    @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
-        return _auto_from_dict(AcquisitionRequest, d, mode)
-
-@dataclass
 class StageMoveRequest:
     """
     A specific command to move the sample stage.
@@ -3086,6 +3032,254 @@ class StageMoveRequest:
         return _auto_from_dict(StageMoveRequest, d, mode, alias_map={
             "settle_time": "settle_time_s"
         })
+
+
+@dataclass
+class StageControlRequest:
+    """
+    Command to alter the operational state of the stage motors (Stop, Home, Reset).
+    distinct from moving to a coordinate.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        action: The command to execute ("STOP", "ABORT", "HOME", "RESET_ERROR").
+        axes: Optional list of axes to apply the action to (e.g. ["x", "y"]).
+              If None, applies to ALL axes.
+    """
+    action: Optional[str] = None
+    axes: Optional[List[str]] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "StageControlRequest")
+        self.action = p.str(self.action, "action")
+        self.axes = p.list_str(self.axes, "axes")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+
+        # 1. Action is mandatory
+        valid_actions = {"STOP", "ABORT", "HOME", "RESET_ERROR", "ZERO_ENCODERS"}
+        v.check(self.action in valid_actions, "action",
+                f"Action must be one of {valid_actions}")
+
+        # 2. Axes validation (if provided)
+        if self.axes:
+            valid_axes = {"x", "y", "z", "r", "tilt_x", "tilt_y"}
+            for axis in self.axes:
+                v.check(axis in valid_axes, f"axes.{axis}", f"Invalid axis '{axis}'")
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageControlRequest":
+        return _auto_from_dict(StageControlRequest, d, mode)
+
+
+@dataclass
+class DetectorControlRequest:
+    """
+    Command to configure detector parameters or change mechanical state
+    WITHOUT triggering an image acquisition.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        detector_id: The specific device to target.
+        settings: Configuration to apply (e.g., binning, temperature, readout mode).
+        action: Mechanical command ("INSERT", "RETRACT", "COOLDOWN", "WARMUP").
+    """
+    detector_id: Optional[str] = None
+    settings: Optional[DetectorSettings] = None
+    action: Optional[str] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "DetectorControlRequest")
+        self.detector_id = p.id(self.detector_id, "detector_id")
+        self.settings = p.model(DetectorSettings, self.settings, "settings", default=DetectorSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
+
+        # Sync: If settings has an ID but request doesn't, bubble it up
+        if self.settings.detector_id and not self.detector_id:
+            self.detector_id = self.settings.detector_id
+        # Sync: If request has ID, push it down to settings for consistency
+        elif self.detector_id and not self.settings.detector_id:
+            self.settings.detector_id = self.detector_id
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check(bool(self.detector_id), "detector_id", "detector_id is required")
+        v.check_nested(self.settings)
+
+        # Logic Check: Ensure we are doing *something*
+        # 1. Check if settings has any non-None fields (Intent)
+        has_settings_intent = False
+        for f in dataclasses.fields(self.settings):
+            # Ignore internal fields and the ID itself (which is just identity, not a change)
+            if f.name not in ["extra", "_mode", "detector_id"] and getattr(self.settings, f.name) is not None:
+                has_settings_intent = True
+                break
+
+        # 2. Check if action is present
+        has_action = self.action is not None
+
+        v.check(has_settings_intent or has_action, "empty_intent",
+                "Request must have either settings to apply or an action to execute")
+
+        if self.action:
+            valid_actions = {"INSERT", "RETRACT", "COOLDOWN", "WARMUP", "RESET"}
+            v.check(self.action in valid_actions, "action",
+                    f"Action must be one of {valid_actions}")
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorControlRequest":
+        return _auto_from_dict(DetectorControlRequest, d, mode)
+
+
+
+@dataclass
+class BeamControlRequest:
+    """
+    Command to change optical parameters (Voltage, Mode, Spot Size).
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+    """
+    target: Optional[BeamSettings] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "BeamControlRequest")
+        self.target = p.model(BeamSettings, self.target, "target", default=BeamSettings(_mode=p.mode))
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check_nested(self.target)
+
+        # Check for empty intent
+        # (We iterate fields to ensure the user is actually asking for a change)
+        has_intent = False
+        for f in dataclasses.fields(self.target):
+            if f.name not in ["extra", "_mode"] and getattr(self.target, f.name) is not None:
+                has_intent = True
+                break
+
+        v.check(has_intent, "empty_target", "Beam request has no parameters set")
+
+        # Specific Logic: If changing Optical Mode, ensure necessary params are present
+        if self.target.optical_mode == "DIFFRACTION":
+            v.check(self.target.camera_length is not None, "missing_cam_len",
+                    "Switching to Diffraction requires a camera_length")
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamControlRequest":
+        return _auto_from_dict(BeamControlRequest, d, mode)
+
+
+@dataclass
+class ScanControlRequest:
+    """
+    Command to control the STEM raster engine state.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        action: "START", "STOP", or "SINGLE_FRAME"
+        settings: The scan parameters (dwell time, rotation) to apply.
+    """
+    action: Optional[str] = None  # "START", "STOP", "SINGLE_FRAME"
+    settings: Optional[ScanSettings] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        # Renamed from ScanRequest to ScanControlRequest
+        p = FieldParser(self, self._mode, "ScanControlRequest")
+        self.action = p.str(self.action, "action")
+        self.settings = p.model(ScanSettings, self.settings, "settings", default=ScanSettings(_mode=p.mode))
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        # 1. Action is mandatory
+        v.check(self.action in {"START", "STOP", "SINGLE_FRAME"}, "action",
+                "Action must be START, STOP, or SINGLE_FRAME")
+
+        # 2. Settings required if Starting
+        if self.action in {"START", "SINGLE_FRAME"}:
+            v.check_nested(self.settings)
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ScanControlRequest":
+        return _auto_from_dict(ScanControlRequest, d, mode)
+
+
+@dataclass
+class VacuumControlRequest:
+    """
+    Command to change the state of valves or pumps.
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+    """
+    target: Optional[VacuumSettings] = None
+    force: Optional[bool] = None  # If True, bypasses some software soft-checks (use with caution)
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "VacuumControlRequest")
+        self.target = p.model(VacuumSettings, self.target, "target", default=VacuumSettings(_mode=p.mode))
+        self.force = p.bool(self.force, "force", default=False)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check_nested(self.target)
+
+        # Ensure at least one valve/pump state is being requested
+        has_intent = (self.target.column_valve_state is not None or
+                      self.target.gun_valve_state is not None or
+                      self.target.turbo_pump_state is not None)
+
+        v.check(has_intent, "empty_target", "Request must specify at least one state change")
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "VacuumControlRequest":
+        return _auto_from_dict(VacuumControlRequest, d, mode)
 
 @dataclass
 class ApertureControlRequest:
@@ -3153,128 +3347,56 @@ class ApertureControlRequest:
 
 
 @dataclass
-class BeamControlRequest:
+class AcquisitionRequest:
     """
-    Command to change optical parameters (Voltage, Mode, Spot Size).
+    High-level intent to capture an image using a specific detector and settings.
 
     Role:     Intent (User Request)
     Context:  Control-plane
-    Category: D (Intent)
-    """
-    target: Optional[BeamSettings] = None
-    extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
-
-    def __post_init__(self):
-        p = FieldParser(self, self._mode, "BeamControlRequest")
-        self.target = p.model(BeamSettings, self.target, "target", default=BeamSettings(_mode=p.mode))
-
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        v = Validator(self, mode)
-        v.check_nested(self.target)
-
-        # Check for empty intent
-        # (We iterate fields to ensure the user is actually asking for a change)
-        has_intent = False
-        for f in dataclasses.fields(self.target):
-            if f.name not in ["extra", "_mode"] and getattr(self.target, f.name) is not None:
-                has_intent = True
-                break
-
-        v.check(has_intent, "empty_target", "Beam request has no parameters set")
-
-        # Specific Logic: If changing Optical Mode, ensure necessary params are present
-        if self.target.optical_mode == "DIFFRACTION":
-            v.check(self.target.camera_length is not None, "missing_cam_len",
-                    "Switching to Diffraction requires a camera_length")
-
-        return v.valid
-
-    def to_dict(self) -> dict:
-        return _auto_to_dict(self)
-
-    @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamControlRequest":
-        return _auto_from_dict(BeamControlRequest, d, mode)
-
-@dataclass
-class ScanRequest:
-    """
-    Command to control the STEM raster engine.
-
-    Role:     Intent (User Request)
-    Context:  Control-plane
-    Category: D (Intent)
+    Category: B / D (Structure / Intent)
 
     Attributes:
-        action: "START", "STOP", or "SINGLE_FRAME"
-        settings: The scan parameters (dwell time, rotation) to apply.
+        detector_id (Optional[str]): Targeted hardware device for capture.
+            None Behavior: Preserved as None; syncs with inner DetectorSettings.
+        detector (Optional[DetectorSettings]): Detailed camera parameters.
+            None Behavior: Structural Default (Empty DetectorSettings).
+        image (Optional[ImageOutputSettings]): Specific overrides for saving this image.
+            None Behavior: Structural Default (Empty ImageOutputSettings).
     """
-    action: Optional[str] = None  # "START", "STOP", "SINGLE_FRAME"
-    settings: Optional[ScanSettings] = None
+    detector_id: Optional[str] = None
+    detector: Optional[DetectorSettings] = None
+    image: Optional[ImageOutputSettings] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ScanRequest")
-        self.action = p.str(self.action, "action")
-        self.settings = p.model(ScanSettings, self.settings, "settings", default=ScanSettings(_mode=p.mode))
+        p = FieldParser(self, self._mode, "AcquisitionRequest")
+        self.detector_id = p.id(self.detector_id, "detector_id")
+        self.detector = p.model(DetectorSettings, self.detector, "detector", default=DetectorSettings(_mode=p.mode))
+        self.image = p.model(ImageOutputSettings, self.image, "image", default=ImageOutputSettings(_mode=p.mode))
+        # Sync Logic
+        if self.detector_id is None and self.detector.detector_id is not None:
+            self.detector_id = self.detector.detector_id
+        elif self.detector.detector_id is None and self.detector_id is not None:
+            self.detector.detector_id = self.detector_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        # 1. Action is mandatory
-        v.check(self.action in {"START", "STOP", "SINGLE_FRAME"}, "action",
-                "Action must be START, STOP, or SINGLE_FRAME")
+        v.check(bool(self.detector_id), "detector_id", "detector_id is required")
+        v.check_nested(self.detector)
+        v.check_nested(self.image)
 
-        # 2. Settings required if Starting
-        if self.action in {"START", "SINGLE_FRAME"}:
-            v.check_nested(self.settings)
-
+        # Cross-field consistency
+        if self.detector.detector_id and self.detector_id and self.detector.detector_id != self.detector_id:
+            v.check(False, "id_mismatch",
+                    f"Ambiguous IDs: outer={self.detector_id}, inner={self.detector.detector_id}",
+                    heal=lambda: setattr(self.detector, 'detector_id', self.detector_id))
         return v.valid
 
     def to_dict(self) -> dict:
         return _auto_to_dict(self)
 
     @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ScanRequest":
-        return _auto_from_dict(ScanRequest, d, mode)
-
-
-@dataclass
-class VacuumControlRequest:
-    """
-    Command to change the state of valves or pumps.
-
-    Role:     Intent (User Request)
-    Context:  Control-plane
-    Category: D (Intent)
-    """
-    target: Optional[VacuumSettings] = None
-    force: Optional[bool] = None  # If True, bypasses some software soft-checks (use with caution)
-    extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
-
-    def __post_init__(self):
-        p = FieldParser(self, self._mode, "VacuumControlRequest")
-        self.target = p.model(VacuumSettings, self.target, "target", default=VacuumSettings(_mode=p.mode))
-        self.force = p.bool(self.force, "force", default=False)
-
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        v = Validator(self, mode)
-        v.check_nested(self.target)
-
-        # Ensure at least one valve/pump state is being requested
-        has_intent = (self.target.column_valve_state is not None or
-                      self.target.gun_valve_state is not None or
-                      self.target.turbo_pump_state is not None)
-
-        v.check(has_intent, "empty_target", "Request must specify at least one state change")
-        return v.valid
-
-    def to_dict(self) -> dict:
-        return _auto_to_dict(self)
-
-    @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "VacuumControlRequest":
-        return _auto_from_dict(VacuumControlRequest, d, mode)
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "AcquisitionRequest":
+        return _auto_from_dict(AcquisitionRequest, d, mode)
 
