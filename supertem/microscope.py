@@ -1,46 +1,95 @@
 """
 supertem.microscope
 
-Abstract Base Class (ABC) for Transmission Electron Microscope (TEM) control.
+The Hardware Abstraction Layer (HAL) and Control Plane Orchestrator.
 
-Architecture & Usage Patterns:
-==============================
+This module defines the abstract interface (`TemMicroscope`) that all vendor
+drivers (e.g., JEOL, Thermo, Simulated) must implement. It acts as the
+operational "Verb" layer corresponding to the "Noun" structures defined in
+`supertem.structures.base`.
 
-1. THE ATOMIC LAYER (Abstract Methods)
-   - Role: Direct Hardware Access.
-   - Implementation: Must be implemented by the vendor driver (JEOL, Thermo, etc.).
-   - Signature: Simple types (int, bool) or strictly typed Quantities.
-   - Example: `set_spot_size(1)`, `set_defocus(Q_(100, 'nm'))`.
+===============================================================================
+I. The Three-Layer Architecture
+===============================================================================
 
-2. THE HELPER LAYER (Concrete Methods)
-   - Role: Partial Updates & Batch Application.
-   - Implementation: Provided here (do not override).
-   - Signature: Takes a Settings object (e.g., `BeamSettings`).
-   - Function: Iterates through the settings object; if a field is not None,
-     calls the corresponding Atomic method.
-   - Example: `apply_beam_settings(my_settings)`
+To ensure safety and consistency across different hardware vendors, this class
+enforces a strict separation of concerns via three distinct execution layers:
 
-3. THE ORCHESTRATOR LAYER (Concrete Methods)
-   - Role: Control Plane Interface.
-   - Implementation: Provided here.
-   - Signature: Takes a Request object (e.g., `BeamControlRequest`).
-   - Function: Validates the Request, checks Safety Systems, and routes to Helpers.
-   - Example: `execute_beam_control(request)`
+  1) The Atomic Layer (Abstract - Vendor Implemented)
+     - Role: Direct, unbuffered hardware I/O.
+     - Responsibility: Translate a typed value (e.g., `10 nm`) into the specific
+       serial/network command required by the microscope column.
+     - Safety: BLIND. It performs no logic or safety checks. It just executes.
+     - Signature: `set_spot_size(int)`, `set_defocus(Quantity)`.
+
+  2) The Helper Layer (Concrete - Framework Provided)
+     - Role: Bulk application and State management.
+     - Responsibility: Unpack `Settings` objects (e.g., `BeamSettings`) and
+       route non-None fields to the appropriate Atomic setters.
+     - Safety: LOGICAL. Ensures units are correct but assumes values are safe.
+     - Signature: `apply_beam_settings(settings)`.
+
+  3) The Orchestrator Layer (Concrete - Framework Provided)
+     - Role: The Control Plane Interface / Gatekeeper.
+     - Responsibility:
+       a. Validate the Intent (`request.validate()`).
+       b. Check Hardware Capabilities (`system.is_safe_...`).
+       c. Interpolate/Sequence complex moves (e.g., Step-limited stage movement).
+       d. Delegate to Helpers/Atomic methods for execution.
+     - Safety: STRICT. This is the only public entry point for automation scripts.
+     - Signature: `execute_stage_move(request)`, `execute_beam_control(request)`.
+
+===============================================================================
+II. The Safety & Validation Contract
+===============================================================================
+
+Drivers inheriting from `TemMicroscope` rely on the base class to handle safety.
+The `Orchestrator` methods guarantee that by the time an Atomic method is called:
+
+  1) Structural Integrity is verified (via `base.py` Strict Parsing).
+  2) Logical Integrity is verified (via `request.validate()`).
+  3) Physical Safety is verified (via `SystemSettings` limits).
+
+  *Driver Developer Note:* Do not re-implement safety checks in Atomic methods
+  unless they are hardware-critical firmware interlocks. Rely on the
+  `Orchestrator` to filter unsafe requests.
+
+===============================================================================
+III. Type Safety & Units
+===============================================================================
+
+All Atomic interfaces use strict typing:
+  - `Quantity` (from pint) is used for all physical values.
+  - `int` / `str` / `bool` are used for discrete states.
+  - Vendor drivers must handle unit conversion (e.g., converting the input
+    `10 nm` to the `1e-8 meters` expected by a specific API).
+
+===============================================================================
+Usage
+===============================================================================
+
+  # 1. Instantiate (usually via utils.setup_session)
+  scope = JeolMicroscope(settings)
+
+  # 2. Control (Use Orchestrators)
+  req = StageMoveRequest(target=StagePosition(x=Q_(10, 'um')))
+  scope.execute_stage_move(req)  # -> Checks limits -> Calls move_stage_absolute
+
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import logging
 from dataclasses import replace
-
-from pint import Quantity
+import time
 
 # Import strictly typed structures from base.py
 from supertem.structures.base import (
-    # Configuration
+    # Configuration & Safety
     MicroscopeSettings,
     SystemSettings,
     SystemInfo,
+    SafetyCheck,
 
     # State Objects (Snapshots)
     MicroscopeState,
@@ -68,7 +117,9 @@ from supertem.structures.base import (
 
     # Enums & Constants
     Units,
-    Q_
+    Q_,         # For Instantiation (Values)
+    Quantity,   # For Type Hinting (Annotations)
+    StageDriveType
 )
 
 logger = logging.getLogger(__name__)
@@ -89,6 +140,7 @@ class TemMicroscope(ABC):
                       and safety policies. If None, safe defaults are used.
         """
         if settings is None:
+            # Fallback for bare initialization (not recommended for production)
             self._settings = MicroscopeSettings(
                 system=SystemSettings(),
                 _mode="lenient"
@@ -166,7 +218,7 @@ class TemMicroscope(ABC):
         Capture a comprehensive snapshot of the entire microscope state.
 
         Aggregates data from all subsystems (Stage, Beam, Optics, etc.) into
-        a single timestamped structure.
+        a single timestamped structure matching base.py definition.
         """
         return MicroscopeState(
             mode=self.get_mode(),
@@ -178,7 +230,8 @@ class TemMicroscope(ABC):
             apertures=self.get_all_apertures(),
             detectors={d_id: self.get_detector_settings(d_id)
                        for d_id in self.list_detectors()},
-            active_detector_ids=self.get_active_detector_ids()
+            active_detector_ids=self.get_active_detector_ids(),
+            primary_detector_id=self.get_primary_detector_id()
         )
 
     # =========================================================================
@@ -193,8 +246,7 @@ class TemMicroscope(ABC):
         Atomic: Read current physical stage coordinates.
 
         Returns:
-            StagePosition: Objects with x, y, z, tilt_x, tilt_y.
-            Units: Length (meters/nm), Angle (degrees/radians).
+            StagePosition: Objects with x, y, z, r, tilt_x, tilt_y.
         """
         pass
 
@@ -229,51 +281,54 @@ class TemMicroscope(ABC):
                             wait: bool = True) -> None:
         """
         Helper: Calculate absolute target from delta and execute move.
-
-        Args:
-            delta: Relative distances. x=5nm means move 5nm right.
         """
         current = self.get_stage_position()
         target = current + delta  # Vector addition handled by StagePosition
-        self.move_stage_absolute(target, drive_type=drive_type, wait=wait)
+        # We delegate to the safe mover to ensure step sizes are respected even for relative moves
+        self.safe_move_stage(target, drive_type=drive_type, wait=wait)
 
     def execute_stage_move(self, request: StageMoveRequest) -> None:
         """
         Orchestrator: Handle StageMoveRequest.
 
         Features:
-        - Validates request.
-        - Checks `SystemSettings` for safety (safe_move).
+        - Validates request (structure and types).
+        - Checks `SystemSettings` for safety limits (logic).
         - Handles Relative vs Absolute logic.
+        - Uses `safe_move_stage` to interpolate large moves if needed.
         """
         if not request.validate():
             raise ValueError(f"Invalid StageMoveRequest: {request}")
 
-        # Safety Check
+        # 1. Resolve Target (Absolute)
+        current = self.get_stage_position()
+        target_abs = request.target
+
+        if request.relative:
+            target_abs = current + request.target
+            # If absolute addition resulted in None for some axes, fill them from current
+            # to allow for a complete safety check of the final destination.
+            # (Note: move_stage_absolute typically ignores Nones, but safety check needs context)
+
+        # 2. Safety Check (Destination & Capability)
         sys = self.system_settings.stage_system
         if sys:
-            current = self.get_stage_position()
+            # We check the move using the resolved absolute target.
+            # We pass 'current' to allow step size calculation in the check.
             check = sys.is_safe_move(
-                target=request.target,
+                target=request.target if request.relative else target_abs,
                 current=current,
                 relative=request.relative
             )
             if not check:
                 raise RuntimeError(f"Unsafe move rejected: {check.reasons}")
 
-            # Calculate Absolute Target
-            target_abs = request.target
-            if request.relative:
-                target_abs = current + request.target
-
-            # Execute via Safe Mover (enforces step size limits)
+            # 3. Execution (via Safe Mover)
+            # The safe mover handles "max_step_distance" interpolation.
             self.safe_move_stage(target_abs, drive_type=request.drive_type, wait=request.wait_for_settle)
         else:
-            # Fallback (No safety system)
-            if request.relative:
-                self.move_stage_relative(request.target, drive_type=request.drive_type, wait=request.wait_for_settle)
-            else:
-                self.move_stage_absolute(request.target, drive_type=request.drive_type, wait=request.wait_for_settle)
+            # Fallback (No safety system defined)
+            self.move_stage_absolute(target_abs, drive_type=request.drive_type, wait=request.wait_for_settle)
 
     def execute_stage_control(self, request: StageControlRequest) -> None:
         """
@@ -286,6 +341,7 @@ class TemMicroscope(ABC):
             self.stop_stage()
         elif request.action == "HOME":
             self.home_stage()
+        # "ABORT", "RESET_ERROR" could be implemented if driver supports them
 
     # =========================================================================
     # 4. Beam Control (Illumination)
@@ -415,11 +471,17 @@ class TemMicroscope(ABC):
             self.set_gun_tilt(settings.gun_tilt.x or 0.0, settings.gun_tilt.y or 0.0)
 
     def execute_beam_control(self, request: BeamControlRequest) -> None:
-        """
-        Orchestrator: Handle BeamControlRequest.
-        Validates the request and applies the target settings.
-        """
-        # Safety / Validation could happen here (e.g. check voltage limits)
+        """Orchestrator: Handle BeamControlRequest."""
+        if not request.validate():
+            raise ValueError(f"Invalid BeamControlRequest: {request}")
+
+        # Safety Check
+        sys = self.system_settings.beam_system
+        if sys:
+            check = sys.is_safe_beam(request.target)
+            if not check:
+                raise RuntimeError(f"Unsafe beam settings rejected: {check.reasons}")
+
         if request.target:
             self.apply_beam_settings(request.target)
 
@@ -551,7 +613,15 @@ class TemMicroscope(ABC):
                                        settings.diffraction_shift.y or 0.0)
 
     def execute_projection_control(self, request: ProjectionControlRequest) -> None:
-        """Orchestrator: Handle ProjectionControlRequest."""
+        if not request.validate():
+            raise ValueError(f"Invalid ProjectionControlRequest: {request}")
+
+        sys = self.system_settings.projection_system
+        if sys:
+            check = sys.is_safe_projection(request.target)
+            if not check:
+                raise RuntimeError(f"Unsafe projection settings rejected: {check.reasons}")
+
         if request.target:
             self.apply_projection_settings(request.target)
 
@@ -654,16 +724,25 @@ class TemMicroscope(ABC):
         if settings.scan_rotation is not None: self.set_scan_rotation(settings.scan_rotation)
 
     def execute_scan_control(self, request: ScanControlRequest) -> None:
-        """
-        Orchestrator: Handle ScanControlRequest.
-        Supports START (with optional settings update) and STOP.
-        """
+        if not request.validate():
+            raise ValueError(f"Invalid ScanControlRequest: {request}")
+
+        # Safety Check if applying new settings
+        if request.target and request.action in ("START", "SINGLE_FRAME"):
+            sys = self.system_settings.scan_system
+            if sys:
+                check = sys.is_safe_scan(request.target)
+                if not check:
+                    raise RuntimeError(f"Unsafe scan settings rejected: {check.reasons}")
+            self.apply_scan_settings(request.target)
+
         if request.action == "START":
-            if request.target:
-                self.apply_scan_settings(request.target)
             self.set_scan_active(True)
         elif request.action == "STOP":
             self.set_scan_active(False)
+        elif request.action == "SINGLE_FRAME":
+            # Logic for single frame could involve START -> Wait -> STOP, or driver specific logic
+            self.set_scan_active(True)
 
     # =========================================================================
     # 7. Detector Control
@@ -677,7 +756,10 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def get_active_detector_ids(self) -> List[str]:
-        """Return list of currently active/inserted detector IDs."""
+        pass
+
+    @abstractmethod
+    def get_primary_detector_id(self) -> Optional[str]:
         pass
 
     @abstractmethod
@@ -705,7 +787,11 @@ class TemMicroscope(ABC):
         """Return True if detector is mechanically inserted."""
         pass
 
-    # --- Atomic Setters ---
+    @abstractmethod
+    def get_detector_frame_rate(self, detector_id: str) -> Optional[Quantity]:
+        pass
+
+    # ---Atomic Setters ---
     @abstractmethod
     def set_detector_exposure(self, detector_id: str, exposure: Quantity) -> None:
         """Set exposure time."""
@@ -750,7 +836,8 @@ class TemMicroscope(ABC):
             exposure=self.get_detector_exposure(detector_id),
             binning_index=self.get_detector_binning(detector_id),
             roi=self.get_detector_roi(detector_id),
-            frame_integration=self.get_detector_integration(detector_id)
+            frame_integration=self.get_detector_integration(detector_id),
+            frame_rate=self.get_detector_frame_rate(detector_id)
         )
 
     def apply_detector_settings(self, detector_id: str, settings: DetectorSettings) -> None:
@@ -769,6 +856,16 @@ class TemMicroscope(ABC):
         Orchestrator: Handle DetectorControlRequest.
         Handles INSERT/RETRACT actions and applies settings.
         """
+        if not request.validate():
+            raise ValueError(f"Invalid DetectorControlRequest: {request}")
+
+        sys = self.system_settings.detector_system
+        if sys and request.target:
+            # Check if capabilities support the request
+            check = sys.is_supported(request.target)
+            if not check:
+                raise RuntimeError(f"Detector settings not supported: {check.reasons}")
+
         if request.action == "INSERT":
             self.set_detector_insertion(request.detector_id, True)
         elif request.action == "RETRACT":
@@ -821,6 +918,9 @@ class TemMicroscope(ABC):
 
     def execute_vacuum_control(self, request: VacuumControlRequest) -> None:
         """Orchestrator: Handle VacuumControlRequest."""
+        if not request.validate():
+            raise ValueError(f"Invalid VacuumControlRequest: {request}")
+
         if request.target:
             self.apply_vacuum_settings(request.target)
 
@@ -856,6 +956,9 @@ class TemMicroscope(ABC):
         Features:
         - Logic to handle Relative Position moves.
         """
+        if not request.validate():
+            raise ValueError(f"Invalid ApertureControlRequest: {request}")
+
         final_target = request.target
 
         # Handle Relative Movement logic
@@ -865,11 +968,10 @@ class TemMicroscope(ABC):
                 new_pos = replace(request.target.position)
                 # Apply delta to current position (manual vector addition)
                 if request.target.position.x is not None and current.position.x is not None:
-                     new_pos.x = current.position.x + request.target.position.x
+                    new_pos.x = current.position.x + request.target.position.x
                 if request.target.position.y is not None and current.position.y is not None:
-                     new_pos.y = current.position.y + request.target.position.y
-
-                final_target.position = new_pos
+                    new_pos.y = current.position.y + request.target.position.y
+                final_target = replace(final_target, position=new_pos)
 
         self.set_aperture(request.aperture_id, final_target)
 
@@ -918,6 +1020,8 @@ class TemMicroscope(ABC):
 
         # Otherwise, step it out via Linear Interpolation
         steps = int(max_dist // max_step_nm) + 1
+        logger.info(f"Move exceeds max step ({max_dist:.1f}nm > {max_step_nm:.1f}nm). "
+                    f"Breaking into {steps} segments.")
 
         for i in range(1, steps + 1):
             frac = i / steps
