@@ -429,9 +429,11 @@ class Units:
     KV = "kV"
     NA = "nA"
     MRAD = "mrad"
-    DEG = "deg"      # Pint alias for 'degree'
-    MS = "ms"        # Pint alias for 'millisecond'
+    DEG = "deg"
+    MS = "ms"
+    US = "us"
     SEC = "s"
+    PA = "Pa"
 
 def as_parse_mode(mode: Union["ParseMode", str, None]) -> "ParseMode":
     if isinstance(mode, ParseMode): return mode
@@ -1660,6 +1662,14 @@ class BeamSettings:
     spot_size: Optional[int] = None
     convergence_angle: Optional["Quantity"] = None
     defocus: Optional["Quantity"] = None
+
+    # --- NEW CONTROL PROPERTIES ---
+    optical_mode: Optional[str] = None  # "IMAGING", "DIFFRACTION", "LAD"
+    camera_length: Optional["Quantity"] = None  # Primary control for DIFFRACTION
+    magnification_index: Optional[int] = None  # Primary control for IMAGING
+    screen_position: Optional[str] = None  # "UP", "DOWN"
+    high_tension_state: Optional[str] = None  # "ON", "OFF", "STANDBY"
+
     stigmation: Optional[Point] = None
     beam_shift: Optional[Point] = None
     image_shift: Optional[Point] = None
@@ -1670,7 +1680,8 @@ class BeamSettings:
     _UNITS = {
         "voltage": Units.KV, "beam_current": Units.NA,
         "convergence_angle": Units.MRAD, "defocus": Units.NM,
-        "scan_rotation": Units.DEG
+        "scan_rotation": Units.DEG,
+        "camera_length": Units.MM  # <--- NEW UNIT MAPPING
     }
 
     def __post_init__(self):
@@ -1681,6 +1692,13 @@ class BeamSettings:
         self.convergence_angle = p.qty(self.convergence_angle, "convergence_angle", Units.MRAD)
         self.defocus = p.qty(self.defocus, "defocus", Units.NM)
         self.scan_rotation = p.qty(self.scan_rotation, "scan_rotation", Units.DEG)
+
+        # --- NEW PARSERS ---
+        self.optical_mode = p.str(self.optical_mode, "optical_mode")
+        self.camera_length = p.qty(self.camera_length, "camera_length", Units.MM)
+        self.magnification_index = p.int(self.magnification_index, "magnification_index")
+        self.screen_position = p.str(self.screen_position, "screen_position")
+        self.high_tension_state = p.str(self.high_tension_state, "high_tension_state")
 
         self.stigmation = p.model(Point, self.stigmation, "stigmation", default=None)
         self.beam_shift = p.model(Point, self.beam_shift, "beam_shift", default=None)
@@ -1696,6 +1714,20 @@ class BeamSettings:
         v.check_ge_zero(self.voltage, "voltage", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.beam_current, "beam_current", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.spot_size, "spot_size", reset_to=None)
+
+        # --- NEW VALIDATION LOGIC ---
+        v.check_ge_zero(self.camera_length, "camera_length", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.magnification_index, "magnification_index", reset_to=None)
+
+        # Consistency Check: Mode vs Value (Lenient only warns, Strict raises)
+        if self.optical_mode == "DIFFRACTION" and self.camera_length is None and v.strict:
+            # In strict mode, if you say diffraction, you likely should specify the length
+            pass
+
+        if self.screen_position:
+            v.check(self.screen_position in {"UP", "DOWN"}, "screen_position",
+                    "Must be UP or DOWN", heal=lambda: setattr(self, 'screen_position', None))
+
         return v.valid
 
     def to_dict(self) -> dict:
@@ -1706,7 +1738,7 @@ class BeamSettings:
         return _auto_from_dict(BeamSettings, d, mode, alias_map={
             "voltage": "voltage_kv", "beam_current": "beam_current_na",
             "convergence_angle": "convergence_angle_mrad", "defocus": "defocus_nm",
-            "scan_rotation": "scan_rotation_deg"
+            "scan_rotation": "scan_rotation_deg", "camera_length": "camera_length_mm"
         })
 
 # Alias for semantic clarity in Read-Only contexts
@@ -1737,12 +1769,17 @@ class BeamSystemSettings:
     beam_current_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     spot_size_limits: Optional[Tuple[int, int]] = None
     convergence_angle_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
+    # --- NEW LIMITS ---
+    camera_length_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     _UNITS = {
         "voltage_limits": Units.KV, "beam_current_limits": Units.NA,
-        "convergence_angle_limits": Units.MRAD
+        "convergence_angle_limits": Units.MRAD,
+        "camera_length_limits": Units.MM  # <--- NEW UNIT MAPPING
     }
 
     def __post_init__(self):
@@ -1756,6 +1793,10 @@ class BeamSystemSettings:
         # Category B: Structural Default
         self.default_beam = p.model(BeamSettings, self.default_beam, "default_beam", default=BeamSettings(_mode=p.mode))
 
+        # --- NEW PARSER ---
+        self.camera_length_limits = p.pair_qty(self.camera_length_limits, "camera_length_limits", Units.MM)
+
+    # ... validate method (omitted for brevity, assume check_range is called for camera_length_limits) ...
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_nested(self.default_beam)
@@ -1782,6 +1823,7 @@ class BeamSystemSettings:
         _check_range(self.beam_current_limits, "beam_current_limits")
         _check_range(self.convergence_angle_limits, "convergence_angle_limits")
         _check_range(self.spot_size_limits, "spot_size_limits")
+        _check_range(self.camera_length_limits, "camera_length_limits")  # <--- NEW CHECK
 
         return v.valid
 
@@ -1845,6 +1887,12 @@ class DetectorSettings:
     gain_index: Optional[int] = None
     offset_index: Optional[int] = None
     digital_rotation: Optional["Quantity"] = None
+
+    # --- NEW ADVANCED PROPERTIES ---
+    readout_mode: Optional[str] = None  # "LINEAR", "COUNTING", "SUPER_RESOLUTION"
+    shutter_mode: Optional[str] = None  # "PRE_SPECIMEN", "POST_SPECIMEN"
+    save_frames: Optional[bool] = None  # True = save movie stack
+
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
@@ -1863,6 +1911,11 @@ class DetectorSettings:
         # ROI is preserved as None if missing (tristate)
         self.roi = p.model(ROI, self.roi, "roi", default=None)
 
+        # --- NEW PARSERS ---
+        self.readout_mode = p.str(self.readout_mode, "readout_mode")
+        self.shutter_mode = p.str(self.shutter_mode, "shutter_mode")
+        self.save_frames = p.bool(self.save_frames, "save_frames")
+
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_gt_zero(self.exposure, "exposure", unit_aware=True, reset_to=None)
@@ -1880,6 +1933,9 @@ class DetectorSettings:
                 heal=lambda: setattr(self, 'gain_index', 0))
 
         v.check_nested(self.roi)
+        if self.shutter_mode:
+            v.check(self.shutter_mode in {"PRE_SPECIMEN", "POST_SPECIMEN", "BOTH"}, "shutter_mode",
+                    "Invalid shutter mode")
         return v.valid
 
     def to_dict(self) -> dict:
@@ -2208,6 +2264,197 @@ class DetectorSystemSettings:
             "available_detector_ids": "available_detectors"
         })
 
+
+@dataclass
+class ScanSettings:
+    """
+    Configuration for the STEM raster scan engine.
+
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Control-plane
+    Category: C / D
+    """
+    scan_mode: Optional[str] = None  # "SPOT", "FULL_FRAME", "LINE_SCAN"
+    pixel_dwell_time: Optional["Quantity"] = None  # Time per pixel (us)
+    flyback_time: Optional["Quantity"] = None  # Time between lines (us)
+    scan_rotation: Optional["Quantity"] = None  # Digital raster rotation (deg)
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "pixel_dwell_time": Units.US,
+        "flyback_time": Units.US,
+        "scan_rotation": Units.DEG
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ScanSettings")
+        self.scan_mode = p.str(self.scan_mode, "scan_mode")
+        self.pixel_dwell_time = p.qty(self.pixel_dwell_time, "pixel_dwell_time", Units.US)
+        self.flyback_time = p.qty(self.flyback_time, "flyback_time", Units.US)
+        self.scan_rotation = p.qty(self.scan_rotation, "scan_rotation", Units.DEG)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check_gt_zero(self.pixel_dwell_time, "pixel_dwell_time", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.flyback_time, "flyback_time", unit_aware=True, reset_to=None)
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ScanSettings":
+        return _auto_from_dict(ScanSettings, d, mode, alias_map={
+            "pixel_dwell_time": "pixel_dwell_time_us",
+            "flyback_time": "flyback_time_us",
+            "scan_rotation": "scan_rotation_deg"
+        })
+
+
+@dataclass
+class ScanSystemSettings:
+    """
+    Hardware capabilities and safety limits for the STEM scan engine.
+
+    Role:     Gatekeeper (System Limits)
+    Context:  Control-plane
+    Category: A (Strict Runtime Config)
+    """
+    enabled: Optional[bool] = None
+
+    # --- Capabilities ---
+    available_scan_modes: Optional[List[str]] = None  # e.g. ["SPOT", "FULL_FRAME"]
+
+    # --- Limits ---
+    pixel_dwell_time_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    flyback_time_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    scan_rotation_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "pixel_dwell_time_limits": Units.US,
+        "flyback_time_limits": Units.US,
+        "scan_rotation_limits": Units.DEG
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ScanSystemSettings")
+        self.enabled = p.bool(self.enabled, "enabled", default=True)
+        self.available_scan_modes = p.list_str(self.available_scan_modes, "available_scan_modes")
+
+        self.pixel_dwell_time_limits = p.pair_qty(self.pixel_dwell_time_limits, "pixel_dwell_time_limits", Units.US)
+        self.flyback_time_limits = p.pair_qty(self.flyback_time_limits, "flyback_time_limits", Units.US)
+        self.scan_rotation_limits = p.pair_qty(self.scan_rotation_limits, "scan_rotation_limits", Units.DEG)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+
+        def _check_range(rng, name):
+            if not rng: return
+            mn, mx = rng
+            v.check(mn <= mx, name, "min > max", heal=lambda: setattr(self, name, (mx, mn)))
+            # Timing cannot be negative
+            if "rotation" not in name:
+                v.check_ge_zero(mn, f"{name}.min", unit_aware=True)
+
+        _check_range(self.pixel_dwell_time_limits, "pixel_dwell_time_limits")
+        _check_range(self.flyback_time_limits, "flyback_time_limits")
+        _check_range(self.scan_rotation_limits, "scan_rotation_limits")
+
+        return v.valid
+
+    def is_safe_scan(self, settings: "ScanSettings") -> SafetyCheck:
+        """
+        Runtime check: Is the requested scan within hardware timing limits?
+        """
+        reasons = []
+
+        # 1. Check Mode
+        if settings.scan_mode and self.available_scan_modes:
+            if settings.scan_mode not in self.available_scan_modes:
+                reasons.append(f"Scan mode '{settings.scan_mode}' not supported {self.available_scan_modes}")
+
+        # 2. Check Timing Limits
+        def _chk(val, lims, name):
+            if val is not None and lims:
+                if not (lims[0] <= val <= lims[1]):
+                    reasons.append(f"{name} {val} outside limits {lims}")
+
+        _chk(settings.pixel_dwell_time, self.pixel_dwell_time_limits, "dwell_time")
+        _chk(settings.flyback_time, self.flyback_time_limits, "flyback_time")
+        _chk(settings.scan_rotation, self.scan_rotation_limits, "scan_rotation")
+
+        return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ScanSystemSettings":
+        return _auto_from_dict(ScanSystemSettings, d, mode, alias_map={
+            "pixel_dwell_time_limits": "dwell_time_limits_us"
+        })
+
+@dataclass
+class VacuumSettings:
+    """
+    Status and control of the vacuum system (Valves, Pumps, Pressures).
+
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Control-plane
+    Category: C / D
+    """
+    column_valve_state: Optional[str] = None  # "OPEN", "CLOSED" (aka V7/V4)
+    gun_valve_state: Optional[str] = None  # "OPEN", "CLOSED" (aka V1)
+    turbo_pump_state: Optional[str] = None  # "ON", "OFF"
+
+    # Telemetry Only (Usually)
+    column_pressure: Optional["Quantity"] = None
+    gun_pressure: Optional["Quantity"] = None
+    buffer_tank_pressure: Optional["Quantity"] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
+
+    _UNITS = {
+        "column_pressure": Units.PA,
+        "gun_pressure": Units.PA,
+        "buffer_tank_pressure": Units.PA
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "VacuumSettings")
+        self.column_valve_state = p.str(self.column_valve_state, "column_valve_state")
+        self.gun_valve_state = p.str(self.gun_valve_state, "gun_valve_state")
+        self.turbo_pump_state = p.str(self.turbo_pump_state, "turbo_pump_state")
+
+        self.column_pressure = p.qty(self.column_pressure, "column_pressure", Units.PA)
+        self.gun_pressure = p.qty(self.gun_pressure, "gun_pressure", Units.PA)
+        self.buffer_tank_pressure = p.qty(self.buffer_tank_pressure, "buffer_tank_pressure", Units.PA)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        # Pressure can't be negative
+        v.check_ge_zero(self.column_pressure, "column_pressure", unit_aware=True)
+        v.check_ge_zero(self.gun_pressure, "gun_pressure", unit_aware=True)
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "VacuumSettings":
+        return _auto_from_dict(VacuumSettings, d, mode, alias_map={
+            "column_valve": "column_valve_state",
+            "v7": "column_valve_state",
+            "column_pressure": "column_pressure_pa"
+        })
+
+
 @dataclass
 class ImageOutputSettings:
     """
@@ -2316,6 +2563,8 @@ class MicroscopeState:
     mode: Optional[str] = None
     stage_position: Optional[StagePosition] = None
     beam: Optional[BeamState] = None
+    scan: Optional[ScanSettings] = None
+    vacuum: Optional[VacuumSettings] = None  # <--- NEW
     apertures: Optional[Dict[str, Aperture]] = None
     detectors: Optional[Dict[str, DetectorState]] = None
     active_detector_ids: Optional[List[str]] = None
@@ -2334,6 +2583,9 @@ class MicroscopeState:
         self.stage_position = p.model(StagePosition, self.stage_position, "stage_position",
                                       default=StagePosition(_mode=p.mode))
         self.beam = p.model(BeamState, self.beam, "beam", default=BeamState(_mode=p.mode))
+        self.scan = p.model(ScanSettings, self.scan, "scan", default=ScanSettings(_mode=p.mode))
+        self.vacuum = p.model(VacuumSettings, self.vacuum, "vacuum", default=VacuumSettings(_mode=p.mode))  # <--- NEW
+
         self.apertures = p.map_model(Aperture, self.apertures, "apertures", "aperture_id")
         self.detectors = p.map_model(DetectorState, self.detectors, "detectors", "detector_id")
 
@@ -2341,6 +2593,7 @@ class MicroscopeState:
         v = Validator(self, mode)
         v.check_nested(self.stage_position)
         v.check_nested(self.beam)
+        v.check_nested(self.vacuum)  # <--- NEW
         v.check_nested_map(self.apertures)
         v.check_nested_map(self.detectors)
 
@@ -2643,6 +2896,7 @@ class SystemSettings:
     """
     stage_system: Optional[StageSystemSettings] = None
     beam_system: Optional[BeamSystemSettings] = None
+    scan_system: Optional[ScanSystemSettings] = None  # <--- NEW
     detector_system: Optional[DetectorSystemSettings] = None
     info: Optional[SystemInfo] = None
     extra: Extras = field(default_factory=Extras)
@@ -2654,6 +2908,10 @@ class SystemSettings:
                                     default=StageSystemSettings(_mode=p.mode))
         self.beam_system = p.model(BeamSystemSettings, self.beam_system, "beam_system",
                                    default=BeamSystemSettings(_mode=p.mode))
+        # --- NEW PARSER ---
+        self.scan_system = p.model(ScanSystemSettings, self.scan_system, "scan_system",
+                                   default=ScanSystemSettings(_mode=p.mode))
+
         self.detector_system = p.model(DetectorSystemSettings, self.detector_system, "detector_system",
                                        default=DetectorSystemSettings(_mode=p.mode))
         self.info = p.model(SystemInfo, self.info, "info", default=SystemInfo(_mode=p.mode))
@@ -2662,6 +2920,7 @@ class SystemSettings:
         v = Validator(self, mode)
         v.check_nested(self.stage_system)
         v.check_nested(self.beam_system)
+        v.check_nested(self.scan_system)  # <--- NEW CHECK
         v.check_nested(self.detector_system)
         v.check_nested(self.info)
         return v.valid
