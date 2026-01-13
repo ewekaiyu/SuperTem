@@ -8,7 +8,7 @@ This module is responsible for converting between:
 2. Strictly typed SuperTEM structures.
 
 It isolates the 'Dirty' logic of parsing vendor keys/units from the 'Clean' logic of the microscope driver.
-All unmapped data is preserved in the `extra.vendor` dictionary of the respective objects.
+All unmapped data is preserved in the `extra.vendor['JEOL']` dictionary.
 """
 
 import copy
@@ -34,10 +34,13 @@ from supertem.structures.base import (
 # =============================================================================
 
 def _pack_vendor_extras(data: Dict[str, Any]) -> Optional[Extras]:
-    """Wraps a dictionary of raw vendor data into the standard Extras.vendor structure."""
+    """
+    Wraps a dictionary of raw vendor data into the standard Extras.vendor structure.
+    Strictly namespaces under 'JEOL'.
+    """
     if not data:
         return None
-    return Extras(vendor=data)
+    return Extras(vendor={"JEOL": data})
 
 def _jeol_roi_to_struct(x: Any) -> Optional[ROI]:
     """Convert JEOL 'ImagingArea' dict to ROI object."""
@@ -186,8 +189,8 @@ def to_jeol_detector_config(settings: DetectorSettings) -> Dict[str, Any]:
 
     # 2. Vendor Extras (Pass-through)
     if settings.extra and settings.extra.vendor:
-        # We merge these back in so PyJEM receives keys we didn't touch
-        out.update(settings.extra.vendor)
+        jeol_extras = settings.extra.vendor.get("JEOL", {})
+        out.update(jeol_extras)
 
     return out
 
@@ -256,12 +259,20 @@ def from_jeol_vacuum_stats(
     return VacuumSettings(
         gun_pressure=Q_(p[0], Units.PA),      # P1
         column_pressure=Q_(p[1], Units.PA),   # P2
-        chamber_pressure=Q_(p[2], Units.PA),  # P3
+        # 'chamber_pressure' is not in base.py VacuumSettings, mapping P3 to extra or dropping?
+        # base.py has: column, gun, buffer_tank.
+        # JEOL P3 is usually Chamber. P4/P5 vary.
+        # We will map P4 to buffer based on typical configs, or leave P3 in extras.
+        buffer_tank_pressure=Q_(p[3], Units.PA), # Attempt mapping P4 to buffer
+
+        column_valve_state=valves_mapped.get("V4") or valves_mapped.get("V7"), # Heuristic
+        gun_valve_state=valves_mapped.get("V1"),
+
         extra=_pack_vendor_extras({
             "raw_pressures_P1_to_P5": p_values,
-            "raw_valves": valve_status_flags
+            "raw_valves": valve_status_flags,
+            "chamber_pressure_P3_Pa": p[2]
         }),
-        valves=valves_mapped,
         _mode="lenient"
     )
 
@@ -301,12 +312,14 @@ def from_jeol_beam_stats(
         vendor_data.update(raw_flags)
 
     return BeamSettings(
-        beam_on=True,
         voltage=v_qty,
-        current=Q_(current_ua, Units.UA).to(Units.NA),
-        spot_size_index=spot_size_idx,
-        convergence_angle_index=alpha_idx,
-        shift=shift_pt,
+        beam_current=Q_(current_ua, Units.UA).to(Units.NA),
+        spot_size=spot_size_idx,
+        # COMPLIANCE FIX: base.py BeamSettings uses 'convergence_angle' (Quantity).
+        # We cannot map an index (alpha_idx) to a Quantity without a table.
+        # We store the index in extras and leave the quantity None.
+        convergence_angle=None,
+        beam_shift=shift_pt,
         extra=_pack_vendor_extras(vendor_data),
         _mode="lenient"
     )
@@ -332,7 +345,7 @@ def from_jeol_scan_stats(
         vendor_data["ScanModeInt"] = scan_mode_int
 
     return ScanSettings(
-        rotation=Q_(rotation_deg, Units.DEG),
+        scan_rotation=Q_(rotation_deg, Units.DEG),
         scan_mode=str(scan_mode_int) if scan_mode_int is not None else None,
         # Fields not available in scan3.py:
         width_px=None,
