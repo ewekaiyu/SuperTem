@@ -189,11 +189,11 @@ def setup_session(
     if mfg == "DEMO":
         from supertem.microscopes.demo_microscope import DemoMicroscope
         microscope = DemoMicroscope(settings)
-        microscope.connect_to_microscope(ip_address, port=7520)
+        microscope.connect(ip_address, port=7520)
     elif mfg == "JEOL":
         from supertem.microscopes.jeol_microscope import JeolMicroscope
         microscope = JeolMicroscope(settings)
-        microscope.connect_to_microscope(ip_address, port=7520)
+        microscope.connect(ip_address, port=7520)
 
     else:
         raise NotImplementedError(f"Manufacturer {mfg} not supported.")

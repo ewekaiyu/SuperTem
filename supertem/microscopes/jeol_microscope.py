@@ -1,3 +1,90 @@
+"""
+supertem.jeol_microscope
+
+JEOL TEM driver implementation for the SuperTEM hardware abstraction layer.
+
+This module provides :class:`JeolMicroscope`, a vendor-backed implementation of the
+:class:`~supertem.microscope.TemMicroscope` interface using PyJEM (TEM3).
+
+Core idea
+---------
+SuperTEM separates "what the microscope *means*" from "what a vendor API *returns*":
+
+1) Canonical (portable) fields live in the typed structures from ``supertem.structures.base``
+   (e.g. :class:`~supertem.structures.base.BeamSettings`,
+   :class:`~supertem.structures.base.ProjectionSettings`,
+   :class:`~supertem.structures.base.DetectorSettings`).
+
+2) Vendor-native encodings (indices, DAC units, mode codes, table keys) must be preserved
+   losslessly under ``Extras.vendor["JEOL"]`` rather than being forced into canonical physics.
+
+This matters because PyJEM exposes some controls only as selectors/indices or raw DAC values.
+If those values are pushed directly into canonical fields (e.g. treating an alpha selector index
+as a convergence angle), you either:
+- crash in STRICT parsing, or
+- silently store plausible-looking but incorrect physics.
+
+Design philosophy
+-----------------
+- **Be honest at the atomic layer.**
+  If JEOL can only provide an index/DAC, do not fabricate a calibrated physical quantity.
+  Expose a vendor-native accessor (e.g. ``get_alpha_index()``, ``get_defocus_dac()``).
+
+- **Translate at the snapshot layer.**
+  ``JeolMicroscope`` overrides helper aggregators (e.g. ``get_beam_settings()``,
+  ``get_projection_settings()``) to route through ``supertem.jeol_adapter``.
+  The adapter produces canonical structures where possible, and stores vendor-only data in
+  ``Extras.vendor["JEOL"]`` when mapping is not available.
+
+- **Apply settings with provenance.**
+  ``apply_beam_settings()`` / ``apply_projection_settings()`` apply canonical fields, and also
+  recognize JEOL-only values supplied via ``settings.extra.vendor["JEOL"]`` (e.g. ``alpha_index``).
+
+JEOL-only keys stored in Extras.vendor["JEOL"]
+----------------------------------------------
+The following vendor keys are used by this driver (non-exhaustive; extend as needed):
+
+- ``alpha_index``:
+  Convergence selector index (JEOL alpha). Canonical ``BeamSettings.convergence_angle`` is
+  ``None`` unless a calibration/mapping is added.
+
+- ``defocus_olc_dac``:
+  Raw OLc/DAC value for defocus. Canonical ``ProjectionSettings.defocus`` is only populated
+  when a calibration scale is provided (see "Calibration" below).
+
+- Capture-specific details (recorded in image metadata extras where applicable):
+  ``detector_id``, ``binning_index``, ``frame_integration``, ROI payload, etc.
+
+Calibration
+-----------
+Some JEOL controls require calibration to convert vendor-native values into physical units.
+This driver supports an opt-in defocus calibration via ``defocus_scale`` (nm per DAC unit).
+If not provided, defocus is treated as uncalibrated:
+- ``get_defocus()`` returns ``None`` and stashes ``defocus_olc_dac`` under vendor extras.
+- ``set_defocus()`` refuses uncalibrated nm inputs (use ``set_defocus_dac()`` instead).
+
+Acquisition / acquire_image()
+-----------------------------
+``acquire_image(request)`` expects the current SuperTEM request model:
+- Detector controls come from ``request.detector`` (:class:`~supertem.structures.base.DetectorSettings`).
+- The returned :class:`~supertem.structures.base.MicroscopeImageMetadata` stays canonical, while
+  JEOL-only capture details are stored under ``metadata.extra.vendor["JEOL"]``.
+
+Extending this driver
+---------------------
+When adding a new JEOL feature:
+1) Prefer adding a vendor-native atomic getter/setter if PyJEM uses indices/DAC/mode codes.
+2) Add/extend mapping logic in ``supertem.jeol_adapter`` to translate to canonical structures.
+3) Ensure any unmapped vendor data is preserved under ``Extras.vendor["JEOL"]`` with stable keys.
+4) Keep the base interface semantics intact: canonical fields represent physical quantities
+   (or ``None`` when not representable without calibration).
+
+Dependencies
+------------
+- PyJEM (TEM3). This module imports PyJEM lazily and will raise a clear error if unavailable.
+
+"""
+
 import time
 import logging
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -1030,81 +1117,264 @@ class JeolMicroscope(TemMicroscope):
     # =========================================================================
     # 6. Scan Control (Atomic)
     # =========================================================================
+    #
+    # PyJEM has *two* places where "scan-ish" controls show up:
+    #   1) TEM3.Scan3: low-level scan engine controls (rotation, ext scan mode, etc.)
+    #   2) detector.Detector: STEM scan configuration tied to the currently selected detector
+    #      (scan mode, imaging area, spot position, scan rotation, etc.)
+    #
+    # In practice, many day-to-day STEM scan knobs (Scan/Spot/Area + imaging area)
+    # live under `detector.Detector` rather than TEM3.Scan3. We therefore prefer the
+    # detector API when available, and fall back to TEM3.Scan3 only for the subset
+    # of scan controls it actually exposes.
+    #
+    # Reference: PyJEM detector.Detector exposes set_scanmode / set_imaging_area /
+    # set_areamode_imagingarea / set_spotposition / set_scanrotation.
+    # Reference: PyJEM TEM3.Scan3 exposes Get/SetRotationAngle(Ex) and Get/SetExtScanMode.
+
+    def _get_scan_controller_detector(self):
+        """Return a Detector instance used for scan config (best-effort).
+
+        PyJEM's scan configuration is often bound to a specific detector instance.
+        We use the primary detector if known, else fall back to the first available.
+        """
+        if detector is None:
+            return None
+        try:
+            det_id = self.get_primary_detector_id()
+            if det_id is None:
+                ids = self.list_detectors()
+                det_id = ids[0] if ids else None
+            if det_id is None:
+                return None
+            return self._get_detector(det_id)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _first_int(d: dict, keys: tuple[str, ...]) -> Optional[int]:
+        for k in keys:
+            if k in d:
+                try:
+                    return int(d[k])
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    def _first_float(d: dict, keys: tuple[str, ...]) -> Optional[float]:
+        for k in keys:
+            if k in d:
+                try:
+                    return float(d[k])
+                except Exception:
+                    continue
+        return None
 
     def get_scan_mode(self) -> str:
-        # todo: needs fix
-        if self.scan and hasattr(self.scan, "GetScanMode"):
-            return str(self.scan.GetScanMode())
-        return "0"
+        """Return scan mode as a human-readable string."""
+        d = self._get_scan_controller_detector()
+        if d is not None and hasattr(d, "get_detectorsetting"):
+            try:
+                st = d.get_detectorsetting()
+                if isinstance(st, dict):
+                    raw = self._first_int(st, ("ScanMode", "ScanModeValue", "ScanModeIndex"))
+                    if raw is not None:
+                        return {0: "Scan", 1: "Spot", 3: "Area"}.get(raw, str(raw))
+                    raw_s = st.get("ScanModeStr") or st.get("ScanModeString")
+                    if isinstance(raw_s, str) and raw_s.strip():
+                        return raw_s.strip()
+            except Exception:
+                pass
+        return str(self._scan_cfg.get("mode", "Scan"))
 
     def get_scan_width(self) -> int:
-        return int(self._scan_cfg.get('width_px', 512))
-
+        d = self._get_scan_controller_detector()
+        if d is not None and hasattr(d, "get_detectorsetting"):
+            try:
+                st = d.get_detectorsetting()
+                if isinstance(st, dict):
+                    w = self._first_int(st, ("Width", "ImagingAreaWidth", "ImagingArea_Width", "ImagingAreaW"))
+                    if w is not None:
+                        self._scan_cfg["width_px"] = w
+                        return w
+            except Exception:
+                pass
+        return int(self._scan_cfg.get("width_px", 512))
 
     def get_scan_height(self) -> int:
-        return int(self._scan_cfg.get('height_px', 512))
-
+        d = self._get_scan_controller_detector()
+        if d is not None and hasattr(d, "get_detectorsetting"):
+            try:
+                st = d.get_detectorsetting()
+                if isinstance(st, dict):
+                    h = self._first_int(st, ("Height", "ImagingAreaHeight", "ImagingArea_Height", "ImagingAreaH"))
+                    if h is not None:
+                        self._scan_cfg["height_px"] = h
+                        return h
+            except Exception:
+                pass
+        return int(self._scan_cfg.get("height_px", 512))
 
     def get_scan_pixel_dwell(self) -> Quantity:
-        return Q_(float(self._scan_cfg.get('pixel_dwell_us', 10.0)), Units.US)
-
+        # No stable public getter in PyJEM docs; keep as local config for now.
+        return Q_(float(self._scan_cfg.get("pixel_dwell_us", 10.0)), Units.US)
 
     def get_scan_flyback(self) -> Quantity:
-        return Q_(float(self._scan_cfg.get('flyback_us', 0.0)), Units.US)
-
+        # No stable public getter in PyJEM docs; keep as local config for now.
+        return Q_(float(self._scan_cfg.get("flyback_us", 100.0)), Units.US)
 
     def get_scan_rotation(self) -> Quantity:
+        # Prefer TEM3.Scan3 for rotation readback.
+        if self.scan and hasattr(self.scan, "GetRotationAngleEx"):
+            try:
+                return Q_(float(self.scan.GetRotationAngleEx()), Units.DEG)
+            except Exception:
+                pass
         if self.scan and hasattr(self.scan, "GetRotationAngle"):
-            return Q_(float(self.scan.GetRotationAngle()), Units.DEG)
-        return Q_(0.0, Units.DEG)
+            try:
+                return Q_(float(self.scan.GetRotationAngle()), Units.DEG)
+            except Exception:
+                pass
+
+        # Fallback: try detector settings (if present).
+        d = self._get_scan_controller_detector()
+        if d is not None and hasattr(d, "get_detectorsetting"):
+            try:
+                st = d.get_detectorsetting()
+                if isinstance(st, dict):
+                    ang = self._first_float(st, ("ScanRotation", "ScanRotationValue", "ScanRotationDeg"))
+                    if ang is not None:
+                        return Q_(ang, Units.DEG)
+            except Exception:
+                pass
+
+        return Q_(float(self._scan_cfg.get("rotation_deg", 0.0)), Units.DEG)
 
     def get_scan_active(self) -> bool:
+        # Prefer TEM3.Scan3 ext scan mode.
         if self.scan and hasattr(self.scan, "GetExtScanMode"):
-            return bool(self.scan.GetExtScanMode())
-        return False
-
-    # --- Setters ---
+            try:
+                return bool(int(self.scan.GetExtScanMode()) == 1)
+            except Exception:
+                pass
+        return bool(self._scan_cfg.get("active", False))
 
     def set_scan_mode(self, mode: str) -> None:
-        if self.scan and hasattr(self.scan, "SetExtScanMode"):
+        m = (mode or "").strip().lower()
+        mapping = {"scan": 0, "full": 0, "full frame": 0, "spot": 1, "area": 3, "subarea": 3}
+        if m not in mapping and m.isdigit():
+            mapping[m] = int(m)
+        val = mapping.get(m)
+        if val is None:
+            raise ValueError(f"Unsupported scan mode: {mode!r} (expected Scan/Spot/Area)")
+
+        d = self._get_scan_controller_detector()
+        if d is not None and hasattr(d, "set_scanmode"):
             try:
-                self.scan.SetExtScanMode(int(mode))
-            except ValueError:
+                d.set_scanmode(int(val))
+                self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
+                return
+            except Exception:
+                pass
+
+        self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
+
+    def _set_imaging_area(
+        self,
+        *,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+    ) -> None:
+        """Best-effort wrapper around detector.Detector.set_imaging_area()."""
+        d = self._get_scan_controller_detector()
+        if d is None:
+            return
+
+        w = int(width if width is not None else self._scan_cfg.get("width_px", 512))
+        h = int(height if height is not None else self._scan_cfg.get("height_px", 512))
+        xx = int(x if x is not None else self._scan_cfg.get("x_px", 0))
+        yy = int(y if y is not None else self._scan_cfg.get("y_px", 0))
+
+        self._scan_cfg.update({"width_px": w, "height_px": h, "x_px": xx, "y_px": yy})
+
+        if hasattr(d, "set_imaging_area"):
+            try:
+                d.set_imaging_area(w, h, xx, yy)
+                return
+            except Exception:
                 pass
 
     def set_scan_width(self, width: int) -> None:
-        self._scan_cfg['width_px'] = int(width)
-
+        self._set_imaging_area(width=int(width))
 
     def set_scan_height(self, height: int) -> None:
-        self._scan_cfg['height_px'] = int(height)
-
+        self._set_imaging_area(height=int(height))
 
     def set_scan_pixel_dwell(self, time: Quantity) -> None:
         try:
             us = float(time.to(Units.US).magnitude)
         except Exception:
             us = float(time.magnitude)
-        self._scan_cfg['pixel_dwell_us'] = us
-
+        self._scan_cfg["pixel_dwell_us"] = us
 
     def set_scan_flyback(self, time: Quantity) -> None:
         try:
             us = float(time.to(Units.US).magnitude)
         except Exception:
             us = float(time.magnitude)
-        self._scan_cfg['flyback_us'] = us
-
+        self._scan_cfg["flyback_us"] = us
 
     def set_scan_rotation(self, angle: Quantity) -> None:
+        deg = float(angle.to(Units.DEG).magnitude)
+        self._scan_cfg["rotation_deg"] = deg
+
+        d = self._get_scan_controller_detector()
+        if d is not None and hasattr(d, "set_scanrotation"):
+            try:
+                d.set_scanrotation(float(deg))
+                return
+            except Exception:
+                pass
+
+        if self.scan and hasattr(self.scan, "SetRotationAngleEx"):
+            try:
+                self.scan.SetRotationAngleEx(float(deg))
+                return
+            except Exception:
+                pass
         if self.scan and hasattr(self.scan, "SetRotationAngle"):
-            self.scan.SetRotationAngle(int(angle.to(Units.DEG).magnitude))
+            try:
+                self.scan.SetRotationAngle(int(round(deg)) % 360)
+            except Exception:
+                pass
 
     def set_scan_active(self, active: bool) -> None:
-        # Map Start/Stop to ExtScanMode 1/0
+        self._scan_cfg["active"] = bool(active)
+
+        d = self._get_scan_controller_detector()
+        if d is not None:
+            if active and hasattr(d, "livestart"):
+                try:
+                    d.livestart()
+                    return
+                except Exception:
+                    pass
+            if (not active) and hasattr(d, "livestop"):
+                try:
+                    d.livestop()
+                    return
+                except Exception:
+                    pass
+
         val = 1 if active else 0
         if self.scan and hasattr(self.scan, "SetExtScanMode"):
-            self.scan.SetExtScanMode(val)
+            try:
+                self.scan.SetExtScanMode(val)
+            except Exception:
+                pass
 
     # =========================================================================
     # 7. Detector Control (Atomic)
