@@ -1302,11 +1302,21 @@ def _auto_from_dict(
 @dataclass
 class Point:
     """
-    Simple 3D point used for geometry and settings.
+    Simple 3D point used for geometry and alignments.
 
     Role:     Structure
     Context:  Both (Data-plane / Control-plane)
     Category: A (Config)
+
+    Attributes:
+        x (Optional[float]): X coordinate.
+            None Behavior: Defaulted to 0.0.
+        y (Optional[float]): Y coordinate.
+            None Behavior: Defaulted to 0.0.
+        z (Optional[float]): Z coordinate.
+            None Behavior: Defaulted to 0.0.
+        name (Optional[str]): Label for this point.
+            None Behavior: Preserved as None.
     """
     x: Optional[float] = None
     y: Optional[float] = None
@@ -1402,13 +1412,25 @@ class StagePosition:
     Category: C / D (Measured State / Intent)
 
     Attributes:
+        name (Optional[str]): Label for this position (e.g. "Sample Center").
+            None Behavior: Preserved as None.
         x, y, z (Optional[Quantity]): Translation coordinates. Units: nm.
             None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
-        tilt_x, tilt_y (Optional[Quantity]): Rotation/Alpha-Beta tilts. Units: degree.
+        r (Optional[Quantity]): Rotation coordinate. Units: deg.
             None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
+        tilt_x, tilt_y (Optional[Quantity]): Alpha/Beta tilts. Units: deg.
+            None Behavior: Snapshot (Unknown) | Intent (No Change/Wildcard).
+        coordinate_system (Optional[str]): Reference frame ID.
+            None Behavior: Preserved as None.
+
     Behavior:
-      - Manual Construction: Defaults to STRICT (Safe for control scripts).
-      - Ingestion (from_dict): Inherits mode from parent (usually LENIENT for State).
+        1. Snapshot (Telemetry): Represents the physical location of the stage.
+           Fields capable of being read are populated; others are None.
+        2. Intent (Movement): Represents a target or a delta.
+           - Absolute Move: Fields set to None are ignored (axes do not move).
+           - Relative Move: Fields set to None imply 0 delta.
+        3. Arithmetic: Supports vector math (pos_a + pos_b, target - current).
+           Math operations propagate None (None + 10 = None).
     """
     name: Optional[str] = None
     x: Optional["Quantity"] = None
@@ -1513,14 +1535,24 @@ class StageSystemSettings:
     Attributes:
         enabled (Optional[bool]): Master toggle for stage interaction.
             None Behavior: Defaulted to True.
-        max_step_distance (Optional[Quantity]): Safety cap for XY travel. Units: nm.
-            None Behavior: Defaulted to 50,000 nm.
-        settle_time (Optional[Quantity]): Time to wait for vibration damping. Units: seconds.
-            None Behavior: Defaulted to 0.2 seconds.
+        can_x, can_y, can_z (Optional[bool]): Individual axis toggles.
+            None Behavior: Defaulted to True.
+        can_r, can_tilt_x, can_tilt_y (Optional[bool]): Individual axis toggles.
+            None Behavior: Defaulted to False.
         x_limits, y_limits, z_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
-            None Behavior:
-              - STRICT: Raises Validation Error (Mandatory if enabled).
-              - LENIENT: Heals by disabling the axis (can_x -> False).
+            None Behavior: Preserved as None (Axis disabled).
+        r_limits, tilt_x_limits, tilt_y_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
+            None Behavior: Preserved as None (Axis disabled).
+        max_step_distance (Optional[Quantity]): Safety cap for XY/Z travel per move. Units: nm.
+            None Behavior: Defaulted to 50,000 nm.
+        max_step_deg (Optional[Quantity]): Safety cap for rotation per move. Units: deg.
+            None Behavior: Defaulted to 1.0 deg.
+        eucentric_z (Optional[Quantity]): Calibrated sample height. Units: nm.
+            None Behavior: Preserved as None.
+        settle_time (Optional[Quantity]): Time to wait for vibration damping. Units: s.
+            None Behavior: Defaulted to 0.2 s.
+        timeout (Optional[Quantity]): Max duration for move operations. Units: s.
+            None Behavior: Defaulted to 10.0 s.
     """
     enabled: Optional[bool] = None
     can_x: Optional[bool] = None
@@ -1724,20 +1756,33 @@ class StageSystemSettings:
 @dataclass
 class BeamSettings:
     """
-    Optical parameters of the electron beam for both state reporting and control.
-    ILLUMINATION SYSTEM (Gun + Condensers). Controls the beam *before* it hits the sample.
+    Optical parameters of the electron beam (Gun + Condensers).
 
-    Role:     Gatekeeper (System Limits)
-    Context:  Control-plane
-    Category: A / B (Config and Structure)
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Both (Data-plane / Control-plane)
+    Category: C / D (Measured State / Intent)
 
     Attributes:
         voltage (Optional[Quantity]): Accelerating voltage. Units: kV.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
-        spot_size (Optional[int]): Beam focus index.
+        beam_current (Optional[Quantity]): Measured current. Units: nA.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
-        defocus (Optional[Quantity]): Lens shift from focus. Units: nm.
+        spot_size (Optional[int]): Beam focus/condenser index.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
+        convergence_angle (Optional[Quantity]): Alpha angle. Units: mrad.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        beam_shift (Optional[Point]): Beam alignment shift.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        condenser_stigmation (Optional[Point]): Stigmator coil values.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        gun_tilt (Optional[Point]): Gun alignment tilt.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the active state of the column.
+        2. Intent (Control): Represents a partial configuration change.
+           Example: BeamSettings(spot_size=3) will change ONLY the spot size,
+           leaving voltage and alignments untouched.
     """
     voltage: Optional["Quantity"] = None
     beam_current: Optional["Quantity"] = None
@@ -1794,95 +1839,27 @@ class BeamSettings:
 BeamState = BeamSettings
 
 @dataclass
-class ProjectionSettings:
-    """
-    IMAGING SYSTEM (Objective + Projectors).
-    Controls the optics *after* the sample.
-    [NEW CLASS]
-    """
-    optical_mode: Optional[str] = None  # "IMAGING", "DIFFRACTION", "LAD"
-
-    # Imaging Parameters (IMAGING mode)
-    magnification_index: Optional[int] = None
-    defocus: Optional["Quantity"] = None
-    objective_stigmation: Optional[Point] = None
-    image_shift: Optional[Point] = None
-
-    # Diffraction Parameters (DIFFRACTION mode)
-    camera_length: Optional["Quantity"] = None
-    diffraction_shift: Optional[Point] = None
-
-    screen_position: Optional[str] = None  # "UP", "DOWN"
-
-    extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
-
-    _UNITS = {
-        "defocus": Units.NM,
-        "camera_length": Units.MM
-    }
-
-    def __post_init__(self):
-        p = FieldParser(self, self._mode, "ProjectionSettings")
-        self.optical_mode = p.str(self.optical_mode, "optical_mode")
-        self.magnification_index = p.int(self.magnification_index, "magnification_index")
-        self.defocus = p.qty(self.defocus, "defocus", Units.NM)
-        self.camera_length = p.qty(self.camera_length, "camera_length", Units.MM)
-        self.screen_position = p.str(self.screen_position, "screen_position")
-
-        self.objective_stigmation = p.model(Point, self.objective_stigmation, "objective_stigmation")
-        self.image_shift = p.model(Point, self.image_shift, "image_shift")
-        self.diffraction_shift = p.model(Point, self.diffraction_shift, "diffraction_shift")
-
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        v = Validator(self, mode)
-
-        v.check_nested(self.objective_stigmation)
-        v.check_nested(self.image_shift)
-
-        # --- NEW VALIDATION LOGIC ---
-        v.check_ge_zero(self.camera_length, "camera_length", unit_aware=True, reset_to=None)
-        v.check_ge_zero(self.magnification_index, "magnification_index", reset_to=None)
-
-        if self.screen_position:
-            v.check(self.screen_position in {"UP", "DOWN"}, "screen_position",
-                    "Must be UP or DOWN", heal=lambda: setattr(self, 'screen_position', None))
-
-        # Consistency Check: Mode vs Value
-        if self.optical_mode == "DIFFRACTION" and self.camera_length is None:
-            # In strict mode, if you switch to diffraction, you must know the length
-            v.check(False, "missing_cam_len", "Diffraction mode requires camera_length")
-
-        return v.valid
-
-    def to_dict(self) -> dict:
-        return _auto_to_dict(self, unit_map=self._UNITS)
-
-    @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ProjectionSettings":
-        return _auto_from_dict(ProjectionSettings, d, mode, alias_map={
-            "defocus": "defocus_nm", "camera_length": "camera_length_mm"
-        })
-
-@dataclass
 class BeamSystemSettings:
     """
-    Safety limits and supported ranges for beam optics and high voltage.
-    Safety limits for ILLUMINATION (Gun/Condensers)
+    Safety limits and capabilities for the Illumination system.
 
     Role:     Gatekeeper (System Limits)
     Context:  Control-plane
-    Category: A / B (Config and Structure)
+    Category: A (Strict Runtime Config)
 
     Attributes:
         enabled (Optional[bool]): Master toggle for beam control.
             None Behavior: Defaulted to True.
-        default_beam (Optional[BeamSettings]): Baseline settings for beam reset.
-            None Behavior: Structural Default (Empty BeamSettings).
+        default_beam (Optional[BeamSettings]): Baseline settings for reset.
+            None Behavior: Structural Default (Empty object).
         voltage_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max HT. Units: kV.
-            None Behavior: Preserved as None (implies 'Unlimited').
+            None Behavior: Preserved as None (Unlimited).
+        beam_current_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max Current. Units: nA.
+            None Behavior: Preserved as None (Unlimited).
         spot_size_limits (Optional[Tuple[int, int]]): Valid range for spot indices.
-            None Behavior: Preserved as None.
+            None Behavior: Preserved as None (Unlimited).
+        convergence_angle_limits (Optional[Tuple[Quantity, Quantity]]): Valid range. Units: mrad.
+            None Behavior: Preserved as None (Unlimited).
     """
     enabled: Optional[bool] = None
     default_beam: Optional[BeamSettings] = None
@@ -1974,10 +1951,122 @@ class BeamSystemSettings:
         })
 
 @dataclass
+class ProjectionSettings:
+    """
+    Imaging system controls (Objective + Projectors).
+
+    Role:     Dual-Use (Snapshot and Intent)
+    Context:  Both (Data-plane / Control-plane)
+    Category: C / D (Measured State / Intent)
+
+    Attributes:
+        optical_mode (Optional[str]): Active lens program (e.g. "IMAGING", "DIFFRACTION").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        magnification_index (Optional[int]): Discrete step index for mag.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        defocus (Optional[Quantity]): Deviation from focus. Units: nm.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        camera_length (Optional[Quantity]): Effective camera length (Diffraction). Units: mm.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        objective_stigmation (Optional[Point]): Objective stigmator coils.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        image_shift (Optional[Point]): Image shift coils.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        diffraction_shift (Optional[Point]): Diffraction shift coils.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        screen_position (Optional[str]): Mechanical screen state ("UP", "DOWN").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the active imaging state.
+        2. Intent (Control): Represents a partial configuration change.
+           - Mode Switching: If `optical_mode` changes (e.g. to DIFFRACTION),
+             associated fields (e.g. `camera_length`) become mandatory.
+    """
+    optical_mode: Optional[str] = None  # "IMAGING", "DIFFRACTION", "LAD"
+
+    # Imaging Parameters (IMAGING mode)
+    magnification_index: Optional[int] = None
+    defocus: Optional["Quantity"] = None
+    objective_stigmation: Optional[Point] = None
+    image_shift: Optional[Point] = None
+
+    # Diffraction Parameters (DIFFRACTION mode)
+    camera_length: Optional["Quantity"] = None
+    diffraction_shift: Optional[Point] = None
+
+    screen_position: Optional[str] = None  # "UP", "DOWN"
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "defocus": Units.NM,
+        "camera_length": Units.MM
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ProjectionSettings")
+        self.optical_mode = p.str(self.optical_mode, "optical_mode")
+        self.magnification_index = p.int(self.magnification_index, "magnification_index")
+        self.defocus = p.qty(self.defocus, "defocus", Units.NM)
+        self.camera_length = p.qty(self.camera_length, "camera_length", Units.MM)
+        self.screen_position = p.str(self.screen_position, "screen_position")
+
+        self.objective_stigmation = p.model(Point, self.objective_stigmation, "objective_stigmation")
+        self.image_shift = p.model(Point, self.image_shift, "image_shift")
+        self.diffraction_shift = p.model(Point, self.diffraction_shift, "diffraction_shift")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+
+        v.check_nested(self.objective_stigmation)
+        v.check_nested(self.image_shift)
+
+        # --- NEW VALIDATION LOGIC ---
+        v.check_ge_zero(self.camera_length, "camera_length", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.magnification_index, "magnification_index", reset_to=None)
+
+        if self.screen_position:
+            v.check(self.screen_position in {"UP", "DOWN"}, "screen_position",
+                    "Must be UP or DOWN", heal=lambda: setattr(self, 'screen_position', None))
+
+        # Consistency Check: Mode vs Value
+        if self.optical_mode == "DIFFRACTION" and self.camera_length is None:
+            # In strict mode, if you switch to diffraction, you must know the length
+            v.check(False, "missing_cam_len", "Diffraction mode requires camera_length")
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ProjectionSettings":
+        return _auto_from_dict(ProjectionSettings, d, mode, alias_map={
+            "defocus": "defocus_nm", "camera_length": "camera_length_mm"
+        })
+
+@dataclass
 class ProjectionSystemSettings:
     """
-    Safety limits for IMAGING (Objective/Projectors).
-    [NEW CLASS]
+    Safety limits for the Projection system.
+
+    Role:     Gatekeeper (System Limits)
+    Context:  Control-plane
+    Category: A (Strict Runtime Config)
+
+    Attributes:
+        enabled (Optional[bool]): Master toggle for projection controls.
+            None Behavior: Defaulted to True.
+        default_projection (Optional[ProjectionSettings]): Baseline settings.
+            None Behavior: Structural Default (Empty object).
+        camera_length_limits (Optional[Tuple[Quantity, Quantity]]): Valid range for diffraction.
+            None Behavior: Preserved as None (Unlimited).
+        magnification_limits (Optional[Tuple[int, int]]): Valid range for mag indices.
+            None Behavior: Preserved as None (Unlimited).
+        defocus_limits (Optional[Tuple[Quantity, Quantity]]): Safety limits for defocus.
+            None Behavior: Preserved as None (Unlimited).
     """
     enabled: Optional[bool] = None
     default_projection: Optional[ProjectionSettings] = None
@@ -2013,30 +2102,82 @@ class ProjectionSystemSettings:
             v.check(mn <= mx, "camera_length_limits", "min > max")
         return v.valid
 
+    def is_safe_projection(self, target: ProjectionSettings) -> SafetyCheck:
+        reasons = []
+
+        # Check Diffraction Limits
+        if target.optical_mode == "DIFFRACTION" and target.camera_length is not None:
+            if self.camera_length_limits:
+                mn, mx = self.camera_length_limits
+                if not (mn <= target.camera_length <= mx):
+                    reasons.append(f"Camera length {target.camera_length} outside limits {self.camera_length_limits}")
+
+        # Check Defocus Limits
+        if target.defocus is not None and self.defocus_limits:
+            mn, mx = self.defocus_limits
+            if not (mn <= target.defocus <= mx):
+                reasons.append(f"Defocus {target.defocus} outside limits {self.defocus_limits}")
+
+        # Check Mag Limits
+        if target.magnification_index is not None and self.magnification_limits:
+            mn, mx = self.magnification_limits
+            if not (mn <= target.magnification_index <= mx):
+                reasons.append(f"Mag index {target.magnification_index} outside limits {self.magnification_limits}")
+
+        return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
+
     def to_dict(self) -> dict:
         return _auto_to_dict(self, unit_map=self._UNITS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ProjectionSystemSettings":
-        return _auto_from_dict(ProjectionSystemSettings, d, mode)
+        return _auto_from_dict(ProjectionSystemSettings, d, mode, alias_map={
+            "camera_length_limits": "camera_length_limits_mm",
+            "defocus_limits": "defocus_limits_nm"
+        })
 
 @dataclass
 class DetectorSettings:
     """
-    Detector parameters used for reporting state and requesting image acquisition.
+    Detector parameters for state reporting and acquisition requests.
 
     Role:     Dual-Use (Snapshot and Intent)
     Context:  Both (Data-plane / Control-plane)
     Category: C / D (Measured State / Intent)
 
     Attributes:
-        detector_id (Optional[str]): The identifier of the camera to use.
-            None Behavior: Allowed for generic presets. Must be resolved/populated
-                           before execution (e.g. by AcquisitionRequest).
+        detector_id (Optional[str]): The identifier of the camera.
+            None Behavior: Preserved as None.
         exposure (Optional[Quantity]): Integration time. Units: ms.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
-        roi (Optional[ROI]): Pixel-coordinate window on the sensor.
-            None Behavior: Snapshot (Unknown/Full) | Intent (No Change).
+        binning_index (Optional[int]): Discrete binning level.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        binning_xy (Optional[Tuple[int, int]]): Explicit X/Y binning.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        roi (Optional[ROI]): Sub-region readout window.
+            None Behavior: Snapshot (Full Sensor) | Intent (No Change).
+        frame_integration (Optional[int]): Number of internal hardware averages.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        gain_index, offset_index (Optional[int]): Sensor amplifier settings.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        digital_rotation (Optional[Quantity]): Post-processing rotation. Units: deg.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        frame_rate (Optional[Quantity]): Continuous acquisition speed. Units: Hz.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        total_frames (Optional[int]): Number of frames to capture (Movie mode).
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        readout_mode (Optional[str]): Sensor readout strategy (e.g. "LINEAR").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        shutter_mode (Optional[str]): Shutter timing (e.g. "PRE_SPECIMEN").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        save_frames (Optional[bool]): Whether to save individual movie frames.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the idle state of the camera.
+        2. Intent (Control): Used to configure the camera permanently.
+        3. Intent (Acquisition): Used ephemerally for a single 'Take Picture' event.
+           Values defined here override the persistent camera state for that one shot.
     """
     detector_id: Optional[str] = None
     exposure: Optional["Quantity"] = None
@@ -2122,7 +2263,9 @@ class DetectorSettings:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "DetectorSettings":
         return _auto_from_dict(DetectorSettings, d, mode, alias_map={
-            "exposure": "exposure_ms"
+            "exposure": "exposure_ms",
+            "digital_rotation": "digital_rotation_deg",
+            "frame_rate": "frame_rate_hz"
         })
 
 # Alias for semantic clarity in Read-Only contexts
@@ -2131,17 +2274,25 @@ DetectorState = DetectorSettings
 @dataclass
 class DetectorCapabilities:
     """
-    Hardware-specific profile used to assess if a request is supported by the device.
+    Hardware-specific profile of detector features and limits.
 
     Role:     Gatekeeper (Capabilities)
     Context:  Control-plane
     Category: C (Measured State)
 
     Attributes:
-        can_binning (Optional[bool]): If the sensor supports hardware pixel grouping.
-            None Behavior: Preserved as None (Unknown).
-        exposure_min, exposure_max (Optional[Quantity]): Physical timing limits. Units: ms.
-            None Behavior: Preserved as None (Unknown).
+        can_binning (Optional[bool]): Supports pixel binning.
+        binning_index_min, binning_index_max (Optional[int]): Range of bin indices.
+        binning_xy_min, binning_xy_max (Optional[Tuple[int, int]]): Range of bin factors.
+        exposure_min, exposure_max (Optional[Quantity]): Exposure limits. Units: ms.
+        frame_integration_min, frame_integration_max (Optional[int]): Averaging limits.
+        roi_size_min, roi_size_max (Optional[Tuple[int, int]]): ROI dimension limits.
+        can_gain (Optional[bool]): Supports gain adjustment.
+        gain_index_min, gain_index_max (Optional[int]): Gain limits.
+        can_offset (Optional[bool]): Supports offset adjustment.
+        offset_index_min, offset_index_max (Optional[int]): Offset limits.
+        can_digital_rotation (Optional[bool]): Supports hardware rotation.
+        digital_rotation_min, digital_rotation_max (Optional[Quantity]): Rotation limits.
     """
     can_binning: Optional[bool] = None
     binning_index_min: Optional[int] = None
@@ -2361,15 +2512,19 @@ class DetectorCapabilities:
 @dataclass
 class DetectorSystemSettings:
     """
-    Registry for available detectors and their associated capability profiles.
+    Registry for available detectors and their capability profiles.
 
     Role:     Gatekeeper (System Registry)
     Context:  Control-plane
     Category: B (Structural Container)
 
     Attributes:
+        enabled (Optional[bool]): Master toggle for detector system.
+            None Behavior: Defaulted to True.
         available_detector_ids (Optional[List[str]]): List of known device names.
             None Behavior: Structural Default (Empty List).
+        default_detector_id (Optional[str]): Primary detector name.
+            None Behavior: Preserved as None.
         defaults_by_id (Optional[Dict[str, DetectorSettings]]): Base settings per device.
             None Behavior: Structural Default (Empty Dict).
         capabilities_by_id (Optional[Dict[str, DetectorCapabilities]]): Hardware limits per device.
@@ -2448,8 +2603,27 @@ class ScanSettings:
     Configuration for the STEM raster scan engine.
 
     Role:     Dual-Use (Snapshot and Intent)
-    Context:  Control-plane
-    Category: C / D
+    Context:  Both (Data-plane / Control-plane)
+    Category: C / D (Measured State / Intent)
+
+    Attributes:
+        scan_mode (Optional[str]): The scanning strategy (e.g. "Full Frame").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        width_px (Optional[int]): Scan grid width.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        height_px (Optional[int]): Scan grid height.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        pixel_dwell_time (Optional[Quantity]): Time per pixel. Units: us.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        flyback_time (Optional[Quantity]): Retrace time between lines. Units: us.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        scan_rotation (Optional[Quantity]): Rotation of scan axes. Units: deg.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the currently active scan parameters.
+        2. Intent (Control): Used in `ScanControlRequest` to configure the engine.
+           Any field set to None retains the previous value.
     """
     scan_mode: Optional[str] = None
 
@@ -2521,11 +2695,23 @@ class ScanSettings:
 @dataclass
 class ScanSystemSettings:
     """
-    Hardware capabilities and safety limits for the STEM scan engine.
+    Hardware capabilities and limits for the STEM scan engine.
 
     Role:     Gatekeeper (System Limits)
     Context:  Control-plane
     Category: A (Strict Runtime Config)
+
+    Attributes:
+        enabled (Optional[bool]): Master toggle for scan engine.
+            None Behavior: Defaulted to True.
+        available_scan_modes (Optional[List[str]]): Supported strategies.
+            None Behavior: Preserved as None.
+        pixel_dwell_time_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max dwell.
+            None Behavior: Preserved as None (Unlimited).
+        flyback_time_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max flyback.
+            None Behavior: Preserved as None (Unlimited).
+        scan_rotation_limits (Optional[Tuple[Quantity, Quantity]]): Min/Max rotation.
+            None Behavior: Preserved as None (Unlimited).
     """
     enabled: Optional[bool] = None
 
@@ -2601,7 +2787,9 @@ class ScanSystemSettings:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ScanSystemSettings":
         return _auto_from_dict(ScanSystemSettings, d, mode, alias_map={
-            "pixel_dwell_time_limits": "dwell_time_limits_us"
+            "pixel_dwell_time_limits": "pixel_dwell_time_limits_us",
+            "flyback_time_limits": "flyback_time_limits_us",
+            "scan_rotation_limits": "scan_rotation_limits_deg"
         })
 
 @dataclass
@@ -2611,7 +2799,26 @@ class VacuumSettings:
 
     Role:     Dual-Use (Snapshot and Intent)
     Context:  Control-plane
-    Category: C / D
+    Category: C / D (Measured State / Intent)
+
+    Attributes:
+        column_valve_state (Optional[str]): V7/V4 state ("OPEN", "CLOSED").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        gun_valve_state (Optional[str]): V1 state ("OPEN", "CLOSED").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        turbo_pump_state (Optional[str]): Turbo status ("ON", "OFF").
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+        column_pressure (Optional[Quantity]): Column gauge. Units: Pa.
+            None Behavior: Snapshot (Unknown).
+        gun_pressure (Optional[Quantity]): Gun/FEG gauge. Units: Pa.
+            None Behavior: Snapshot (Unknown).
+        buffer_tank_pressure (Optional[Quantity]): Buffer gauge. Units: Pa.
+            None Behavior: Snapshot (Unknown).
+
+    Behavior:
+        1. Snapshot (Telemetry): Returns all valve states and gauge readings.
+        2. Intent (Control): Only 'state' fields (valves/pumps) are actionable.
+           Pressure fields are Read-Only; setting them in a request is ignored.
     """
     column_valve_state: Optional[str] = None  # "OPEN", "CLOSED" (aka V7/V4)
     gun_valve_state: Optional[str] = None  # "OPEN", "CLOSED" (aka V1)
@@ -2654,50 +2861,11 @@ class VacuumSettings:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "VacuumSettings":
         return _auto_from_dict(VacuumSettings, d, mode, alias_map={
-            "column_valve": "column_valve_state",
-            "v7": "column_valve_state",
-            "column_pressure": "column_pressure_pa"
+            "column_valve_state": "column_valve",
+            "column_pressure": "column_pressure_pa",
+            "gun_pressure": "gun_pressure_pa",
+            "buffer_tank_pressure": "buffer_tank_pressure_pa"
         })
-
-@dataclass
-class ImageOutputSettings:
-    """
-    Configuration for naming conventions and storage formats for acquired data.
-
-    Role:     Gatekeeper (Output Config)
-    Context:  Control-plane
-    Category: A (Config)
-
-    Attributes:
-        file_format (Optional[str]): Destination format (tiff, png, jpg, bmp).
-            None Behavior: Defaulted to "tiff".
-        path (Optional[str]): Base directory or template for saving files.
-            None Behavior: Preserved as None (implies auto-selection or current dir).
-    """
-    file_format: Optional[str] = None
-    path: Optional[str] = None
-    extra: Extras = field(default_factory=Extras)
-    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
-
-    def __post_init__(self):
-        p = FieldParser(self, self._mode, "ImageOutputSettings")
-        _fmt = p.str(self.file_format, "file_format")
-        self.file_format = (_fmt.lower() if _fmt else "tiff")
-        self.path = p.str(self.path, "path")
-
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        v = Validator(self, mode)
-        v.check(self.file_format in {"tiff", "tif", "png", "jpg", "jpeg", "bmp"},
-                "file_format", f"Unsupported format: {self.file_format}",
-                heal=lambda: setattr(self, 'file_format', "tiff"))
-        return v.valid
-
-    def to_dict(self) -> dict:
-        return _auto_to_dict(self)
-
-    @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ImageOutputSettings":
-        return _auto_from_dict(ImageOutputSettings, d, mode)
 
 @dataclass
 class Aperture:
@@ -2709,10 +2877,21 @@ class Aperture:
     Category: C / D (Measured State / Intent)
 
     Attributes:
+        aperture_id (Optional[str]): The mechanism ID (e.g. "condenser", "objective").
+            None Behavior: Preserved as None.
         inserted (Optional[bool]): Whether the aperture is in the beam path.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
         size_index (Optional[int]): The currently selected hole size index.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
+        position (Optional[Point]): Mechanical micro-position.
+            None Behavior: Snapshot (Unknown) | Intent (No Change).
+
+    Behavior:
+        1. Snapshot (Telemetry): Represents the current mechanism state.
+        2. Intent (Control): Represents a desire to change state.
+           - Insert/Retract: Set `inserted` to True/False.
+           - Change Size: Set `size_index`.
+           - Align: Set `position`.
     """
     aperture_id: Optional[str] = None
     inserted: Optional[bool] = None
@@ -2758,10 +2937,19 @@ class MicroscopeState:
     Category: C (Nullable Runtime)
 
     Attributes:
-        timestamp (Optional[str]): ISO8601 formatted time of capture.
-            None Behavior: Defaulted to "Now" if missing during ingestion.
+        timestamp (Optional[str]): ISO8601 time of capture.
+            None Behavior: Defaulted to "Now".
+        mode (Optional[str]): Global instrument mode (e.g. "STEM", "TEM").
+            None Behavior: Preserved as None.
         stage_position (Optional[StagePosition]): Current physical coordinates.
-            None Behavior: Structural Default (Empty StagePosition).
+        beam (Optional[BeamSettings]): Current gun/optics state.
+        projection (Optional[ProjectionSettings]): Current imaging state.
+        scan (Optional[ScanSettings]): Current raster state.
+        vacuum (Optional[VacuumSettings]): Current vacuum state.
+        apertures (Optional[Dict[str, Aperture]]): State of all apertures.
+        detectors (Optional[Dict[str, DetectorSettings]]): State of all cameras.
+        active_detector_ids (Optional[List[str]]): List of currently active cameras.
+        primary_detector_id (Optional[str]): The main camera in use.
     """
     timestamp: Optional[str] = None
     mode: Optional[str] = None
@@ -2826,21 +3014,23 @@ class MicroscopeState:
 @dataclass
 class MicroscopeImageMetadata:
     """
-    The scientific 'sidecar' metadata describing the context of an image acquisition.
+    Scientific metadata describing the context of an image acquisition.
 
     Role:     Snapshot (Scientific Context)
     Context:  Data-plane
     Category: C (Measured State)
 
     Attributes:
-        magnification (Optional[float]): The indicated microscope magnification.
-            None Behavior: Preserved as None (Unknown).
-        pixel_size_nm (Optional[Tuple[float, float]]): Calibrated pixel dimensions. Units: nm.
-            None Behavior: Preserved as None (Unknown).
-        microscope_state (Optional[MicroscopeState]): Full machine telemetry at acquisition.
-            None Behavior: Preserved as None.
-        created_at (Optional[str]): ISO8601 timestamp of acquisition.
-            None Behavior: Defaulted to 'Now' if missing during ingestion.
+        version (Optional[str]): Metadata schema version.
+        created_at (Optional[str]): Acquisition timestamp.
+        magnification (Optional[float]): Indicated mag.
+        camera_length_mm (Optional[float]): Indicated camera length.
+        pixel_size_nm (Optional[Tuple[float, float]]): Calibrated pixel scale (X, Y).
+        image_size_px (Optional[Tuple[int, int]]): Image dimensions (W, H).
+        accelerating_voltage_kv (Optional[float]): Beam voltage.
+        beam_current_na (Optional[float]): Beam current.
+        exposure_ms (Optional[float]): Exposure time.
+        microscope_state (Optional[MicroscopeState]): Full telemetry snapshot.
     """
     version: Optional[str] = None
     created_at: Optional[str] = None
@@ -3023,23 +3213,61 @@ class MicroscopeImage:
         return path
 
 @dataclass
+class ImageOutputSettings:
+    """
+    Configuration for naming conventions and storage formats.
+
+    Role:     Gatekeeper (Output Config)
+    Context:  Control-plane
+    Category: A (Config)
+
+    Attributes:
+        file_format (Optional[str]): "tiff", "png", "jpg", or "bmp".
+            None Behavior: Defaulted to "tiff".
+        path (Optional[str]): Destination directory or path template.
+            None Behavior: Preserved as None.
+    """
+    file_format: Optional[str] = None
+    path: Optional[str] = None
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ImageOutputSettings")
+        _fmt = p.str(self.file_format, "file_format")
+        self.file_format = (_fmt.lower() if _fmt else "tiff")
+        self.path = p.str(self.path, "path")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check(self.file_format in {"tiff", "tif", "png", "jpg", "jpeg", "bmp"},
+                "file_format", f"Unsupported format: {self.file_format}",
+                heal=lambda: setattr(self, 'file_format', "tiff"))
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ImageOutputSettings":
+        return _auto_from_dict(ImageOutputSettings, d, mode)
+
+@dataclass
 class SystemInfo:
     """
     Static identifying information about the microscope hardware and software.
 
     Role:     Structure / Identity
-    Context:  Both (Data-plane / Control-plane)
+    Context:  Data-plane
     Category: A (Config/Identity)
 
     Attributes:
-        name (Optional[str]): Human-readable name of the system.
-            None Behavior: Defaulted to "Unknown".
-        ip_address (Optional[str]): Network address for the microscope control PC.
-            None Behavior: Defaulted to "Unknown"; validated as IP format.
-        supertem_version (Optional[str]): Version of the SuperTEM library.
-            None Behavior: Defaulted to the current installed package version.
-        manufacturer, model, serial_number (Optional[str]): Hardware identifiers.
-            None Behavior: Defaulted to "Unknown".
+        name (Optional[str]): Human-readable system name.
+        ip_address (Optional[str]): Control PC network address.
+        manufacturer, model, serial_number (Optional[str]): Hardware IDs.
+        hardware_version, software_version (Optional[str]): Vendor versions.
+        supertem_version (Optional[str]): Library version.
+        application, application_version (Optional[str]): Client app info.
     """
     name: Optional[str] = None
     ip_address: Optional[str] = None
@@ -3090,18 +3318,16 @@ class SystemSettings:
     Root container for system-wide settings and limit registries.
 
     Role:     Structure / Gateway
-    Context:  Both (Data-plane / Control-plane)
+    Context:  Control-plane
     Category: B (Structural Container)
 
     Attributes:
-        stage_system (Optional[StageSystemSettings]): Limits for sample motion.
-            None Behavior: Structural Default (Empty StageSystemSettings).
-        beam_system (Optional[BeamSystemSettings]): Limits for optics and voltage.
-            None Behavior: Structural Default (Empty BeamSystemSettings).
-        detector_system (Optional[DetectorSystemSettings]): Registry of camera hardware.
-            None Behavior: Structural Default (Empty DetectorSystemSettings).
-        info (Optional[SystemInfo]): Static hardware/software identification.
-            None Behavior: Structural Default (Empty SystemInfo).
+        stage_system (Optional[StageSystemSettings]): Stage limits.
+        beam_system (Optional[BeamSystemSettings]): Beam limits.
+        projection_system (Optional[ProjectionSystemSettings]): Projection limits.
+        scan_system (Optional[ScanSystemSettings]): Scan limits.
+        detector_system (Optional[DetectorSystemSettings]): Detector registry.
+        info (Optional[SystemInfo]): Static identity.
     """
     stage_system: Optional[StageSystemSettings] = None
     beam_system: Optional[BeamSystemSettings] = None
@@ -3151,19 +3377,16 @@ class SystemSettings:
 @dataclass
 class MicroscopeSettings:
     """
-    Root configuration for a microscope instance and its supported subsystems.
+    Root configuration for a microscope instance.
 
     Role:     Structure / Gateway
-    Context:  Both (Data-plane / Control-plane)
+    Context:  Control-plane
     Category: B (Structural Container)
 
     Attributes:
-        system (Optional[SystemSettings]): The hardware limits and registries.
-            None Behavior: Structural Default (Empty SystemSettings).
-        image (Optional[ImageOutputSettings]): Default save and naming settings.
-            None Behavior: Structural Default (Empty ImageOutputSettings).
-        protocol (Optional[dict]): High-level automation logic definitions.
-            None Behavior: Defaulted to a "demo" protocol dict.
+        system (Optional[SystemSettings]): Hardware limits and registries.
+        image (Optional[ImageOutputSettings]): Default output settings.
+        protocol (Optional[dict]): Automation scripts configuration.
     """
     system: Optional[SystemSettings] = None
     image: Optional[ImageOutputSettings] = None
@@ -3197,17 +3420,25 @@ class MicroscopeSettings:
 @dataclass
 class StageMoveRequest:
     """
-    A specific command to move the sample stage.
+    Command to move the sample stage to a specific coordinate.
 
     Role:     Intent (User Request)
     Context:  Control-plane
     Category: D (Tristate Intent)
 
     Attributes:
-        target (Optional[StagePosition]): The destination coordinates.
-            None Behavior: Structural Default (Empty StagePosition).
-        relative (Optional[bool]): If True, 'target' is a delta, not an absolute.
-            None Behavior: Defaulted to False for safety.
+        target (Optional[StagePosition]): Destination coordinates.
+            None Behavior: Structural Default (Empty).
+        relative (Optional[bool]): If True, target is a delta.
+            None Behavior: Defaulted to False.
+        drive_type (Optional[str]): Mechanism ("mechanical", "piezo", "default").
+            None Behavior: Defaulted to "default".
+        backlash_correction (Optional[bool]): Apply anti-hysteresis.
+            None Behavior: Defaulted to True.
+        wait_for_settle (Optional[bool]): Block until vibration stops.
+            None Behavior: Defaulted to True.
+        settle_time (Optional[Quantity]): Override default wait. Units: s.
+            None Behavior: Preserved as None.
     """
     target: Optional[StagePosition] = None
     relative: Optional[bool] = None
@@ -3263,17 +3494,17 @@ class StageMoveRequest:
 @dataclass
 class StageControlRequest:
     """
-    Command to alter the operational state of the stage motors (Stop, Home, Reset).
-    distinct from moving to a coordinate.
+    Command to alter stage motor state (Stop, Home, Reset).
 
     Role:     Intent (User Request)
     Context:  Control-plane
     Category: D (Intent)
 
     Attributes:
-        action: The command to execute ("STOP", "ABORT", "HOME", "RESET_ERROR").
-        axes: Optional list of axes to apply the action to (e.g. ["x", "y"]).
-              If None, applies to ALL axes.
+        action (Optional[str]): "STOP", "ABORT", "HOME", "RESET_ERROR".
+            None Behavior: Validation Error (Mandatory).
+        axes (Optional[List[str]]): Specific axes to target (e.g. ["x"]).
+            None Behavior: Applies to ALL axes.
     """
     action: Optional[str] = None
     axes: Optional[List[str]] = None
@@ -3311,20 +3542,22 @@ class StageControlRequest:
 @dataclass
 class DetectorControlRequest:
     """
-    Command to configure detector parameters or change mechanical state
-    WITHOUT triggering an image acquisition.
+    Command to configure detector hardware (Temp, Insert) without acquisition.
 
     Role:     Intent (User Request)
     Context:  Control-plane
     Category: D (Intent)
 
     Attributes:
-        detector_id: The specific device to target.
-        settings: Configuration to apply (e.g., binning, temperature, readout mode).
-        action: Mechanical command ("INSERT", "RETRACT", "COOLDOWN", "WARMUP").
+        detector_id (Optional[str]): Target device ID.
+            None Behavior: Required if not in target.
+        target (Optional[DetectorSettings]): Configuration parameters to apply.
+            None Behavior: Structural Default (Empty).
+        action (Optional[str]): Mechanical cmd ("INSERT", "RETRACT", "COOLDOWN").
+            None Behavior: Preserved as None.
     """
     detector_id: Optional[str] = None
-    settings: Optional[DetectorSettings] = None
+    target: Optional[DetectorSettings] = None
     action: Optional[str] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
@@ -3332,27 +3565,27 @@ class DetectorControlRequest:
     def __post_init__(self):
         p = FieldParser(self, self._mode, "DetectorControlRequest")
         self.detector_id = p.id(self.detector_id, "detector_id")
-        self.settings = p.model(DetectorSettings, self.settings, "settings", default=DetectorSettings(_mode=p.mode))
+        self.target = p.model(DetectorSettings, self.target, "target", default=DetectorSettings(_mode=p.mode))
         self.action = p.str(self.action, "action")
 
         # Sync: If settings has an ID but request doesn't, bubble it up
-        if self.settings.detector_id and not self.detector_id:
-            self.detector_id = self.settings.detector_id
+        if self.target.detector_id and not self.detector_id:
+            self.detector_id = self.target.detector_id
         # Sync: If request has ID, push it down to settings for consistency
-        elif self.detector_id and not self.settings.detector_id:
-            self.settings.detector_id = self.detector_id
+        elif self.detector_id and not self.target.detector_id:
+            self.target.detector_id = self.detector_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check(bool(self.detector_id), "detector_id", "detector_id is required")
-        v.check_nested(self.settings)
+        v.check_nested(self.target)
 
         # Logic Check: Ensure we are doing *something*
         # 1. Check if settings has any non-None fields (Intent)
         has_settings_intent = False
-        for f in dataclasses.fields(self.settings):
+        for f in dataclasses.fields(self.target):
             # Ignore internal fields and the ID itself (which is just identity, not a change)
-            if f.name not in ["extra", "_mode", "detector_id"] and getattr(self.settings, f.name) is not None:
+            if f.name not in ["extra", "_mode", "detector_id"] and getattr(self.target, f.name) is not None:
                 has_settings_intent = True
                 break
 
@@ -3384,6 +3617,10 @@ class BeamControlRequest:
     Role:     Intent (User Request)
     Context:  Control-plane
     Category: D (Intent)
+
+    Attributes:
+        target (Optional[BeamSettings]): The desired beam configuration.
+            None Behavior: Validation Error (Mandatory).
     """
     target: Optional[BeamSettings] = None
     extra: Extras = field(default_factory=Extras)
@@ -3417,7 +3654,15 @@ class BeamControlRequest:
 @dataclass
 class ProjectionControlRequest:
     """
-    Command to change imaging parameters (Defocus, Mag, Image Shift).
+    Command to change imaging parameters (Defocus, Mag, Shifts).
+
+    Role:     Intent (User Request)
+    Context:  Control-plane
+    Category: D (Intent)
+
+    Attributes:
+        target (Optional[ProjectionSettings]): The desired optical configuration.
+            None Behavior: Validation Error (Mandatory).
     """
     target: Optional[ProjectionSettings] = None
     extra: Extras = field(default_factory=Extras)
@@ -3464,11 +3709,13 @@ class ScanControlRequest:
     Category: D (Intent)
 
     Attributes:
-        action: "START", "STOP", or "SINGLE_FRAME"
-        settings: The scan parameters (dwell time, rotation) to apply.
+        action (Optional[str]): "START", "STOP", "SINGLE_FRAME".
+            None Behavior: Validation Error (Mandatory).
+        target (Optional[ScanSettings]): Parameters to apply if starting.
+            None Behavior: Validation Error if action is START.
     """
     action: Optional[str] = None  # "START", "STOP", "SINGLE_FRAME"
-    settings: Optional[ScanSettings] = None
+    target: Optional[ScanSettings] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
@@ -3476,7 +3723,7 @@ class ScanControlRequest:
         # Renamed from ScanRequest to ScanControlRequest
         p = FieldParser(self, self._mode, "ScanControlRequest")
         self.action = p.str(self.action, "action")
-        self.settings = p.model(ScanSettings, self.settings, "settings", default=ScanSettings(_mode=p.mode))
+        self.target = p.model(ScanSettings, self.target, "target", default=ScanSettings(_mode=p.mode))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
@@ -3486,7 +3733,7 @@ class ScanControlRequest:
 
         # 2. Settings required if Starting
         if self.action in {"START", "SINGLE_FRAME"}:
-            v.check_nested(self.settings)
+            v.check_nested(self.target)
 
         return v.valid
 
@@ -3500,11 +3747,17 @@ class ScanControlRequest:
 @dataclass
 class VacuumControlRequest:
     """
-    Command to change the state of valves or pumps.
+    Command to change valve or pump states.
 
     Role:     Intent (User Request)
     Context:  Control-plane
     Category: D (Intent)
+
+    Attributes:
+        target (Optional[VacuumSettings]): Desired valve/pump states.
+            None Behavior: Validation Error (Mandatory).
+        force (Optional[bool]): Bypass software pressure checks.
+            None Behavior: Defaulted to False.
     """
     target: Optional[VacuumSettings] = None
     force: Optional[bool] = None  # If True, bypasses some software soft-checks (use with caution)
@@ -3538,22 +3791,22 @@ class VacuumControlRequest:
 @dataclass
 class ApertureControlRequest:
     """
-    Intent to mechanically modify an aperture's state.
+    Command to modify an aperture's position or size.
 
     Role:     Intent (User Request)
     Context:  Control-plane
-    Category: B / D (Structure / Intent)
+    Category: D (Intent)
 
     Attributes:
-        aperture_id (Optional[str]): The mechanism to target (e.g., 'objective').
-            None Behavior: Required for execution.
-        state (Optional[Aperture]): The desired configuration changes.
-            None Behavior: Structural Default (Empty Aperture object).
-        relative (Optional[bool]): If True, position coordinates are treated as a delta.
+        aperture_id (Optional[str]): Mechanism to target.
+            None Behavior: Required.
+        target (Optional[Aperture]): Desired configuration.
+            None Behavior: Structural Default (Empty).
+        relative (Optional[bool]): If True, position is a delta.
             None Behavior: Defaulted to False.
     """
     aperture_id: Optional[str] = None
-    state: Optional[Aperture] = None
+    target: Optional[Aperture] = None
     relative: Optional[bool] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
@@ -3562,30 +3815,30 @@ class ApertureControlRequest:
         p = FieldParser(self, self._mode, "ApertureControlRequest")
         self.aperture_id = p.id(self.aperture_id, "aperture_id")
         self.relative = p.bool(self.relative, "relative", default=False)
-        self.state = p.model(Aperture, self.state, "state", default=Aperture(_mode=p.mode))
-        if self.aperture_id is None and self.state.aperture_id is not None:
-            self.aperture_id = self.state.aperture_id
-        elif self.state.aperture_id is None and self.aperture_id is not None:
-            self.state.aperture_id = self.aperture_id
+        self.target = p.model(Aperture, self.target, "target", default=Aperture(_mode=p.mode))
+        if self.aperture_id is None and self.target.aperture_id is not None:
+            self.aperture_id = self.target.aperture_id
+        elif self.target.aperture_id is None and self.aperture_id is not None:
+            self.target.aperture_id = self.aperture_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check(bool(self.aperture_id), "aperture_id", "aperture_id is required")
-        v.check_nested(self.state)
+        v.check_nested(self.target)
 
         # ID Mismatch
-        if self.state.aperture_id and self.aperture_id and self.state.aperture_id != self.aperture_id:
+        if self.target.aperture_id and self.aperture_id and self.target.aperture_id != self.aperture_id:
             v.check(False, "id_mismatch",
-                    f"Ambiguous IDs: '{self.aperture_id}' vs '{self.state.aperture_id}'",
-                    heal=lambda: setattr(self.state, 'aperture_id', self.aperture_id))
+                    f"Ambiguous IDs: '{self.aperture_id}' vs '{self.target.aperture_id}'",
+                    heal=lambda: setattr(self.target, 'aperture_id', self.aperture_id))
 
         # Relative logic check
         if self.relative:
-            v.check(self.state.position is not None, "relative_no_pos", "Relative mode requires a position vector")
+            v.check(self.target.position is not None, "relative_no_pos", "Relative mode requires a position vector")
 
         # No-Op Check
         has_intent = (
-                self.state.inserted is not None or self.state.size_index is not None or self.state.position is not None)
+                self.target.inserted is not None or self.target.size_index is not None or self.target.position is not None)
         v.check(has_intent, "empty_payload", "Request contains no changes")
 
         return v.valid
@@ -3602,19 +3855,19 @@ class ApertureControlRequest:
 @dataclass
 class AcquisitionRequest:
     """
-    High-level intent to capture an image using a specific detector and settings.
+    Intent to capture an image using a specific detector.
 
     Role:     Intent (User Request)
     Context:  Control-plane
     Category: B / D (Structure / Intent)
 
     Attributes:
-        detector_id (Optional[str]): Targeted hardware device for capture.
-            None Behavior: Preserved as None; syncs with inner DetectorSettings.
-        detector (Optional[DetectorSettings]): Detailed camera parameters.
-            None Behavior: Structural Default (Empty DetectorSettings).
-        image (Optional[ImageOutputSettings]): Specific overrides for saving this image.
-            None Behavior: Structural Default (Empty ImageOutputSettings).
+        detector_id (Optional[str]): Target hardware device.
+            None Behavior: Required (can be inferred from detector).
+        detector (Optional[DetectorSettings]): Acquisition parameters.
+            None Behavior: Structural Default (Empty).
+        image (Optional[ImageOutputSettings]): Output file overrides.
+            None Behavior: Structural Default (Empty).
     """
     detector_id: Optional[str] = None
     detector: Optional[DetectorSettings] = None
