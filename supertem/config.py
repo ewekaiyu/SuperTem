@@ -104,34 +104,94 @@ DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
             "name": "default-configuration",
             "ip_address": __DEFAULT_IP_ADDRESS__,
             "manufacturer": __DEFAULT_MANUFACTURER__,
-            "model": "Unknown",
-            "serial_number": "Unknown",
+            "model": "Simulated TEM",
+            "serial_number": "000000",
+            "software_version": "1.0.0"
         },
         "stage_system": {
             "enabled": True,
             "can_x": True, "can_y": True, "can_z": True,
-            "x_limits_nm": [-1000000.0, 1000000.0],
-            "y_limits_nm": [-1000000.0, 1000000.0],
+            "can_r": True, "can_tilt_x": False, "can_tilt_y": False,
+            "x_limits_nm": [-2000000.0, 2000000.0],
+            "y_limits_nm": [-2000000.0, 2000000.0],
             "z_limits_nm": [-100000.0, 100000.0],
+            "r_limits_deg": [-180.0, 180.0],
+            "tilt_x_limits_deg": [-70.0, 70.0],
+            "tilt_y_limits_deg": [-70.0, 70.0],
             "max_step_nm": 50000.0,
+            "max_step_deg": 5.0,
             "settle_time_s": 0.5,
+            "timeout_s": 30.0,
+            "eucentric_z_nm": 0.0
         },
         "beam_system": {
             "enabled": True,
             "voltage_limits_kv": [60.0, 300.0],
-            "default_beam": {"voltage_kv": 200.0, "beam_current_na": 0.1, "spot_size": 1}
+            "beam_current_limits_na": [0.0, 100.0],
+            "spot_size_limits": [1, 5],
+            "convergence_angle_limits_mrad": [0.0, 50.0],
+            "default_beam": {
+                "voltage_kv": 200.0,
+                "beam_current_na": 0.1,
+                "spot_size": 1,
+                "convergence_angle_mrad": 10.0
+            }
+        },
+        "projection_system": {
+            "enabled": True,
+            "camera_length_limits_mm": [50.0, 5000.0],
+            "magnification_limits": [50, 2000000],
+            "defocus_limits_nm": [-10000.0, 10000.0],
+            "default_projection": {
+                "optical_mode": "IMAGING",
+                "magnification_index": 5000,
+                "defocus_nm": 0.0
+            }
+        },
+        "scan_system": {
+            "enabled": True,
+            "available_scan_modes": ["Full Frame", "Spot"],
+            "pixel_dwell_time_limits_us": [0.1, 1000.0],
+            "flyback_time_limits_us": [0.0, 500.0],
+            "scan_rotation_limits_deg": [0.0, 360.0]
         },
         "detector_system": {
             "enabled": True,
             "available_detectors": ["SimCam"],
             "default_detector_id": "SimCam",
+            "defaults_by_id": {
+                "SimCam": {
+                    "exposure_ms": 100.0,
+                    "binning_index": 1,
+                    "frame_integration": 1,
+                    "readout_mode": "LINEAR",
+                    "save_frames": False
+                }
+            },
             "capabilities_by_id": {
-                "SimCam": {"can_binning": True, "exposure_ms_min": 0.1, "exposure_ms_max": 10000.0}
+                "SimCam": {
+                    "can_binning": True,
+                    "binning_index_min": 1,
+                    "binning_index_max": 4,
+                    "exposure_ms_min": 0.1,
+                    "exposure_ms_max": 10000.0,
+                    "roi_min": [64, 64],
+                    "roi_max": [4096, 4096],
+                    "can_gain": True,
+                    "gain_index_min": 0,
+                    "gain_index_max": 3
+                }
             }
         }
     },
-    "image": {"file_format": "tiff", "path": os.path.join(DATA_PATH, "{date}", "images")},
-    "protocol": {"name": "demo", "steps": []}
+    "image": {
+        "file_format": "tiff",
+        "path": os.path.join(DATA_PATH, "{date}", "images")
+    },
+    "protocol": {
+        "name": "demo",
+        "steps": []
+    }
 }
 
 DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML = {
