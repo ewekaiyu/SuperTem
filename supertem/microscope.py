@@ -15,36 +15,37 @@ I. The Three-Layer Architecture
 To ensure safety and consistency across different hardware vendors, this class
 enforces a strict separation of concerns via three distinct execution layers:
 
-  1) The Atomic Layer (Abstract - Vendor Implemented)
+  1) The Atomic Layer (The "Hands" - Abstract & Vendor Implemented)
      - Role: Direct, unbuffered hardware I/O.
-     - Responsibility: Translate a typed value (e.g., `10 nm`) into the specific
-       serial/network command required by the microscope column.
-     - Safety: BLIND & LOUD.
-       a. Logic: It performs NO safety checks (assumes Helper validated it).
-       b. Errors: It performs NO error suppression. If the hardware raises an
-          exception (IOError, Timeout), this layer MUST let it bubble up.
-          *Rule:* Setters raise Exceptions; Getters return None.
-     - Signature: `set_spot_size(int)`, `set_defocus(Quantity)`.
+     - Responsibility: Dumb I/O. If asked to set an unsafe value (e.g. index 99),
+       it attempts it without second-guessing.
+     - Behavior:
+        - READ (Getters): "Null means Unknown". Returns `None` on failure, never defaults.
+        - WRITE (Setters): "Fail Loudly". Raises exceptions if hardware rejects the command.
+          *Rule:* Do NOT swallow hardware errors (IOError, Timeout) in this layer.
 
-  2) The Helper Layer (Concrete - Framework Provided & Driver Overridden)
+  2) The Helper Layer (The "Brain" - Vendor Overridden)
      - Role: Bulk application, Unpacking, and **Vendor Validation**.
      - Responsibility:
-       a. Unpack `Settings` objects (e.g., `BeamSettings`).
-       b. Route canonical fields (`voltage`) to generic Atomic setters.
-       c. **CRITICAL:** Extract and VALIDATE vendor-specific extras (`alpha_index`)
-          before passing them to Atomic setters.
-     - Safety: LOGICAL. It acts as the "Vendor Safety Gatekeeper."
-     - Signature: `apply_beam_settings(settings)`.
+       a. Routes canonical physics (e.g. `voltage`) to atomic setters.
+       b. **Vendor Guard:** Extracts vendor-specific keys from `Extras` (e.g. registers,
+          indices), validates them against hardware limits, and RAISES error if invalid.
+       c. Prevents invalid vendor data from reaching the Atomic layer.
+     - Behavior:
+       - **Validation:** Enforces vendor-specific safety logic (raises ValueError).
+       - **Pass-Through:** Does NOT catch hardware errors. If the Atomic layer explodes
+         (e.g., IOError), the Helper layer MUST let the exception bubble up.
 
-  3) The Orchestrator Layer (Concrete - Framework Provided)
-     - Role: The Control Plane Interface / Gatekeeper.
+  3) The Orchestrator Layer (The "Gatekeeper" - Framework Provided)
+     - Role: The Control Plane Interface.
      - Responsibility:
        a. Validate the Intent (`request.validate()`).
        b. Check Canonical Hardware Capabilities (`system.is_safe_...`).
-       c. Interpolate/Sequence complex moves (e.g., Step-limited stage movement).
-       d. Delegate to Helpers/Atomic methods for execution.
-     - Safety: STRICT. This is the only public entry point for automation scripts.
-     - Signature: `execute_stage_move(request)`, `execute_beam_control(request)`.
+       c. Delegate to Helpers/Atomic methods for execution.
+     - Behavior:
+       - **Strict Safety:** Raises `SafetyViolationError` to prevent unsafe moves.
+       - **Bubble Up:** Does NOT catch hardware errors. If the Atomic/Helper layers explode,
+         the Orchestrator lets the exception pass through to the user script.
 
 ===============================================================================
 II. The Safety & Validation Contract
@@ -58,34 +59,26 @@ Safety is handled via a "Dual-Gatekeeper" model:
      *Result:* Safe canonical values reach the Helper layer.
 
   B. Vendor Safety (Handled by Helper Overrides)
-     The Orchestrator CANNOT validate vendor-specific `Extras` (e.g., JEOL
-     indices or Thermo register flags). The Vendor Driver MUST override Helper
-     methods to validate these values.
+     The Orchestrator CANNOT validate vendor-specific `Extras`. The Vendor Driver
+     MUST override Helper methods (e.g. `apply_beam_settings`) to validate these.
      *Result:* The driver refuses to pass invalid indices to the Atomic layer.
-
-  *Driver Developer Note:*
-  - Do not put safety logic in Atomic methods (they should be dumb I/O).
-  - Do put vendor safety logic in Helper overrides (e.g., `apply_beam_settings`).
-  - Rely on the Orchestrator for generic physics safety.
 
 ===============================================================================
 III. Data Integrity & Parse Modes
 ===============================================================================
 
-This interface uses the `ParseMode` mechanism from `base.py` to enforce context-
-aware error handling. Behavior changes based on the direction of data flow:
+Drivers must implement the "Ingress/Egress" policy using `base.py` ParseModes:
 
-  A. Egress (Control Plane) -> ParseMode.STRICT
-     - Context: Sending commands to hardware (e.g., `StageMoveRequest`).
-     - Behavior: **Fail Fast.** Validation errors raise exceptions immediately.
-     - Rationale: We must never guess the user's intent. Ambiguity is unsafe.
+  A. Egress (Control Plane / Writing to Hardware) -> ParseMode.STRICT
+     - Context: `apply_...` methods and `move_stage...`.
+     - Rule: **Fail Fast.** If the input (canonical or vendor extra) is invalid
+       or unsafe, raise an Exception immediately. Do not coerce. Do not guess.
 
-  B. Ingress (Data Plane) -> ParseMode.LENIENT
-     - Context: Reading state from hardware (e.g., `BeamSettings` snapshot).
-     - Behavior: **Survive & Report.** Malformed data from the hardware is
-       coerced to safe defaults or `None`. The error is recorded in `Extras.notes`.
-     - Rationale: A glitch in a non-critical sensor (e.g., vacuum gauge NaN)
-       should not crash the entire control loop.
+  B. Ingress (Data Plane / Reading from Hardware) -> ParseMode.LENIENT
+     - Context: `get_...` methods and `acquire_image`.
+     - Rule: **Survive.** If hardware returns malformed data (e.g., NaN vacuum),
+       coerce it to `None` or a safe default. Do not crash the logging loop.
+     - Implementation: Wrap Atomic Getters in try/except blocks that return `None`.
 
   *Exception:* Critical navigation data (e.g., Stage Position) may use STRICT
   mode on Ingress if corrupted data poses a physical collision risk.

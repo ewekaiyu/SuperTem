@@ -3,88 +3,58 @@ supertem.jeol_microscope
 
 JEOL TEM driver implementation for the SuperTEM hardware abstraction layer.
 
-This module provides :class:`JeolMicroscope`, a vendor-backed implementation of the
-:class:`~supertem.microscope.TemMicroscope` interface using PyJEM (TEM3).
+This module provides :class:`JeolMicroscope`, a concrete implementation of
+:class:`~supertem.microscope.TemMicroscope` wrapping the `PyJEM` (TEM3) interface.
 
 ===============================================================================
-I. Architecture Implementation
+I. Implementation Specifics
 ===============================================================================
 
-This driver maps the SuperTEM Three-Layer Architecture to PyJEM as follows:
+This driver adheres to the strict safety contract defined in `supertem.microscope`.
+It maps the standard layers to JEOL hardware as follows:
 
-  1) Atomic Layer (The "Hands")
-     - Wraps PyJEM calls (TEM3/EOS3).
-     - Responsibility: Dumb I/O. If asked to set Alpha Index 99, it attempts it.
-     - Behavior:
-        - READ (Getters): "Null means Unknown". Returns `None` on failure, never defaults.
-        - WRITE (Setters): "Fail Loudly". Raises exceptions if hardware rejects the command.
+  1) Atomic Layer: Wraps `PyJEM` calls (TEM3, EOS3, Stage3).
+     - **Error Handling:** Raises `PyJEM` exceptions directly (Fail Loudly).
+     - **Data Handling:** Returns `None` if `PyJEM` returns error codes or
+       invalid data (e.g., 0 for spot size), strictly following "Null means Unknown".
 
-  2) Helper Layer (The "Brain")
-     - Overrides methods like `apply_beam_settings`.
-     - Responsibility:
-       a. Routes canonical physics to atomic setters.
-       b. **Vendor Guard:** Extracts `alpha_index` from `Extras`, validates it
-          against valid ranges (0-8), and RAISES error if invalid.
-       c. Prevents invalid vendor data from reaching the Atomic layer.
-
-  3) Orchestrator Layer (Inherited)
-     - Uses the base `TemMicroscope` logic for generic safety limits.
-
-This module relies heavily on `supertem.vendor.JEOL.jeol_adapter` to perform
-pure data translation (Unit Conversion, Parsing) while this module handles
-the physical execution.
+  2) Helper Layer:
+     - **Vendor Validation:** `apply_beam_settings` validates that `alpha_index`
+       is within the hardware limit (0-8) before execution.
+     - **Mapping:** Translates canonical `defocus` (nm) to `OLc` (DAC) *only if*
+       a calibration scale is provided.
 
 ===============================================================================
-II. Design Philosophy & Rules
+II. Supported Vendor Extras
 ===============================================================================
 
-This driver adheres to three core philosophies to ensure safe automation:
+This driver utilizes the `Extras.vendor['JEOL']` dictionary to expose hardware
+capabilities that do not map to canonical physics.
 
-  1) "Null means Unknown" (Data Safety)
-     - Atomic getters MUST NOT return default values (0, 0.0, 512) if hardware
-       reads fail. They MUST return `None`.
-     - Rationale: A script seeing `spot_size=None` knows to halt; `0` implies success.
+  - `alpha_index` (int):
+    The convergence angle selector (0-8). Used because JEOL does not report
+    physical convergence angles (mrad) without external calibration.
 
-  2) "Trust but Verify" (Control Robustness)
-     - Hardware status flags (e.g., `GetStatus() == 0`) are necessary but
-       not sufficient.
-     - Critical movements (Stage) utilize Closed-Loop Control:
-       Command -> Wait for Idle -> Read Actual Position -> Retry if outside Tolerance.
+  - `defocus_olc_dac` (int):
+    The raw Objective Lens Coarse DAC value. Populated in `ProjectionSettings`
+    when `defocus_scale` is not configured.
 
-  3) "Be Honest" (Data Fidelity)
-     - **Do not fabricate calibrated physics.** If JEOL only provides an Index,
-       do NOT coerce it into a fake physical unit (mrad).
-     - **Implementation:** Vendor-native encodings are stored in `Extras.vendor['JEOL']`.
-     - **Accessors:** Exposed via specific atomic accessors (e.g., `get_alpha_index()`).
+  - `mag_selector` (int):
+    The raw magnification index. Used when `Magnification` (float) is ambiguous.
 
 ===============================================================================
-III. Safety & Error Handling
+III. Hardware Quirks & Workarounds
 ===============================================================================
 
-This driver implements a "Uni-Directional Safety Policy":
+  - **Stage Hysteresis:** JEOL stages may report "Idle" (0) momentarily during
+    direction changes. This driver's `move_stage_absolute` implements a custom
+    retry loop that waits for *stable* idle status.
 
-  A. Ingress (Reading from Hardware) -> LENIENT
-     - Methods: `get_beam_settings`, `get_stage_position`.
-     - Behavior: If PyJEM returns garbage (e.g., NaN), we coerce it to `None`
-       and log the error. We prioritize keeping the control loop alive.
+  - **Detector Sync:** If the active detector is offline, `set_scan_active` will
+    fallback to the internal scan generator to prevent beam damage (static beam).
 
-  B. Egress (Writing to Hardware) -> STRICT
-     - Methods: `apply_beam_settings`, `move_stage_absolute`.
-     - Behavior: **Safety Checks are Absolute.**
-       Rule: The `_mode` of the input object is IGNORED during execution.
-       If a value (canonical or vendor-extra) is out of safe bounds, the
-       Helper MUST raise an exception immediately.
-     - Rationale: "Lenient execution" of unsafe commands causes physical damage.
-
-===============================================================================
-IV. Hardware Notes
-===============================================================================
-
-  - **Stage Latency:** JEOL stages may report "Idle" status momentarily during
-    direction changes. The driver's retry loop accounts for this hysteresis.
-  - **Defocus Calibration:** Returns raw DAC units unless `defocus_scale` is configured.
-  - **Detector Sync:** Decouples scan coils from detector if detector is offline
-    to prevent beam damage (static beam safety).
+  - **Lazy Loading:** `PyJEM` is imported only upon instantiation. This allows
+    the class to be imported in simulation/offline environments without crashing.
 """
 import time
 import logging
