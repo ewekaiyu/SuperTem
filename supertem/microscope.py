@@ -251,9 +251,15 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def move_stage_absolute(self, target: StagePosition,
-                            drive_type: str = "default",
-                            wait: bool = True) -> None:
+    def move_stage_absolute(
+            self,
+            target: StagePosition,
+            drive_type: str = "default",
+            wait: bool = True,
+            tolerance_nm: float = 200.0,
+            tolerance_deg: float = 0.1,
+            max_retries: int = 3
+    ) -> None:
         """
         Atomic: Move stage to a specific absolute coordinate.
 
@@ -496,8 +502,8 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def get_magnification_index(self) -> int:
-        """Get Magnification Index (unitless integer)."""
+    def get_magnification(self) -> int:
+        """Get Magnification (unitless integer)."""
         pass
 
     @abstractmethod
@@ -537,8 +543,8 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def set_magnification_index(self, index: int) -> None:
-        """Set Magnification Index."""
+    def set_magnification(self, index: int) -> None:
+        """Set Magnification."""
         pass
 
     @abstractmethod
