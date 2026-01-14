@@ -217,8 +217,25 @@ def load_microscope(
     protocol_dict = load_yaml(Path(p_path), default=cfg.DEFAULT_PROTOCOL_YAML)
 
     # Ingest using base.py logic
-    return MicroscopeSettings.from_dict(config_dict, mode=mode, protocol=protocol_dict)
-
+    #
+    # MicroscopeSettings already has a `protocol` field, but its `from_dict()` only accepts
+    # (d, mode). Therefore we merge the protocol payload into the microscope config dict
+    # before ingestion.
+    #
+    # Backwards-compat:
+    # - If the microscope config YAML already contains a `protocol` section and the loaded
+    #   protocol YAML is empty/None, we keep the embedded one.
+    # - Otherwise, the separate protocol YAML wins.
+    if isinstance(config_dict, dict):
+        embedded_protocol = config_dict.get("protocol")
+        if protocol_dict not in (None, {}, [], ""):
+            config_dict["protocol"] = protocol_dict
+        elif embedded_protocol not in (None, {}, [], ""):
+            # legacy: protocol embedded in microscope config
+            config_dict["protocol"] = embedded_protocol
+        else:
+            config_dict["protocol"] = protocol_dict
+    return MicroscopeSettings.from_dict(config_dict, mode=mode)
 # =============================================================================
 # Stage Position Management
 # =============================================================================

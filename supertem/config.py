@@ -187,10 +187,6 @@ DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
     "image": {
         "file_format": "tiff",
         "path": os.path.join(DATA_PATH, "{date}", "images")
-    },
-    "protocol": {
-        "name": "demo",
-        "steps": []
     }
 }
 

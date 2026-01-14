@@ -295,17 +295,16 @@ class JeolMicroscope(TemMicroscope):
         if not self.eos or not hasattr(self.eos, "GetFunctionMode"):
             return None
         try:
-            modes = self.eos.GetFunctionMode()
+            function_mode = self.eos.GetFunctionMode()[0]
+            main_mode = self.eos.GetTemStemMode()
         except Exception:
             return None
-        if not modes or len(modes) < 2:
-            return None
-        key = self._EOS_MODE_MAP.get((int(modes[0]), int(modes[1])))
+        key = self._EOS_MODE_MAP.get((int(main_mode), int(function_mode)))
         if key:
             return key
         # Fallback: best-effort string
-        obs = "TEM" if int(modes[0]) == 0 else "STEM"
-        return f"{obs}:{int(modes[1])}"
+        obs = "TEM" if int(main_mode) == 0 else "STEM"
+        return f"{obs}:{int(function_mode)}"
 
     def _normalize_eos_key(self, key: str) -> Optional[str]:
         """Case-insensitive match against EOS_MODE_TABLES keys."""

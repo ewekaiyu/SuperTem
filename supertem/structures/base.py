@@ -508,6 +508,7 @@ class Units:
     MM = "mm"
     KV = "kV"
     NA = "nA"
+    UA = "uA"
     MRAD = "mrad"
     DEG = "deg"
     MS = "ms"
