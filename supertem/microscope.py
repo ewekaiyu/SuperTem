@@ -19,21 +19,28 @@ enforces a strict separation of concerns via three distinct execution layers:
      - Role: Direct, unbuffered hardware I/O.
      - Responsibility: Translate a typed value (e.g., `10 nm`) into the specific
        serial/network command required by the microscope column.
-     - Safety: BLIND. It performs no logic or safety checks. It just executes.
+     - Safety: BLIND & LOUD.
+       a. Logic: It performs NO safety checks (assumes Helper validated it).
+       b. Errors: It performs NO error suppression. If the hardware raises an
+          exception (IOError, Timeout), this layer MUST let it bubble up.
+          *Rule:* Setters raise Exceptions; Getters return None.
      - Signature: `set_spot_size(int)`, `set_defocus(Quantity)`.
 
-  2) The Helper Layer (Concrete - Framework Provided)
-     - Role: Bulk application and State management.
-     - Responsibility: Unpack `Settings` objects (e.g., `BeamSettings`) and
-       route non-None fields to the appropriate Atomic setters.
-     - Safety: LOGICAL. Ensures units are correct but assumes values are safe.
+  2) The Helper Layer (Concrete - Framework Provided & Driver Overridden)
+     - Role: Bulk application, Unpacking, and **Vendor Validation**.
+     - Responsibility:
+       a. Unpack `Settings` objects (e.g., `BeamSettings`).
+       b. Route canonical fields (`voltage`) to generic Atomic setters.
+       c. **CRITICAL:** Extract and VALIDATE vendor-specific extras (`alpha_index`)
+          before passing them to Atomic setters.
+     - Safety: LOGICAL. It acts as the "Vendor Safety Gatekeeper."
      - Signature: `apply_beam_settings(settings)`.
 
   3) The Orchestrator Layer (Concrete - Framework Provided)
      - Role: The Control Plane Interface / Gatekeeper.
      - Responsibility:
        a. Validate the Intent (`request.validate()`).
-       b. Check Hardware Capabilities (`system.is_safe_...`).
+       b. Check Canonical Hardware Capabilities (`system.is_safe_...`).
        c. Interpolate/Sequence complex moves (e.g., Step-limited stage movement).
        d. Delegate to Helpers/Atomic methods for execution.
      - Safety: STRICT. This is the only public entry point for automation scripts.
@@ -43,19 +50,48 @@ enforces a strict separation of concerns via three distinct execution layers:
 II. The Safety & Validation Contract
 ===============================================================================
 
-Drivers inheriting from `TemMicroscope` rely on the base class to handle safety.
-The `Orchestrator` methods guarantee that by the time an Atomic method is called:
+Safety is handled via a "Dual-Gatekeeper" model:
 
-  1) Structural Integrity is verified (via `base.py` Strict Parsing).
-  2) Logical Integrity is verified (via `request.validate()`).
-  3) Physical Safety is verified (via `SystemSettings` limits).
+  A. Canonical Safety (Handled by Orchestrator)
+     The base class Orchestrator validates standard physical properties against
+     `SystemSettings` limits (e.g., Voltage, Stage Limits).
+     *Result:* Safe canonical values reach the Helper layer.
 
-  *Driver Developer Note:* Do not re-implement safety checks in Atomic methods
-  unless they are hardware-critical firmware interlocks. Rely on the
-  `Orchestrator` to filter unsafe requests.
+  B. Vendor Safety (Handled by Helper Overrides)
+     The Orchestrator CANNOT validate vendor-specific `Extras` (e.g., JEOL
+     indices or Thermo register flags). The Vendor Driver MUST override Helper
+     methods to validate these values.
+     *Result:* The driver refuses to pass invalid indices to the Atomic layer.
+
+  *Driver Developer Note:*
+  - Do not put safety logic in Atomic methods (they should be dumb I/O).
+  - Do put vendor safety logic in Helper overrides (e.g., `apply_beam_settings`).
+  - Rely on the Orchestrator for generic physics safety.
 
 ===============================================================================
-III. Type Safety & Units
+III. Data Integrity & Parse Modes
+===============================================================================
+
+This interface uses the `ParseMode` mechanism from `base.py` to enforce context-
+aware error handling. Behavior changes based on the direction of data flow:
+
+  A. Egress (Control Plane) -> ParseMode.STRICT
+     - Context: Sending commands to hardware (e.g., `StageMoveRequest`).
+     - Behavior: **Fail Fast.** Validation errors raise exceptions immediately.
+     - Rationale: We must never guess the user's intent. Ambiguity is unsafe.
+
+  B. Ingress (Data Plane) -> ParseMode.LENIENT
+     - Context: Reading state from hardware (e.g., `BeamSettings` snapshot).
+     - Behavior: **Survive & Report.** Malformed data from the hardware is
+       coerced to safe defaults or `None`. The error is recorded in `Extras.notes`.
+     - Rationale: A glitch in a non-critical sensor (e.g., vacuum gauge NaN)
+       should not crash the entire control loop.
+
+  *Exception:* Critical navigation data (e.g., Stage Position) may use STRICT
+  mode on Ingress if corrupted data poses a physical collision risk.
+
+===============================================================================
+IV. Type Safety & Units
 ===============================================================================
 
 All Atomic interfaces use strict typing:
