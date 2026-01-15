@@ -996,7 +996,7 @@ class JeolMicroscope(TemMicroscope):
         key, _ = self._resolve_eos_table_info()
         return key if key else "UNKNOWN"
 
-    def get_magnification(self) -> int:
+    def get_magnification(self) -> Optional[int]:
         """
         Get the magnification value (e.g., 100000).
 
@@ -1104,14 +1104,14 @@ class JeolMicroscope(TemMicroscope):
         """Get Phosphor Screen state ('UP'/'DOWN')."""
         if not self.det3:
             logger.debug("[LENS] GetScreen failed: Hardware not connected.")
-            return None
+            return "UNKNOWN"
         try:
             if hasattr(self.det3, "GetScreen"):
                 idx = int(self.det3.GetScreen())
                 return "DOWN" if idx == 2 else "UP"
         except Exception as e:
             logger.debug(f"[LENS] GetScreen failed: {e}")
-        return None
+        return "UNKNOWN"
 
     def get_objective_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Objective Stigmation (OLs)."""
@@ -1501,11 +1501,11 @@ class JeolMicroscope(TemMicroscope):
                 pass
         return None
 
-    def get_scan_pixel_dwell(self) -> Quantity:
+    def get_scan_pixel_dwell(self) -> Optional[Quantity]:
         """Get pixel dwell time (cached from config, as HW read is unreliable)."""
         return None
 
-    def get_scan_flyback(self) -> Quantity:
+    def get_scan_flyback(self) -> Optional[Quantity]:
         """Get flyback time (cached from config)."""
         return None
 
@@ -2091,7 +2091,7 @@ class JeolMicroscope(TemMicroscope):
     def list_apertures(self) -> List[str]:
         return list(self._APERTURE_MAP.keys())
 
-    def get_aperture(self, aperture_id: str) -> Aperture:
+    def get_aperture(self, aperture_id: str) -> Optional[Aperture]:
         """Get current aperture state (Size + Position)."""
         if not self.apt:
             logger.debug(f"[APT] GetAperture({aperture_id}) failed: Hardware not connected.")

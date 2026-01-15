@@ -144,7 +144,7 @@ DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
             "defocus_limits_nm": [-10000.0, 10000.0],
             "default_projection": {
                 "optical_mode": "IMAGING",
-                "magnification_index": 5000,
+                "magnification": 5000,
                 "defocus_nm": 0.0
             }
         },

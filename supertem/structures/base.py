@@ -1963,7 +1963,7 @@ class ProjectionSettings:
     Attributes:
         optical_mode (Optional[str]): Active lens program (e.g. "IMAGING", "DIFFRACTION").
             None Behavior: Snapshot (Unknown) | Intent (No Change).
-        magnification_index (Optional[int]): Discrete step index for mag.
+        magnification (Optional[int]): Magnification.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
         defocus (Optional[Quantity]): Deviation from focus. Units: nm.
             None Behavior: Snapshot (Unknown) | Intent (No Change).
@@ -1987,7 +1987,7 @@ class ProjectionSettings:
     optical_mode: Optional[str] = None  # "IMAGING", "DIFFRACTION", "LAD"
 
     # Imaging Parameters (IMAGING mode)
-    magnification_index: Optional[int] = None
+    magnification: Optional[int] = None
     defocus: Optional["Quantity"] = None
     objective_stigmation: Optional[Point] = None
     image_shift: Optional[Point] = None
@@ -2009,7 +2009,7 @@ class ProjectionSettings:
     def __post_init__(self):
         p = FieldParser(self, self._mode, "ProjectionSettings")
         self.optical_mode = p.str(self.optical_mode, "optical_mode")
-        self.magnification_index = p.int(self.magnification_index, "magnification_index")
+        self.magnification = p.int(self.magnification, "magnification")
         self.defocus = p.qty(self.defocus, "defocus", Units.NM)
         self.camera_length = p.qty(self.camera_length, "camera_length", Units.MM)
         self.screen_position = p.str(self.screen_position, "screen_position")
@@ -2026,7 +2026,7 @@ class ProjectionSettings:
 
         # --- NEW VALIDATION LOGIC ---
         v.check_ge_zero(self.camera_length, "camera_length", unit_aware=True, reset_to=None)
-        v.check_ge_zero(self.magnification_index, "magnification_index", reset_to=None)
+        v.check_ge_zero(self.magnification, "magnification", reset_to=None)
 
         if self.screen_position:
             v.check(self.screen_position in {"UP", "DOWN"}, "screen_position",
@@ -2120,10 +2120,10 @@ class ProjectionSystemSettings:
                 reasons.append(f"Defocus {target.defocus} outside limits {self.defocus_limits}")
 
         # Check Mag Limits
-        if target.magnification_index is not None and self.magnification_limits:
+        if target.magnification is not None and self.magnification_limits:
             mn, mx = self.magnification_limits
-            if not (mn <= target.magnification_index <= mx):
-                reasons.append(f"Mag index {target.magnification_index} outside limits {self.magnification_limits}")
+            if not (mn <= target.magnification <= mx):
+                reasons.append(f"Magnification {target.magnification} outside limits {self.magnification_limits}")
 
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 

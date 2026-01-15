@@ -84,14 +84,24 @@ Drivers must implement the "Ingress/Egress" policy using `base.py` ParseModes:
   mode on Ingress if corrupted data poses a physical collision risk.
 
 ===============================================================================
-IV. Type Safety & Units
+IV. Type Safety & Return Policy
 ===============================================================================
 
-All Atomic interfaces use strict typing:
-  - `Quantity` (from pint) is used for all physical values.
-  - `int` / `str` / `bool` are used for discrete states.
-  - Vendor drivers must handle unit conversion (e.g., converting the input
-    `10 nm` to the `1e-8 meters` expected by a specific API).
+To balance Safety (Control Logic) with Accuracy (Physics), this interface enforces
+a strict return type policy for Atomic Getters:
+
+  A. Measurements (Optional Objects) -> Return `None` on Failure
+     - Types: `Quantity`, `int` (indices), `StagePosition`, `ROI`.
+     - Logic: `None` implies "Unknown". Zero is a valid physical value.
+     - Example: `get_pressure() -> None` (Sensor offline).
+     - Signature: `def get_x(self) -> Optional[Type]`
+
+  B. Discrete States (Strict Primitives) -> Return Sentinel on Failure
+     - Types: `str`, `bool`.
+     - Logic: Return `"UNKNOWN"` or `False` to ensure control flow safety.
+       Allows logic like `if get_mode() == "TEM"` to fail gracefully rather than crashing.
+     - Example: `get_mode() -> "UNKNOWN"`, `get_beam_blank() -> False`.
+     - Signature: `def get_x(self) -> str` (No Optional)
 
 ===============================================================================
 V. Logging Strategy (Intent vs. IO)
@@ -271,10 +281,10 @@ class TemMicroscope(ABC):
     @abstractmethod
     def get_mode(self) -> str:
         """
-        Get the global instrument mode.
+        Get the global instrument mode. (Strict Primitive)
 
         Returns:
-            String: e.g., 'TEM', 'STEM', 'SEM', 'DIFF', 'EDX'.
+            String: 'TEM', 'STEM', or 'UNKNOWN' on failure.
         """
         pass
 
@@ -316,12 +326,13 @@ class TemMicroscope(ABC):
     # --- Atomic Layer (Abstract) ---
 
     @abstractmethod
-    def get_stage_position(self) -> StagePosition:
+    def get_stage_position(self) -> Optional[StagePosition]:
         """
         Atomic: Read current physical stage coordinates.
 
         Returns:
             StagePosition: Objects with x, y, z, r, tilt_x, tilt_y.
+            None: If hardware read fails.
         """
         pass
 
@@ -364,6 +375,8 @@ class TemMicroscope(ABC):
         Helper: Calculate absolute target from delta and execute move.
         """
         current = self.get_stage_position()
+        if current is None:
+            raise RuntimeError("Cannot perform relative move: Stage position is unknown.")
         target = current + delta  # Vector addition handled by StagePosition
         # We delegate to the safe mover to ensure step sizes are respected even for relative moves
         self.safe_move_stage(target, drive_type=drive_type, wait=wait)
@@ -390,6 +403,8 @@ class TemMicroscope(ABC):
         target_abs = request.target
 
         if request.relative:
+            if current is None:
+                raise RuntimeError("Relative move failed: Current stage position is unknown.")
             target_abs = current + request.target
             # If absolute addition resulted in None for some axes, fill them from current
             # to allow for a complete safety check of the final destination.
@@ -438,42 +453,42 @@ class TemMicroscope(ABC):
     # --- Atomic Getters (Abstract) ---
     @abstractmethod
     def get_acceleration_voltage(self) -> Optional[Quantity]:
-        """Get High Tension. Units: Electric Potential (kV)."""
+        """Get High Tension. Units: Electric Potential (kV). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_beam_current(self) -> Optional[Quantity]:
-        """Get Beam Current. Units: Electric Current (nA/pA)."""
+        """Get Beam Current. Units: Electric Current (nA/pA). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_spot_size(self) -> int:
-        """Get Spot Size Index (unitless integer)."""
+    def get_spot_size(self) -> Optional[int]:
+        """Get Spot Size Index (unitless integer). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_convergence_angle(self) -> Optional[Quantity]:
-        """Get Convergence (Alpha) Angle. Units: Angle (mrad)."""
+        """Get Convergence (Alpha) Angle. Units: Angle (mrad). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_beam_shift(self) -> Tuple[float, float]:
+    def get_beam_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Beam Shift Coils. Units: Logical (-1..1) or Physical (Arb)."""
         pass
 
     @abstractmethod
-    def get_condenser_stigmation(self) -> Tuple[float, float]:
+    def get_condenser_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Condenser Stigmator Coils. Units: Logical or Physical."""
         pass
 
     @abstractmethod
-    def get_gun_tilt(self) -> Tuple[float, float]:
+    def get_gun_tilt(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Gun Tilt Alignment. Units: Logical or Physical."""
         pass
 
     @abstractmethod
     def get_beam_blank(self) -> bool:
-        """Get Beam Blank Status. True = Blanked (Beam OFF)."""
+        """Get Beam Blank Status. True = Blanked (Beam OFF). (Strict Primitive)"""
         pass
 
     # --- Atomic Setters (Abstract) ---
@@ -582,41 +597,41 @@ class TemMicroscope(ABC):
     # --- Atomic Getters ---
     @abstractmethod
     def get_projection_mode(self) -> str:
-        """Get optical mode (e.g., 'IMAGING', 'DIFFRACTION')."""
+        """Get optical mode (e.g., 'IMAGING', 'DIFFRACTION'). (Strict Primitive)"""
         pass
 
     @abstractmethod
-    def get_magnification(self) -> int:
-        """Get Magnification (unitless integer)."""
+    def get_magnification(self) -> Optional[int]:
+        """Get Magnification (unitless integer). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_camera_length(self) -> Optional[Quantity]:
-        """Get Camera Length (Diffraction). Units: Length (mm)."""
+        """Get Camera Length (Diffraction). Units: Length (mm). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_defocus(self) -> Optional[Quantity]:
-        """Get Defocus. Units: Length (nm)."""
+        """Get Defocus. Units: Length (nm). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_screen_position(self) -> str:
-        """Get Fluorescent Screen Position ('UP' or 'DOWN')."""
+        """Get Fluorescent Screen Position ('UP', 'DOWN', or 'UNKNOWN')."""
         pass
 
     @abstractmethod
-    def get_objective_stigmation(self) -> Tuple[float, float]:
+    def get_objective_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Objective Stigmator Coils (x, y)."""
         pass
 
     @abstractmethod
-    def get_image_shift(self) -> Tuple[float, float]:
+    def get_image_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Image Shift Coils (x, y)."""
         pass
 
     @abstractmethod
-    def get_diffraction_shift(self) -> Tuple[float, float]:
+    def get_diffraction_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Diffraction Shift Coils (x, y)."""
         pass
 
@@ -671,7 +686,7 @@ class TemMicroscope(ABC):
 
         return ProjectionSettings(
             optical_mode=self.get_projection_mode(),
-            magnification_index=self.get_magnification_index(),
+            magnification=self.get_magnification(),
             defocus=self.get_defocus(),
             camera_length=self.get_camera_length(),
             screen_position=self.get_screen_position(),
@@ -684,8 +699,8 @@ class TemMicroscope(ABC):
         """Helper: Applies partial projection settings."""
         if settings.optical_mode is not None:
             self.set_projection_mode(settings.optical_mode)
-        if settings.magnification_index is not None:
-            self.set_magnification_index(settings.magnification_index)
+        if settings.magnification is not None:
+            self.set_magnification(settings.magnification)
         if settings.camera_length is not None:
             self.set_camera_length(settings.camera_length)
         if settings.defocus is not None:
@@ -725,37 +740,37 @@ class TemMicroscope(ABC):
     # --- Atomic Getters ---
     @abstractmethod
     def get_scan_mode(self) -> str:
-        """Get scan engine mode."""
+        """Get scan engine mode. (Strict Primitive)"""
         pass
 
     @abstractmethod
-    def get_scan_width(self) -> int:
-        """Get scan width in pixels."""
+    def get_scan_width(self) -> Optional[int]:
+        """Get scan width in pixels. Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_scan_height(self) -> int:
-        """Get scan height in pixels."""
+    def get_scan_height(self) -> Optional[int]:
+        """Get scan height in pixels. Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_scan_pixel_dwell(self) -> Quantity:
-        """Get pixel dwell time. Units: Time (us/ns)."""
+    def get_scan_pixel_dwell(self) -> Optional[Quantity]:
+        """Get pixel dwell time. Units: Time (us/ns). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_scan_flyback(self) -> Quantity:
-        """Get flyback time. Units: Time (us/ns)."""
+    def get_scan_flyback(self) -> Optional[Quantity]:
+        """Get flyback time. Units: Time (us/ns). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_scan_rotation(self) -> Quantity:
-        """Get scan rotation. Units: Angle (deg/rad)."""
+    def get_scan_rotation(self) -> Optional[Quantity]:
+        """Get scan rotation. Units: Angle (deg/rad). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_scan_active(self) -> bool:
-        """Return True if scanning is currently active."""
+        """Return True if scanning is currently active. (Strict Primitive)"""
         pass
 
     # --- Atomic Setters ---
@@ -858,32 +873,33 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def get_detector_exposure(self, detector_id: str) -> Quantity:
-        """Get exposure time. Units: Time (s/ms)."""
+    def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
+        """Get exposure time. Units: Time (s/ms). Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_detector_binning(self, detector_id: str) -> int:
-        """Get binning index (e.g., 1 for 1x1, 2 for 2x2)."""
+    def get_detector_binning(self, detector_id: str) -> Optional[int]:
+        """Get binning index (e.g., 1 for 1x1, 2 for 2x2). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
-        """Get Region of Interest."""
+        """Get Region of Interest. Returns None if unknown."""
         pass
 
     @abstractmethod
-    def get_detector_integration(self, detector_id: str) -> int:
-        """Get frame integration count."""
+    def get_detector_integration(self, detector_id: str) -> Optional[int]:
+        """Get frame integration count. Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_detector_inserted(self, detector_id: str) -> bool:
-        """Return True if detector is mechanically inserted."""
+        """Return True if detector is mechanically inserted. (Strict Primitive)"""
         pass
 
     @abstractmethod
     def get_detector_frame_rate(self, detector_id: str) -> Optional[Quantity]:
+        """Get estimated frame rate. Returns None if unknown."""
         pass
 
     # ---Atomic Setters ---
@@ -979,7 +995,7 @@ class TemMicroscope(ABC):
     # --- Atomic Methods ---
     @abstractmethod
     def get_valve_state(self, valve_name: str) -> str:
-        """Get Valve State ('OPEN', 'CLOSED'). Name examples: 'column', 'gun'."""
+        """Get Valve State ('OPEN', 'CLOSED' or 'UNKNOWN'). (Strict Primitive)"""
         pass
 
     @abstractmethod
@@ -988,8 +1004,8 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def get_pressure(self, gauge_name: str) -> Quantity:
-        """Get Pressure. Units: Pressure (Pa/Torr). Name: 'column', 'gun', etc."""
+    def get_pressure(self, gauge_name: str) -> Optional[Quantity]:
+        """Get Pressure. Units: Pressure (Pa/Torr). Name: 'column', 'gun'. Returns None if unknown."""
         pass
 
     # --- Logic Layer ---
@@ -1034,8 +1050,8 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def get_aperture(self, aperture_id: str) -> Aperture:
-        """Get state (inserted, size, position) of an aperture."""
+    def get_aperture(self, aperture_id: str) -> Optional[Aperture]:
+        """Get state (inserted, size, position) of an aperture. Returns None if unknown."""
         pass
 
     @abstractmethod
@@ -1047,7 +1063,7 @@ class TemMicroscope(ABC):
 
     def get_all_apertures(self) -> Dict[str, Aperture]:
         """Aggregator: returns state of all apertures."""
-        return {a_id: self.get_aperture(a_id) for a_id in self.list_apertures()}
+        return {a_id: self.get_aperture(a_id) for a_id in self.list_apertures() if self.get_aperture(a_id) is not None}
 
     def execute_aperture_control(self, request: ApertureControlRequest) -> None:
         """
