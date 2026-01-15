@@ -16,22 +16,19 @@ The primary entry point for any automation routine is `setup_session()`.
 This function manages the transition from static configuration to live execution:
 
   1) Configuration Resolution
-     - Queries the central `registry` (from config.py) to locate the active
-       hardware profile and automation protocol.
+     - Instantiates a `RegistryManager` tied to the provided `SuperTEMContext`.
+     - Queries the registry to locate the active hardware profile.
      - Ingests YAML data into `MicroscopeSettings` using STRICT mode to ensure
        control-plane safety before hardware handoff.
 
   2) Environment Preparation
-     - Generates unique, timestamped session directories within the system
-       log tree.
-     - Bootstraps the logging subsystem to capture multi-level diagnostics
-       (File + Console).
+     - Generates unique, timestamped session directories.
+     - Bootstraps the logging subsystem (File + Console).
 
   3) Hardware Initialization (The Factory Pattern)
      - Maps the `manufacturer` identity to specific driver implementations
        (e.g., JEOL vs. DEMO).
-     - Instantiates the `TemMicroscope` controller, binding the validated
-       settings to a live hardware interface.
+     - Instantiates the `TemMicroscope` controller.
 
 ===============================================================================
 II. Unit-Aware Persistence & Serialization
@@ -39,35 +36,28 @@ II. Unit-Aware Persistence & Serialization
 
 The utility layer provides specialized I/O handlers that respect the
 "Normalization vs. Serialization" contract defined in the base structures:
-
-- Stage Position Management: `save_positions` and `get_saved_positions` handle
-  the translation between human-readable YAML (often containing float magnitudes)
-  and the strongly-typed `StagePosition` objects used in the control plane.
-- Unit Safety: During storage, position data is serialized using `to_dict()`,
-  which strips Pint units and applies standard suffixes (e.g., `_nm`, `_deg`)
-  to ensure the resulting YAML remains portable and JSON-compatible.
+- `save_positions`: Strips Pint units -> Floats (for YAML compatibility).
+- `get_saved_positions`: Re-hydrates Floats -> Pint units (for Safety).
 
 ===============================================================================
 III. Media & Diagnostic Helpers
 ===============================================================================
 
-Beyond control logic, this module provides tools for data post-processing:
-
 - MicroscopeImage Integration: Media helpers (like `create_gif`) utilize the
-  `MicroscopeImage` loading logic to interpret sidecar metadata and embedded
-  JSON headers, ensuring that even diagnostic previews maintain a link to
-  the machine state at the time of acquisition.
-- Logging: Standardized formatting for cross-module traceability, linking
-  timestamps, function names, and line numbers across the automation stack.
+  `MicroscopeImage` loading logic.
+- Logging: Standardized formatting for cross-module traceability.
 
 ===============================================================================
-Usage Contract
+IV. The Wiring Contract (Dependency Injection)
 ===============================================================================
 
-- Filesystem side-effects: Many functions in this module will create directories
-  and files automatically based on `supertem.config` paths.
-- Hardware Safety: Always use `setup_session` rather than manual driver
-  instantiation to ensure that validation logic is never bypassed.
+All functions in this module are **Context-Dependent**. They do not assume
+global state.
+
+- **Rule:** If a function touches the disk (logging, loading YAML), it MUST
+  accept `context: SuperTEMContext` as an argument.
+- **Why?** This ensures that `setup_session()` is the *only* place where
+  decisions about the environment (Prod vs Test) are made.
 """
 import datetime
 import glob
@@ -81,15 +71,13 @@ from typing import List, Tuple, Optional, Any
 import yaml
 from PIL import Image
 
-from supertem import config as cfg
-from supertem.config import registry  # Use the central registry
+from supertem.config import RegistryManager, SuperTEMContext
 from supertem.microscope import TemMicroscope
 from supertem.structures.base import (
     MicroscopeImage,
     MicroscopeSettings,
     StagePosition,
-    ParseMode,
-    as_parse_mode
+    ParseMode
 )
 
 # =============================================================================
@@ -99,18 +87,15 @@ from supertem.structures.base import (
 def current_timestamp():
     return datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
-def make_logging_directory(path: Optional[Path] = None, name="run"):
-    if path is None:
-        path = Path(cfg.LOG_PATH)
-    directory = Path(path) / name
+def make_logging_directory(context: SuperTEMContext, name="run") -> str:
+    """Creates a subdirectory inside the context's log path."""
+    directory = context.log_path / name
     directory.mkdir(parents=True, exist_ok=True)
     return str(directory)
 
-def configure_logging(path: Optional[Path] = None, log_filename="logfile", log_level=logging.DEBUG, _DEBUG: bool = False):
-    if not path:
-        path = Path(cfg.LOG_PATH)
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
+def configure_logging(path: Path, log_filename="logfile", log_level=logging.DEBUG, _DEBUG: bool = False):
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
 
     logfile = path / f"{log_filename}.log"
     file_handler = logging.FileHandler(str(logfile))
@@ -147,6 +132,7 @@ def save_yaml(path: Path, data: Any) -> None:
 # =============================================================================
 
 def setup_session(
+    context: SuperTEMContext,          # <--- REQUIRE CONTEXT
     session_path: Optional[Path] = None,
     config_path: Optional[Path] = None,
     protocol_path: Optional[Path] = None,
@@ -157,19 +143,24 @@ def setup_session(
 ) -> Tuple[TemMicroscope, MicroscopeSettings]:
     """Setup microscope session using registry-aware loading."""
 
-    # 1. Load settings (Uses base.py STRICT mode for control-plane safety)
-    settings = load_microscope(config_path, protocol_path, mode=ParseMode.STRICT)
+    # 1. Instantiate Registry for this context
+    registry = RegistryManager(context)
 
-    # 2. Create session directories
+    # 2. Load settings (Uses base.py STRICT mode for control-plane safety)
+    settings = load_microscope(registry, config_path, protocol_path, mode=ParseMode.STRICT)
+
+    # 3. Create session directories
     session_name = f'{settings.protocol.get("name", "supertem")}_{current_timestamp()}'
-    root_log = Path(session_path) if session_path else Path(cfg.LOG_PATH)
+
+    # Use context log_path if no override provided
+    root_log = Path(session_path) if session_path else context.log_path
     session_dir = root_log / session_name
     session_dir.mkdir(parents=True, exist_ok=True)
 
     if setup_logging:
         configure_logging(session_dir, _DEBUG=debug)
 
-    # 3. Overload System Info if provided
+    # 4. Overload System Info if provided
     # Note: We update via object attributes; normalization is handled in drivers or via re-validation
     if ip_address:
         settings.system.info.ip_address = ip_address
@@ -177,14 +168,14 @@ def setup_session(
         settings.system.info.manufacturer = manufacturer
 
     # Update dynamic output path
-    settings.image.path = str(session_dir)
+    settings.image.path = str(session_dir / "images")
 
-    # 4. Final Validation before hardware handoff
+    # 5. Final Validation before hardware handoff
     if not settings.validate():
         logging.error(f"Settings validation failed: {settings.extra.notes}")
         raise ValueError("Cannot initialize microscope with invalid settings.")
 
-    # 5. Factory Selection
+    # 6. Factory Selection
     mfg = settings.system.info.manufacturer.upper()
     if mfg == "DEMO":
         from supertem.microscopes.demo_microscope import DemoMicroscope
@@ -203,29 +194,24 @@ def setup_session(
     return microscope, settings
 
 def load_microscope(
+    registry: RegistryManager,
     config_path: Optional[Path] = None,
     protocol_path: Optional[Path] = None,
     mode: ParseMode = ParseMode.STRICT
 ) -> MicroscopeSettings:
-    """Orchestrates loading using config.registry and base.py structures."""
+    """Orchestrates loading using the provided registry."""
 
     # Use registry paths if not explicitly provided
     c_path = config_path or registry.get_active_config_path()
     p_path = protocol_path or registry.get_active_protocol_path()
 
-    config_dict = load_yaml(Path(c_path), default=cfg.DEFAULT_MICROSCOPE_CONFIGURATION_YAML)
-    protocol_dict = load_yaml(Path(p_path), default=cfg.DEFAULT_PROTOCOL_YAML)
+    # Default dicts are stateless, so importing from config is safe
+    from supertem.config import DEFAULT_MICROSCOPE_CONFIGURATION_YAML, DEFAULT_PROTOCOL_YAML
+
+    config_dict = load_yaml(Path(c_path), default=DEFAULT_MICROSCOPE_CONFIGURATION_YAML)
+    protocol_dict = load_yaml(Path(p_path), default=DEFAULT_PROTOCOL_YAML)
 
     # Ingest using base.py logic
-    #
-    # MicroscopeSettings already has a `protocol` field, but its `from_dict()` only accepts
-    # (d, mode). Therefore we merge the protocol payload into the microscope config dict
-    # before ingestion.
-    #
-    # Backwards-compat:
-    # - If the microscope config YAML already contains a `protocol` section and the loaded
-    #   protocol YAML is empty/None, we keep the embedded one.
-    # - Otherwise, the separate protocol YAML wins.
     if isinstance(config_dict, dict):
         embedded_protocol = config_dict.get("protocol")
         if protocol_dict not in (None, {}, [], ""):
@@ -235,36 +221,40 @@ def load_microscope(
             config_dict["protocol"] = embedded_protocol
         else:
             config_dict["protocol"] = protocol_dict
+
     return MicroscopeSettings.from_dict(config_dict, mode=mode)
+
 # =============================================================================
 # Stage Position Management
 # =============================================================================
 
-def get_saved_positions(fname: Optional[str] = None) -> List[StagePosition]:
+def get_saved_positions(context: SuperTEMContext) -> List[StagePosition]:
     """Returns list of StagePosition objects from storage."""
-    path = Path(fname) if fname else Path(cfg.POSITION_PATH)
+    # Resolve path via context
+    path = context.config_path / "positions.yaml"
+
     data = load_yaml(path, default=[])
     # Ingest as LENIENT for storage reading
     return [StagePosition.from_dict(d, mode=ParseMode.LENIENT) for d in data]
 
-def get_position_by_name(name: str) -> Optional[StagePosition]:
-    positions = get_saved_positions()
+def get_position_by_name(context: SuperTEMContext, name: str) -> Optional[StagePosition]:
+    positions = get_saved_positions(context)
     for p in positions:
         if p.name == name:
             return p
     return None
 
-def save_positions(positions: Any, path: Optional[str] = None, overwrite: bool = False) -> None:
+def save_positions(context: SuperTEMContext, positions: Any, overwrite: bool = False) -> None:
     """Saves StagePosition objects, ensuring unit-safe serialization."""
-    target_path = Path(path) if path else Path(cfg.POSITION_PATH)
-    
+    target_path = context.config_path / "positions.yaml"
+
     # Convert single input to list
     if not isinstance(positions, list):
         positions = [positions]
 
     # Load existing if not overwriting
     current_data = [] if overwrite else load_yaml(target_path, default=[])
-    
+
     # Add new positions using base.py serialization (handles units -> floats)
     for pos in positions:
         if isinstance(pos, StagePosition):

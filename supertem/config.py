@@ -3,14 +3,9 @@ supertem.config
 
 Configuration Bootstrap, Registry Management, and Default Factory.
 
-This module serves as the central entry point for the application's state,
-responsible for:
-  - Bootstrapping the runtime environment (filesystem trees for logs, data, and db).
-  - Managing the "Registry of Configurations" (Active vs. Available hardware profiles).
-  - Managing the "Protocol Library" (Storage and indexing of automation workflows).
-  - Providing "Factory Reset" defaults that align with the dataclass structures
-    defined in supertem.structure.base.
-  - Atomic persistence of configuration changes to disk to prevent data corruption.
+This module serves as the central entry point for the application's state.
+It has been architected to use **Dependency Injection (DI)**, replacing global
+singletons with explicit Context objects.
 
 ===============================================================================
 I. The Bootstrap Lifecycle
@@ -23,11 +18,9 @@ On instantiation, the RegistryManager executes a self-healing initialization seq
      - Prevents "FileNotFound" crashes in downstream modules.
 
   2) Default Generation (The "Safe Mode")
-     - Checks for existence of critical YAML definitions for both the hardware
-       and the protocol library.
+     - Checks for existence of critical YAML definitions.
      - If missing, atomically writes internal DEFAULT_ dictionaries to disk.
-     - GOAL: The system remains runnable even on a fresh install or after
-       configuration corruption.
+     - GOAL: The system remains runnable even on a fresh install.
 
   3) Registry Loading
      - Loads Index files (microscope-config-index.yaml & protocol-index.yaml).
@@ -38,65 +31,113 @@ II. Registry Management (Hardware vs. Protocols)
 ===============================================================================
 
 The module manages two parallel registries to support different operational needs:
-
-1. Microscope Configurations (The "Hardware Profile")
-   - Tracks multiple machine profiles (e.g., "Simulated", "JEOL-2100").
-   - Aligns with the MicroscopeSettings structure: System -> Subsystem -> Limits.
-   - Enforces Unit-Explicit Naming (e.g., voltage_limits_kv) to eliminate
-     interpretive ambiguity during ingestion.
-
-2. Automation Protocols (The "Workflows")
-   - Manages a library of executable routines (e.g., "Demo", "Grid-Screening").
-   - Uses the same indexing pattern as hardware configs to allow
-     switching active protocols without code changes.
+  1) Microscope Configurations (The "Hardware Profile") - Tracks machine profiles.
+  2) Automation Protocols (The "Workflows") - Manages executable routines.
 
 ===============================================================================
 III. Safety & Atomic I/O
 ===============================================================================
 
-- Atomic Writes: All updates to index files use a write-to-tmp -> OS-replace
-  sequence to prevent file corruption during power failures.
-- Separation of Concerns: This module handles *storage and location* (The Registry),
-  while base.py handles *typing and validation* (The Structure).
+- Atomic Writes: Updates use a write-to-tmp -> OS-replace sequence.
+- Separation of Concerns: This module handles *storage* (The Registry),
+  while base.py handles *structure* (The Typing).
+
+===============================================================================
+IV. Usage Patterns (The Context Architecture)
+===============================================================================
+
+This module does not expose a global `registry` object. Instead, you must
+create a `SuperTEMContext` and pass it downstream.
+
+**Pattern A: Running in Production (Normal Operation)**
+    from supertem.config import SuperTEMContext
+    from supertem.utils import setup_session
+
+    # 1. Create the Production Context (Points to /opt/supertem/...)
+    ctx = SuperTEMContext.production()
+
+    # 2. Initialize the Session
+    scope, settings = setup_session(context=ctx, manufacturer="JEOL")
+
+**Pattern B: Running Unit Tests (Isolated Environment)**
+    # 1. Create a Test Context (Points to a temporary folder)
+    ctx = SuperTEMContext.testing(tmp_path)
+
+    # 2. Verify behavior without touching real config files
+    registry = RegistryManager(ctx)
+    assert registry.active_config_name == "default-configuration"
 """
 
 from __future__ import annotations
 import os
 import yaml
 import logging
-import threading
 from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
+from pathlib import Path
 
 import supertem
 
 # =============================================================================
-# Constants & Paths
+# The Context (Dependency Injection Container)
+# =============================================================================
+
+@dataclass
+class SuperTEMContext:
+    """
+    Holds the runtime environment configuration (paths and mode).
+    Pass this object to functions instead of relying on global variables.
+    """
+    base_path: Path
+    config_path: Path
+    log_path: Path
+    data_path: Path
+
+    # Database and specific data subfolders
+    db_path: Path
+    data_ml_path: Path
+    data_cc_path: Path
+    data_tile_path: Path
+
+    @classmethod
+    def production(cls) -> SuperTEMContext:
+        """Factory for the standard production environment."""
+        base = Path(os.path.dirname(supertem.__path__[0]))
+        # Standard SuperTEM folder structure
+        supertem_root = base / "supertem"
+
+        return cls(
+            base_path=base,
+            config_path=supertem_root / "config",
+            log_path=supertem_root / "log",
+            data_path=supertem_root / "log" / "data",
+            db_path=supertem_root / "db" / "supertem.db",
+            data_ml_path=supertem_root / "log" / "data" / "ml",
+            data_cc_path=supertem_root / "log" / "data" / "crosscorrelation",
+            data_tile_path=supertem_root / "log" / "data" / "tile"
+        )
+
+    @classmethod
+    def testing(cls, tmp_path: Path) -> SuperTEMContext:
+        """Factory for unit tests (runs in a temporary isolated folder)."""
+        return cls(
+            base_path=tmp_path,
+            config_path=tmp_path / "config",
+            log_path=tmp_path / "log",
+            data_path=tmp_path / "data",
+            db_path=tmp_path / "db" / "supertem.db",
+            data_ml_path=tmp_path / "data" / "ml",
+            data_cc_path=tmp_path / "data" / "crosscorrelation",
+            data_tile_path=tmp_path / "data" / "tile"
+        )
+
+# =============================================================================
+# Constants & Defaults
 # =============================================================================
 
 METADATA_VERSION = "1.0.0"
-
-BASE_PATH = os.path.dirname(supertem.__path__[0])
-CONFIG_PATH = os.path.join(BASE_PATH, "supertem", "config")
-LOG_PATH = os.path.join(BASE_PATH, "supertem", "log")
-DATA_PATH = os.path.join(BASE_PATH, "supertem", "log", "data")
-
-MICROSCOPE_CONFIG_INDEX_PATH = os.path.join(CONFIG_PATH, "microscope-config-index.yaml")
-PROTOCOL_INDEX_PATH = os.path.join(CONFIG_PATH, "protocol-index.yaml")
-MICROSCOPE_CONFIGURATION_PATH = os.path.join(CONFIG_PATH, "microscope-configuration.yaml")
-PROTOCOL_PATH = os.path.join(CONFIG_PATH, "protocol.yaml")
-POSITION_PATH = os.path.join(CONFIG_PATH, "positions.yaml")
-
-DATA_ML_PATH = os.path.join(DATA_PATH, "ml")
-DATA_CC_PATH = os.path.join(DATA_PATH, "crosscorrelation")
-DATA_TILE_PATH = os.path.join(DATA_PATH, "tile")
-DATABASE_PATH = os.path.join(BASE_PATH, "supertem", "db", "supertem.db")
-
 __DEFAULT_MANUFACTURER__ = "JEOL"
 __DEFAULT_IP_ADDRESS__ = "192.168.0.1"
-
-# =============================================================================
-# Default Dictionaries (Fallback State)
-# =============================================================================
 
 DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
     "system": {
@@ -186,67 +227,82 @@ DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
     },
     "image": {
         "file_format": "tiff",
-        "path": os.path.join(DATA_PATH, "{date}", "images")
+        # Note: Paths here are relative templates, resolved at runtime
+        "path": "{session_path}/images"
     }
 }
 
 DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML = {
-    "configurations": {"default-configuration": {"path": MICROSCOPE_CONFIGURATION_PATH}},
+    "configurations": {"default-configuration": {"path": "microscope-configuration.yaml"}},
     "default": "default-configuration",
 }
 
 DEFAULT_PROTOCOL_YAML = {"name": "demo", "description": "Default protocol", "steps": []}
 DEFAULT_PROTOCOL_INDEX_YAML = {
-    "protocols": {"default-protocol": {"path": PROTOCOL_PATH}},
+    "protocols": {"default-protocol": {"path": "protocol.yaml"}},
     "default": "default-protocol",
 }
 DEFAULT_POSITIONS_YAML = []
 
 
 # =============================================================================
-# Registry Manager (Singleton)
+# Registry Manager (Context-Aware)
 # =============================================================================
 
 class RegistryManager:
-    _instance = None
-    _lock = threading.Lock()
+    """
+    Manages loading and saving of configuration state.
 
-    def __new__(cls):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(RegistryManager, cls).__new__(cls)
-                cls._instance._initialized = False
-        return cls._instance
+    Refactored to support Dependency Injection:
+    - No longer a Singleton.
+    - Requires a `SuperTEMContext` to determine file locations.
+    """
 
-    def __init__(self):
-        if self._initialized: return
+    def __init__(self, context: SuperTEMContext):
+        self.context = context
         self.microscope_index = {}
         self.protocol_index = {}
         self.active_config_name = ""
         self.active_protocol_name = ""
+
+        # Resolve filenames relative to context
+        self.microscope_index_path = self.context.config_path / "microscope-config-index.yaml"
+        self.protocol_index_path = self.context.config_path / "protocol-index.yaml"
+        self.default_microscope_config_path = self.context.config_path / "microscope-configuration.yaml"
+        self.default_protocol_path = self.context.config_path / "protocol.yaml"
+        self.position_path = self.context.config_path / "positions.yaml"
+
         self.bootstrap()
-        self._initialized = True
 
     def bootstrap(self) -> None:
         """Self-healing setup for folders and YAMLs."""
-        for d in [CONFIG_PATH, LOG_PATH, DATA_PATH, DATA_ML_PATH, DATA_CC_PATH, DATA_TILE_PATH,
-                  os.path.dirname(DATABASE_PATH)]:
+        # Ensure directories exist based on context
+        dirs_to_make = [
+            self.context.config_path,
+            self.context.log_path,
+            self.context.data_path,
+            self.context.data_ml_path,
+            self.context.data_cc_path,
+            self.context.data_tile_path,
+            self.context.db_path.parent
+        ]
+        for d in dirs_to_make:
             os.makedirs(d, exist_ok=True)
 
-        self._write_if_missing(MICROSCOPE_CONFIGURATION_PATH, DEFAULT_MICROSCOPE_CONFIGURATION_YAML)
-        self._write_if_missing(PROTOCOL_PATH, DEFAULT_PROTOCOL_YAML)
-        self._write_if_missing(POSITION_PATH, DEFAULT_POSITIONS_YAML)
-        self._write_if_missing(MICROSCOPE_CONFIG_INDEX_PATH, DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML)
-        self._write_if_missing(PROTOCOL_INDEX_PATH, DEFAULT_PROTOCOL_INDEX_YAML)
+        self._write_if_missing(self.default_microscope_config_path, DEFAULT_MICROSCOPE_CONFIGURATION_YAML)
+        self._write_if_missing(self.default_protocol_path, DEFAULT_PROTOCOL_YAML)
+        self._write_if_missing(self.position_path, DEFAULT_POSITIONS_YAML)
+        self._write_if_missing(self.microscope_index_path, DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML)
+        self._write_if_missing(self.protocol_index_path, DEFAULT_PROTOCOL_INDEX_YAML)
         self.reload()
 
     def reload(self) -> None:
         """Loads indices and runs a health check on the active config."""
-        m_idx = self._load_yaml(MICROSCOPE_CONFIG_INDEX_PATH, DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML)
+        m_idx = self._load_yaml(self.microscope_index_path, DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML)
         self.active_config_name = m_idx.get("default", "default-configuration")
         self.microscope_index = m_idx.get("configurations", {})
 
-        p_idx = self._load_yaml(PROTOCOL_INDEX_PATH, DEFAULT_PROTOCOL_INDEX_YAML)
+        p_idx = self._load_yaml(self.protocol_index_path, DEFAULT_PROTOCOL_INDEX_YAML)
         self.active_protocol_name = p_idx.get("default", "default-protocol")
         self.protocol_index = p_idx.get("protocols", {})
 
@@ -261,11 +317,19 @@ class RegistryManager:
             # Fallback to relative import if the absolute path fails in certain environments
             from .structures.base import MicroscopeSettings
 
-        path = self.microscope_index.get(name, {}).get("path")
-        if not path or not os.path.exists(path):
+        path_str = self.microscope_index.get(name, {}).get("path")
+        if not path_str:
             return False
 
-        data = self._load_yaml(path, None)
+        # Resolve path: If absolute, use it. If relative, join with config_path.
+        full_path = Path(path_str)
+        if not full_path.is_absolute():
+            full_path = self.context.config_path / full_path
+
+        if not full_path.exists():
+            return False
+
+        data = self._load_yaml(full_path, None)
         if data is None:
             return False
 
@@ -279,36 +343,42 @@ class RegistryManager:
 
     # --- Accessors ---
 
-    def get_active_config_path(self) -> str:
-        return self.microscope_index.get(self.active_config_name, {}).get("path", MICROSCOPE_CONFIGURATION_PATH)
+    def get_active_config_path(self) -> Path:
+        p = self.microscope_index.get(self.active_config_name, {}).get("path", "microscope-configuration.yaml")
+        return self._resolve_path(p)
 
     def set_default_microscope_config(self, name: str) -> None:
         if name not in self.microscope_index: raise ValueError(f"Unknown config: {name}")
         if self.validate_profile(name, mode="strict"):
             self.active_config_name = name
-            self._atomic_dump(MICROSCOPE_CONFIG_INDEX_PATH, {"configurations": self.microscope_index, "default": name})
+            self._atomic_dump(self.microscope_index_path, {"configurations": self.microscope_index, "default": name})
 
-    def get_active_protocol_path(self) -> str:
-        return self.protocol_index.get(self.active_protocol_name, {}).get("path", PROTOCOL_PATH)
+    def get_active_protocol_path(self) -> Path:
+        p = self.protocol_index.get(self.active_protocol_name, {}).get("path", "protocol.yaml")
+        return self._resolve_path(p)
+
+    def _resolve_path(self, p: str) -> Path:
+        path = Path(p)
+        if path.is_absolute():
+            return path
+        return self.context.config_path / path
 
     # --- Helpers ---
 
-    def _load_yaml(self, path: str, default: Any) -> Any:
+    def _load_yaml(self, path: Path, default: Any) -> Any:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f) or default
         except Exception:
             return default
 
-    def _atomic_dump(self, path: str, data: Any) -> None:
-        tmp = path + ".tmp"
+    def _atomic_dump(self, path: Path, data: Any) -> None:
+        # Cast to Path to ensure string paths from legacy code don't break
+        path_obj = Path(path)
+        tmp = path_obj.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, sort_keys=False)
-        os.replace(tmp, path)
+        os.replace(tmp, path_obj)
 
-    def _write_if_missing(self, path: str, data: Any) -> None:
-        if not os.path.exists(path): self._atomic_dump(path, data)
-
-
-# Global access point
-registry = RegistryManager()
+    def _write_if_missing(self, path: Path, data: Any) -> None:
+        if not path.exists(): self._atomic_dump(path, data)
