@@ -14,9 +14,9 @@ This driver adheres to the strict safety contract defined in `supertem.microscop
 It maps the standard layers to JEOL hardware as follows:
 
   1) Atomic Layer: Wraps `PyJEM` calls (TEM3, EOS3, Stage3).
-     - **Error Handling:** Raises `PyJEM` exceptions directly (Fail Loudly).
-     - **Data Handling:** Returns `None` if `PyJEM` returns error codes or
-       invalid data (e.g., 0 for spot size), strictly following "Null means Unknown".
+     - **Error Handling:** Raises `PyJEM` exceptions directly in Setters (Fail Loudly).
+     - **Data Handling:** Returns `None` in Getters if `PyJEM` fails or returns
+       invalid data, strictly following "Null means Unknown".
 
   2) Helper Layer:
      - **Vendor Validation:** `apply_beam_settings` validates that `alpha_index`
@@ -144,7 +144,7 @@ class JeolMicroscope(TemMicroscope):
                     TEM3 = _T3
                 except ImportError:
                     TEM3 = None
-                    logger.warning("PyJEM not found. JeolMicroscope will be non-functional.")
+                    logger.warning("[INIT] PyJEM not found. JeolMicroscope will be non-functional.")
 
         if detector is None:
             try:
@@ -183,7 +183,8 @@ class JeolMicroscope(TemMicroscope):
         self._has_defocus_calibration: bool = (
             hasattr(config, 'defocus_scale') or ('defocus_scale' in cfg)
         )
-        self.defocus_scale: float = float(getattr(config, 'defocus_scale', cfg.get('defocus_scale', 1.0)))
+        val = getattr(config, 'defocus_scale', cfg.get('defocus_scale', 1.0))
+        self.defocus_scale: float = float(val)
 
     # =========================================================================
     # 1. Connection & Lifecycle
@@ -197,9 +198,13 @@ class JeolMicroscope(TemMicroscope):
             host: The IP address of the TEM server (unused by standard PyJEM, but required by signature).
         """
         if not TEM3:
+            logger.error("[CONN] Cannot connect: PyJEM library not found.")
             raise RuntimeError("PyJEM library not found.")
+
         try:
+            logger.info(f"[CONN] Connecting to TEM3 interface (Host: {host})...")
             TEM3.connect()
+
             # Initialize individual hardware controllers
             self.stage = TEM3.Stage3()
             self.eos = TEM3.EOS3()
@@ -215,10 +220,26 @@ class JeolMicroscope(TemMicroscope):
 
             self._connected = True
             self._refresh_detectors()
-            logger.info(f"Connected to JEOL PyJEM interface (Host: {host}).")
+            logger.info(f"[CONN] Connected to JEOL PyJEM interface (Host: {host}).")
+
         except Exception as e:
-            logger.error(f"Failed to connect to PyJEM modules: {e}")
+            logger.error(f"[CONN] Failed to connect to PyJEM modules: {e}")
             raise
+
+    def disconnect(self) -> None:
+        self._connected = False
+        logger.info("[CONN] Disconnected from JEOL PyJEM.")
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def get_instrument_info(self) -> SystemInfo:
+        return SystemInfo(
+            manufacturer="JEOL",
+            model="ARM/F2",
+            software_version="PyJEM-TEM3",
+            _mode="lenient"
+        )
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -259,14 +280,20 @@ class JeolMicroscope(TemMicroscope):
         if detector is None:
             return
 
-        fn_mod = self._get_detector_function_module()
+        # Handle PyJEM version differences in module structure
+        fn_mod = getattr(detector, "function", None)
+        if fn_mod is None:
+            fn_mod = detector
+
         getter = getattr(fn_mod, "get_attached_detector", None)
         if not callable(getter):
             return
 
         try:
             ids = list(getter())
-        except Exception:
+            logger.debug(f"[DET] Discovered detectors: {ids}")
+        except Exception as e:
+            logger.debug(f"[DET] Failed to list attached detectors: {e}")
             return
 
         for det_id in ids:
@@ -351,6 +378,9 @@ class JeolMicroscope(TemMicroscope):
         """
         if not self.eos:
             return
+
+        logger.debug(f"[LENS] SelectFunctionMode({key})")
+
         norm = self._normalize_eos_key(key) or key
         if ":" not in norm:
             raise ValueError(f"Invalid EOS mode key: {key!r}")
@@ -363,36 +393,22 @@ class JeolMicroscope(TemMicroscope):
         tem_funcs = {"MAG": 0, "MAG2": 1, "LOWMAG": 2, "SAMAG": 3, "DIFF": 4}
         stem_funcs = {"ALIGN": 0, "SM-LMAG": 1, "SM-MAG": 2, "AMAG": 3, "UUDIFF": 4, "ROCKING": 5}
 
-        if obs == "TEM":
-            if hasattr(self.eos, "SelectTemStem"):
-                self.eos.SelectTemStem(0)
-            if hasattr(self.eos, "SelectFunctionMode"):
-                self.eos.SelectFunctionMode(int(tem_funcs.get(func, 0)))
-        elif obs == "STEM":
-            if hasattr(self.eos, "SelectTemStem"):
-                self.eos.SelectTemStem(1)
-            if hasattr(self.eos, "SelectFunctionMode"):
-                self.eos.SelectFunctionMode(int(stem_funcs.get(func, 2)))
-        else:
-            raise ValueError(f"Unknown EOS observation mode: {obs!r}")
-
-    def disconnect(self) -> None:
-        """Mark the connection as closed."""
-        self._connected = False
-        logger.info("Disconnected from JEOL PyJEM.")
-
-    def is_connected(self) -> bool:
-        """Return True if connected."""
-        return self._connected
-
-    def get_instrument_info(self) -> SystemInfo:
-        """Return static instrument metadata."""
-        return SystemInfo(
-            manufacturer="JEOL",
-            model="ARM/F2",
-            software_version="PyJEM-TEM3",
-            _mode="lenient"
-        )
+        try:
+            if obs == "TEM":
+                if hasattr(self.eos, "SelectTemStem"):
+                    self.eos.SelectTemStem(0)
+                if hasattr(self.eos, "SelectFunctionMode"):
+                    self.eos.SelectFunctionMode(int(tem_funcs.get(func, 0)))
+            elif obs == "STEM":
+                if hasattr(self.eos, "SelectTemStem"):
+                    self.eos.SelectTemStem(1)
+                if hasattr(self.eos, "SelectFunctionMode"):
+                    self.eos.SelectFunctionMode(int(stem_funcs.get(func, 2)))
+            else:
+                raise ValueError(f"Unknown EOS observation mode: {obs!r}")
+        except Exception as e:
+            logger.error(f"[LENS] Failed to switch mode to {key}: {e}")
+            raise
 
     # =========================================================================
     # 2. Global State & Mode
@@ -404,18 +420,26 @@ class JeolMicroscope(TemMicroscope):
             return "UNKNOWN"
         try:
             mode = int(self.eos.GetTemStemMode())
-        except Exception:
+            return "TEM" if mode == 0 else "STEM"
+        except Exception as e:
+            logger.debug(f"[EOS] GetTemStemMode failed: {e}")
             return "UNKNOWN"
-        return "TEM" if mode == 0 else "STEM"
 
     def set_mode(self, mode: str) -> None:
         """Set the main observation mode ('TEM' or 'STEM')."""
         if not self.eos or not hasattr(self.eos, "SelectTemStem"):
             return
+
         m = (mode or "").strip().upper()
         if m not in {"TEM", "STEM"}:
             return
-        self.eos.SelectTemStem(0 if m == "TEM" else 1)
+
+        logger.debug(f"[EOS] SelectTemStem({m})")
+        try:
+            self.eos.SelectTemStem(0 if m == "TEM" else 1)
+        except Exception as e:
+            logger.error(f"[EOS] Failed to set mode {m}: {e}")
+            raise
 
     # =========================================================================
     # 3. Stage Control
@@ -430,7 +454,8 @@ class JeolMicroscope(TemMicroscope):
             return None
         try:
             return jeol_adapter.from_jeol_stage_position(self.stage.GetPos())
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[STAGE] Read failed: {e}")
             return None
 
     def move_stage_absolute(self, target: StagePosition, drive_type: str = "default",
@@ -451,19 +476,20 @@ class JeolMicroscope(TemMicroscope):
 
         dt = (drive_type or "motor").strip().lower()
         is_piezo = (dt == "piezo")
-
         t_args = jeol_adapter.to_jeol_stage_args(target)
+
+        logger.debug(f"[STAGE] IO Write ({dt}): {t_args}")
 
         def _dispatch():
             if is_piezo:
                 # --- PIEZO PATH (SelDrvMode = 1) ---
                 if not hasattr(self.stage, "SelDrvMode"):
-                    logger.error("Hardware mismatch: 'SelDrvMode' not found. Cannot perform piezo move.")
+                    logger.error("[STAGE] Hardware mismatch: 'SelDrvMode' not found.")
                     return
 
                 # Warn if unsupported axes are requested
                 if any(k in t_args for k in ['z', 'tx', 'ty']):
-                    logger.warning("Piezo mode supports X/Y only. Z/Tilt requests will be ignored.")
+                    logger.warning("[STAGE] Piezo mode supports X/Y only. Z/Tilt ignored.")
 
                 try:
                     # 1. Switch to Piezo Mode
@@ -496,8 +522,13 @@ class JeolMicroscope(TemMicroscope):
                 if 'ty' in t_args and hasattr(self.stage, "SetTiltYAngle"):
                     self.stage.SetTiltYAngle(t_args['ty'])
 
-        # Execute
-        _dispatch()
+            # Execute
+
+        try:
+            _dispatch()
+        except Exception as e:
+            logger.error(f"[STAGE] Move IO Error: {e}")
+            raise
 
         if not wait:
             return
@@ -515,24 +546,29 @@ class JeolMicroscope(TemMicroscope):
             # Read back current position
             current = self.get_stage_position()
             if current is None:
-                logger.warning("Stage position unreadable; skipping verification.")
+                logger.warning("[STAGE] Position unreadable during verification.")
                 return
 
             # Check if we are close enough
             if target.is_close(current, tol_nm=tolerance_nm, tol_deg=tolerance_deg):
-                return # Success
+                logger.debug(f"[STAGE] Move verified within tolerance (Attempt {attempt + 1}).")
+                return
 
             # If not, retry
             if attempt < max_retries:
-                logger.debug(f"Stage Correction {attempt + 1}: Target vs Current mismatch > tol.")
-                _dispatch()
+                logger.info(f"[STAGE] Hysteresis Correction {attempt + 1}/{max_retries}: Adjusting position.")
+                try:
+                    _dispatch()
+                except Exception as e:
+                    logger.error(f"[STAGE] Correction IO Error: {e}")
                 time.sleep(0.5)
             else:
-                logger.warning(f"Stage accuracy warning: Finished move but outside tolerance.")
+                logger.warning(f"[STAGE] Move finished but outside tolerance ({tolerance_nm}nm).")
 
     def stop_stage(self) -> None:
         """Immediately halt stage movement."""
         if self.stage and hasattr(self.stage, "Stop"):
+            logger.debug("[STAGE] Stop()")
             self.stage.Stop()
 
     def home_stage(self) -> None:
@@ -540,13 +576,11 @@ class JeolMicroscope(TemMicroscope):
         Move the stage to the mechanical origin (0, 0, 0, 0, 0).
         Wraps `TEM3.Stage3.SetOrg`.
         """
-        if not self.stage:
-            return
-
-        if hasattr(self.stage, "SetOrg"):
+        if self.stage and hasattr(self.stage, "SetOrg"):
+            logger.debug("[STAGE] SetOrg() (Homing)")
             self.stage.SetOrg()
         else:
-            logger.warning("home_stage() failed: 'SetOrg' method not found on hardware interface.")
+            logger.warning("[STAGE] 'SetOrg' method not found on hardware interface.")
 
     # =========================================================================
     # 4. Beam Control (Atomic Getters)
@@ -559,7 +593,8 @@ class JeolMicroscope(TemMicroscope):
         try:
             v = float(self.ht.GetHtValue())
             return Q_(v, "V").to(Units.KV)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[BEAM] GetHtValue failed: {e}")
             return None
 
     def get_beam_current(self) -> Optional[Quantity]:
@@ -568,8 +603,8 @@ class JeolMicroscope(TemMicroscope):
             try:
                 val = self.gun.GetEmissionCurrent()
                 return Q_(val, Units.UA).to(Units.NA)
-            except Exception:
-                return None
+            except Exception as e:
+                logger.debug(f"[BEAM] GetEmissionCurrent failed: {e}")
         return None
 
     def get_spot_size(self) -> Optional[int]:
@@ -577,8 +612,8 @@ class JeolMicroscope(TemMicroscope):
         if self.eos and hasattr(self.eos, "GetSpotSize"):
             try:
                 return int(self.eos.GetSpotSize())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[BEAM] GetSpotSize failed: {e}")
         return None
 
     def get_convergence_angle(self) -> Optional[Quantity]:
@@ -591,31 +626,43 @@ class JeolMicroscope(TemMicroscope):
     def get_beam_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Beam Shift (CLA1). Wraps `TEM3.Def3.GetCLA1`."""
         if self.def_ and hasattr(self.def_, "GetCLA1"):
-            res = self._coerce_xy(self.def_.GetCLA1())
-            if res is not None:
-                return res
+            try:
+                res = self._coerce_xy(self.def_.GetCLA1())
+                if res is not None:
+                    return res
+            except Exception as e:
+                logger.debug(f"[BEAM] GetCLA1 failed: {e}")
         return (None, None)
 
     def get_condenser_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Condenser Stigmation (CLs). Wraps `TEM3.Def3.GetCLs`."""
         if self.def_ and hasattr(self.def_, "GetCLs"):
-            res = self._coerce_xy(self.def_.GetCLs())
-            if res is not None:
-                return res
+            try:
+                res = self._coerce_xy(self.def_.GetCLs())
+                if res is not None:
+                    return res
+            except Exception as e:
+                logger.debug(f"[BEAM] GetCLs failed: {e}")
         return (None, None)
 
     def get_gun_tilt(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Gun Tilt (AngBal). Wraps `TEM3.Def3.GetAngBal`."""
         if self.def_ and hasattr(self.def_, "GetAngBal"):
-            res = self._coerce_xy(self.def_.GetAngBal())
-            if res is not None:
-                return res
+            try:
+                res = self._coerce_xy(self.def_.GetAngBal())
+                if res is not None:
+                    return res
+            except Exception as e:
+                logger.debug(f"[BEAM] GetAngBal failed: {e}")
         return (None, None)
 
     def get_beam_blank(self) -> bool:
         """Get Beam Blank status. Wraps `TEM3.Def3.GetBeamBlank`."""
         if self.def_ and hasattr(self.def_, "GetBeamBlank"):
-            return bool(self.def_.GetBeamBlank())
+            try:
+                return bool(self.def_.GetBeamBlank())
+            except Exception as e:
+                logger.debug(f"[BEAM] GetBeamBlank failed: {e}")
         return False
 
     # =========================================================================
@@ -627,7 +674,12 @@ class JeolMicroscope(TemMicroscope):
         if not self.ht:
             return
         v = float(voltage.to("V").magnitude)
-        self.ht.SetHtValue(v)
+        logger.debug(f"[BEAM] SetHtValue({v})")
+        try:
+            self.ht.SetHtValue(v)
+        except Exception as e:
+            logger.error(f"[BEAM] SetHtValue failed: {e}")
+            raise
 
     def set_beam_current(self, current: Quantity) -> None:
         """Not directly supported; use spot size to control current."""
@@ -637,7 +689,12 @@ class JeolMicroscope(TemMicroscope):
     def set_spot_size(self, index: int) -> None:
         """Set spot size index. Wraps `TEM3.EOS3.SelectSpotSize`."""
         if self.eos:
-            self.eos.SelectSpotSize(int(index))
+            logger.debug(f"[BEAM] SelectSpotSize({index})")
+            try:
+                self.eos.SelectSpotSize(int(index))
+            except Exception as e:
+                logger.error(f"[BEAM] SelectSpotSize failed: {e}")
+                raise
 
     def set_convergence_angle(self, angle: Quantity) -> None:
         """Physical angle setting not supported. Use `set_alpha_index`."""
@@ -646,22 +703,42 @@ class JeolMicroscope(TemMicroscope):
     def set_beam_shift(self, x: float, y: float) -> None:
         """Set Beam Shift (CLA1). Wraps `TEM3.Def3.SetCLA1`."""
         if self.def_:
-            self.def_.SetCLA1(int(x), int(y))
+            logger.debug(f"[BEAM] SetCLA1({x}, {y})")
+            try:
+                self.def_.SetCLA1(int(x), int(y))
+            except Exception as e:
+                logger.error(f"[BEAM] SetCLA1 failed: {e}")
+                raise
 
     def set_condenser_stigmation(self, x: float, y: float) -> None:
         """Set Condenser Stigmation (CLs). Wraps `TEM3.Def3.SetCLs`."""
         if self.def_:
-            self.def_.SetCLs(int(x), int(y))
+            logger.debug(f"[BEAM] SetCLs({x}, {y})")
+            try:
+                self.def_.SetCLs(int(x), int(y))
+            except Exception as e:
+                logger.error(f"[BEAM] SetCLs failed: {e}")
+                raise
 
     def set_gun_tilt(self, x: float, y: float) -> None:
         """Set Gun Tilt (AngBal). Wraps `TEM3.Def3.SetAngBal`."""
         if self.def_:
-            self.def_.SetAngBal(int(x), int(y))
+            logger.debug(f"[BEAM] SetAngBal({x}, {y})")
+            try:
+                self.def_.SetAngBal(int(x), int(y))
+            except Exception as e:
+                logger.error(f"[BEAM] SetAngBal failed: {e}")
+                raise
 
     def set_beam_blank(self, blank: bool) -> None:
         """Set Beam Blanker. Wraps `TEM3.Def3.SetBeamBlank`."""
         if self.def_:
-            self.def_.SetBeamBlank(1 if blank else 0)
+            logger.debug(f"[BEAM] SetBeamBlank({blank})")
+            try:
+                self.def_.SetBeamBlank(1 if blank else 0)
+            except Exception as e:
+                logger.error(f"[BEAM] SetBeamBlank failed: {e}")
+                raise
 
     # --- Vendor Specific ---
 
@@ -671,14 +748,20 @@ class JeolMicroscope(TemMicroscope):
             return None
         try:
             return int(self.eos.GetAlpha())
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[BEAM] GetAlpha failed: {e}")
             return None
 
     def set_alpha_index(self, idx: int) -> None:
         """Set Alpha Selector index. Wraps `TEM3.EOS3.SetAlphaSelector`."""
         if not self.eos:
             return
-        self.eos.SetAlphaSelector(int(idx))
+        logger.debug(f"[BEAM] SetAlphaSelector({idx})")
+        try:
+            self.eos.SetAlphaSelector(int(idx))
+        except Exception as e:
+            logger.error(f"[BEAM] SetAlphaSelector failed: {e}")
+            raise
 
     # =========================================================================
     # 4c. Beam Control (Logic Overrides)
@@ -692,8 +775,8 @@ class JeolMicroscope(TemMicroscope):
         raw_flags: Dict[str, Any] = {}
 
         # Acceleration voltage
-        voltage_val: float = 0.0
         vq = self.get_acceleration_voltage()
+        voltage_val = 0.0
         if vq is None:
             raw_flags["ht_unavailable"] = True
         else:
@@ -703,8 +786,8 @@ class JeolMicroscope(TemMicroscope):
                 raw_flags["ht_unavailable"] = True
 
         # Beam current
-        current_ua: float = 0.0
         cq = self.get_beam_current()
+        current_ua = 0.0
         if cq is None:
             raw_flags["beam_current_unavailable"] = True
         else:
@@ -760,14 +843,17 @@ class JeolMicroscope(TemMicroscope):
                 "Use BeamSettings.extra.vendor['JEOL']['alpha_index']."
             )
 
-        if settings.beam_shift is not None and settings.beam_shift.x is not None:
-             self.set_beam_shift(settings.beam_shift.x, settings.beam_shift.y)
+        if settings.beam_shift is not None:
+            if settings.beam_shift.x is not None:
+                 self.set_beam_shift(settings.beam_shift.x, settings.beam_shift.y)
 
-        if settings.condenser_stigmation is not None and settings.condenser_stigmation.x is not None:
-            self.set_condenser_stigmation(settings.condenser_stigmation.x, settings.condenser_stigmation.y)
+        if settings.condenser_stigmation is not None:
+             if settings.condenser_stigmation.x is not None:
+                self.set_condenser_stigmation(settings.condenser_stigmation.x, settings.condenser_stigmation.y)
 
-        if settings.gun_tilt is not None and settings.gun_tilt.x is not None:
-            self.set_gun_tilt(settings.gun_tilt.x, settings.gun_tilt.y)
+        if settings.gun_tilt is not None:
+            if settings.gun_tilt.x is not None:
+                self.set_gun_tilt(settings.gun_tilt.x, settings.gun_tilt.y)
 
         # Vendor-native: alpha selector
         vend = getattr(settings.extra, "vendor", None) or {}
@@ -775,7 +861,6 @@ class JeolMicroscope(TemMicroscope):
 
         if isinstance(jeol_v, dict) and "alpha_index" in jeol_v:
             idx = int(jeol_v["alpha_index"])
-            # STRICT VALIDATION
             if not (0 <= idx <= 8):
                 raise ValueError(f"Unsafe Command: JEOL Alpha Index {idx} is out of bounds (0-8).")
             self.set_alpha_index(idx)
@@ -805,14 +890,12 @@ class JeolMicroscope(TemMicroscope):
             try:
                 val = self.eos.GetMagValue()
                 if isinstance(val, (list, tuple)) and len(val) >= 2:
-                    v = float(val[0])
-                    unit = str(val[1]).strip().upper()
-                    if unit == "X":
-                        return int(round(v))
-                    return None
-                return int(round(float(val)))
-            except Exception:
-                pass
+                    if str(val[1]).strip().upper() == "X":
+                        return int(round(float(val[0])))
+                else:
+                    return int(round(float(val)))
+            except Exception as e:
+                logger.debug(f"[LENS] GetMagValue failed: {e}")
 
         # Method 2: Table Lookup via Selector
         key = self._normalize_eos_key(self._get_eos_mode_key() or "")
@@ -855,19 +938,24 @@ class JeolMicroscope(TemMicroscope):
         """
         if not self.eos:
             return None
+
         key = self._get_eos_mode_key() or ""
         key_u = key.upper()
+
         try:
             if key_u.startswith("STEM:"):
                 if hasattr(self.eos, "GetStemCamValue"):
                     val, unit, _ = self.eos.GetStemCamValue()
                     return Q_(float(val), str(unit)).to(Units.MM)
                 return None
+
             if "DIFF" in key_u and hasattr(self.eos, "GetMagValue"):
                 val, unit, _ = self.eos.GetMagValue()
                 return Q_(float(val), str(unit)).to(Units.MM)
-        except Exception:
-            return None
+
+        except Exception as e:
+            logger.debug(f"[LENS] Camera Length Read failed: {e}")
+
         return None
 
     def get_defocus(self) -> Optional[Quantity]:
@@ -877,12 +965,14 @@ class JeolMicroscope(TemMicroscope):
         """
         if not self._has_defocus_calibration:
             return None
+
         if self.lens and hasattr(self.lens, "GetOLc"):
             try:
                 val = float(self.lens.GetOLc())
                 return Q_(val / (self.defocus_scale or 1.0), Units.NM)
-            except Exception:
-                return None
+            except Exception as e:
+                logger.debug(f"[LENS] GetOLc failed: {e}")
+
         return None
 
     def get_screen_position(self) -> str:
@@ -893,37 +983,42 @@ class JeolMicroscope(TemMicroscope):
             if hasattr(self.det3, "GetScreen"):
                 idx = int(self.det3.GetScreen())
                 return "DOWN" if idx == 2 else "UP"
-        except Exception:
-            return None
+        except Exception as e:
+            logger.debug(f"[LENS] GetScreen failed: {e}")
         return None
 
     def get_objective_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Objective Stigmation (OLs)."""
         if self.def_ and hasattr(self.def_, "GetOLs"):
-            res = self._coerce_xy(self.def_.GetOLs())
-            if res is not None:
-                return res
+            try:
+                res = self._coerce_xy(self.def_.GetOLs())
+                if res is not None:
+                    return res
+            except Exception as e:
+                logger.debug(f"[LENS] GetOLs failed: {e}")
         return (None, None)
 
     def get_image_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Image Shift (IS1 or IS)."""
         if self.def_:
-            if hasattr(self.def_, "GetIS1"):
-                res = self._coerce_xy(self.def_.GetIS1())
-                if res is not None:
-                    return res
-            if hasattr(self.def_, "GetIS"):
-                res = self._coerce_xy(self.def_.GetIS())
-                if res is not None:
-                    return res
+            try:
+                if hasattr(self.def_, "GetIS1"):
+                    return self._coerce_xy(self.def_.GetIS1()) or (None, None)
+                if hasattr(self.def_, "GetIS"):
+                    return self._coerce_xy(self.def_.GetIS()) or (None, None)
+            except Exception as e:
+                logger.debug(f"[LENS] GetIS/IS1 failed: {e}")
         return (None, None)
 
     def get_diffraction_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Diffraction Shift (PLA)."""
         if self.def_ and hasattr(self.def_, "GetPLA"):
-            res = self._coerce_xy(self.def_.GetPLA())
-            if res is not None:
-                return res
+            try:
+                res = self._coerce_xy(self.def_.GetPLA())
+                if res is not None:
+                    return res
+            except Exception as e:
+                logger.debug(f"[LENS] GetPLA failed: {e}")
         return (None, None)
 
     # =========================================================================
@@ -937,14 +1032,19 @@ class JeolMicroscope(TemMicroscope):
         """
         if not mode:
             return
+
         m = mode.strip().upper()
+        logger.debug(f"[LENS] SwitchFunctionMode({m})")
+
         if ":" in m:
             self._select_eos_mode_key(m)
             return
+
         obs = (self.get_mode() or "TEM").strip().upper()
         if "DIFF" in m:
             self._select_eos_mode_key("STEM:UUDIFF" if obs == "STEM" else "TEM:DIFF")
             return
+
         self._select_eos_mode_key("STEM:SM-MAG" if obs == "STEM" else "TEM:MAG")
 
     def set_magnification(self, index: int) -> None:
@@ -954,6 +1054,8 @@ class JeolMicroscope(TemMicroscope):
         """
         if not self.eos:
             return
+
+        logger.debug(f"[LENS] SetSelector({index})")
         key = self._normalize_eos_key(self._get_eos_mode_key() or "")
         if not key:
             return
@@ -974,13 +1076,18 @@ class JeolMicroscope(TemMicroscope):
         try:
             self.eos.SetSelector(int(best_i + 1))
         except Exception:
-            self.eos.SetSelector(int(best_i))
+            try:
+                self.eos.SetSelector(int(best_i))
+            except Exception as e:
+                logger.error(f"[LENS] SetSelector failed: {e}")
 
     def set_camera_length(self, length: Quantity) -> None:
         """
         Set diffraction camera length.
         Logic: Finds the closest selector index in `MagList` (TEM) or `StemCamList` (STEM).
         """
+        logger.debug(f"[LENS] SetCameraLength({length}) [Not Implemented: Table Lookup Required]")
+
         if not self.eos or length is None:
             return
         key, list_name = self._resolve_eos_table_info()
@@ -1013,37 +1120,67 @@ class JeolMicroscope(TemMicroscope):
         """
         if not self._has_defocus_calibration:
             raise ValueError("JEOL driver cannot set physical defocus without calibration.")
+
         if self.lens and hasattr(self.lens, "SetOLc"):
             val = float(defocus.to(Units.NM).magnitude)
-            self.lens.SetOLc(int(val * (self.defocus_scale or 1.0)))
+            dac = int(val * (self.defocus_scale or 1.0))
+
+            logger.debug(f"[LENS] SetOLc({dac})")
+            try:
+                self.lens.SetOLc(dac)
+            except Exception as e:
+                logger.error(f"[LENS] SetOLc failed: {e}")
+                raise
 
     def set_screen_position(self, position: str) -> None:
         """Set Phosphor Screen ('UP'/'DOWN')."""
         if not self.det3:
             return
+
         p = (position or "").strip().upper()
-        if p == "DOWN":
-            self.det3.SetScreen(2)
-        elif p == "UP":
-            self.det3.SetScreen(0)
+        logger.debug(f"[LENS] SetScreen({p})")
+
+        try:
+            if p == "DOWN":
+                self.det3.SetScreen(2)
+            elif p == "UP":
+                self.det3.SetScreen(0)
+        except Exception as e:
+            logger.error(f"[LENS] SetScreen failed: {e}")
+            raise
 
     def set_objective_stigmation(self, x: float, y: float) -> None:
         """Set Objective Stigmation (OLs)."""
         if self.def_:
-            self.def_.SetOLs(int(x), int(y))
+            logger.debug(f"[LENS] SetOLs({x}, {y})")
+            try:
+                self.def_.SetOLs(int(x), int(y))
+            except Exception as e:
+                logger.error(f"[LENS] SetOLs failed: {e}")
+                raise
 
     def set_image_shift(self, x: float, y: float) -> None:
         """Set Image Shift (IS1 or IS)."""
         if self.def_:
-            if hasattr(self.def_, "SetIS1"):
-                self.def_.SetIS1(int(x), int(y))
-                return
-            self.def_.SetIS(int(x), int(y))
+            logger.debug(f"[LENS] SetIS({x}, {y})")
+            try:
+                if hasattr(self.def_, "SetIS1"):
+                    self.def_.SetIS1(int(x), int(y))
+                else:
+                    self.def_.SetIS(int(x), int(y))
+            except Exception as e:
+                logger.error(f"[LENS] SetIS failed: {e}")
+                raise
 
     def set_diffraction_shift(self, x: float, y: float) -> None:
         """Set Diffraction Shift (PLA)."""
         if self.def_:
-            self.def_.SetPLA(int(x), int(y))
+            logger.debug(f"[LENS] SetPLA({x}, {y})")
+            try:
+                self.def_.SetPLA(int(x), int(y))
+            except Exception as e:
+                logger.error(f"[LENS] SetPLA failed: {e}")
+                raise
 
     # --- Vendor Specific ---
 
@@ -1052,14 +1189,19 @@ class JeolMicroscope(TemMicroscope):
         if self.lens and hasattr(self.lens, "GetOLc"):
             try:
                 return int(self.lens.GetOLc())
-            except Exception:
-                return None
+            except Exception as e:
+                logger.debug(f"[LENS] GetOLc (DAC) failed: {e}")
         return None
 
     def set_defocus_dac(self, dac: int) -> None:
         """Set raw OLc DAC value."""
         if self.lens:
-            self.lens.SetOLc(int(dac))
+            logger.debug(f"[LENS] SetOLc(DAC={dac})")
+            try:
+                self.lens.SetOLc(int(dac))
+            except Exception as e:
+                logger.error(f"[LENS] SetOLc (DAC) failed: {e}")
+                raise
 
     # =========================================================================
     # 5c. Projection Control (Logic Overrides)
@@ -1198,11 +1340,14 @@ class JeolMicroscope(TemMicroscope):
                 return Q_(float(self.scan.GetRotationAngleEx()), Units.DEG)
             except Exception:
                 pass
+
         if self.scan and hasattr(self.scan, "GetRotationAngle"):
             try:
                 return Q_(float(self.scan.GetRotationAngle()), Units.DEG)
             except Exception:
                 pass
+
+        # Fallback to detector settings
         d = self._get_scan_controller_detector()
         if d is not None and hasattr(d, "get_detectorsetting"):
             try:
@@ -1234,11 +1379,18 @@ class JeolMicroscope(TemMicroscope):
         if val is None:
             raise ValueError(f"Unsupported scan mode: {mode}")
 
+        logger.debug(f"[SCAN] Setting Mode: {val}")
+
         d = self._get_scan_controller_detector()
         if d is not None and hasattr(d, "set_scanmode"):
-             d.set_scanmode(int(val))
-             self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
-             return
+             try:
+                 d.set_scanmode(int(val))
+                 self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
+                 return
+             except Exception as e:
+                 logger.error(f"[SCAN] SetMode failed: {e}")
+                 raise
+
         self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
 
     def _set_imaging_area(self, *, width=None, height=None, x=None, y=None) -> None:
@@ -1246,14 +1398,21 @@ class JeolMicroscope(TemMicroscope):
         d = self._get_scan_controller_detector()
         if d is None:
             return
+
         w = int(width if width is not None else self._scan_cfg.get("width_px", 512))
         h = int(height if height is not None else self._scan_cfg.get("height_px", 512))
         xx = int(x if x is not None else self._scan_cfg.get("x_px", 0))
         yy = int(y if y is not None else self._scan_cfg.get("y_px", 0))
+
         self._scan_cfg.update({"width_px": w, "height_px": h, "x_px": xx, "y_px": yy})
 
         if hasattr(d, "set_imaging_area"):
-            d.set_imaging_area(w, h, xx, yy)
+            logger.debug(f"[SCAN] SetImagingArea({w}x{h} @ {xx},{yy})")
+            try:
+                d.set_imaging_area(w, h, xx, yy)
+            except Exception as e:
+                logger.error(f"[SCAN] SetImagingArea failed: {e}")
+                raise
 
     def set_scan_width(self, width: int) -> None:
         self._set_imaging_area(width=int(width))
@@ -1278,16 +1437,27 @@ class JeolMicroscope(TemMicroscope):
     def set_scan_rotation(self, angle: Quantity) -> None:
         deg = float(angle.to(Units.DEG).magnitude)
         self._scan_cfg["rotation_deg"] = deg
+
+        logger.debug(f"[SCAN] SetRotation({deg})")
+
         d = self._get_scan_controller_detector()
         if d is not None and hasattr(d, "set_scanrotation"):
-            d.set_scanrotation(float(deg))
-            return
-        if self.scan:
-            if hasattr(self.scan, "SetRotationAngleEx"):
-                self.scan.SetRotationAngleEx(float(deg))
+            try:
+                d.set_scanrotation(float(deg))
                 return
-            if hasattr(self.scan, "SetRotationAngle"):
-                self.scan.SetRotationAngle(int(round(deg)) % 360)
+            except Exception as e:
+                logger.error(f"[SCAN] Detector SetRotation failed: {e}")
+
+        if self.scan:
+            try:
+                if hasattr(self.scan, "SetRotationAngleEx"):
+                    self.scan.SetRotationAngleEx(float(deg))
+                    return
+                if hasattr(self.scan, "SetRotationAngle"):
+                    self.scan.SetRotationAngle(int(round(deg)) % 360)
+            except Exception as e:
+                logger.error(f"[SCAN] Hardware SetRotation failed: {e}")
+                raise
 
     def set_scan_active(self, active: bool) -> None:
         """Start or stop the scan engine."""
@@ -1295,18 +1465,27 @@ class JeolMicroscope(TemMicroscope):
         detector_handled = False
         d = self._get_scan_controller_detector()
 
+        logger.debug(f"[SCAN] SetActive({active})")
+
         # Detector-specific logic (Preferred)
         if d is not None:
-            if active and hasattr(d, "livestart"):
-                d.livestart()
-                detector_handled = True
-            elif (not active) and hasattr(d, "livestop"):
-                d.livestop()
-                detector_handled = True
+            try:
+                if active and hasattr(d, "livestart"):
+                    d.livestart()
+                    detector_handled = True
+                elif (not active) and hasattr(d, "livestop"):
+                    d.livestop()
+                    detector_handled = True
+            except Exception as e:
+                logger.error(f"[SCAN] Detector Live Control failed: {e}")
 
         # Fallback to internal scan generator if detector control failed/missing
         if not detector_handled and self.scan and hasattr(self.scan, "SetExtScanMode"):
-            self.scan.SetExtScanMode(1 if active else 0)
+            try:
+                self.scan.SetExtScanMode(1 if active else 0)
+            except Exception as e:
+                logger.error(f"[SCAN] SetExtScanMode failed: {e}")
+                raise
 
     # =========================================================================
     # 7. Detector Control (Atomic)
@@ -1334,7 +1513,8 @@ class JeolMicroscope(TemMicroscope):
             d = self._get_detector(detector_id)
             res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
             return res.exposure
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[DET] GetExposure({detector_id}) failed: {e}")
             return None
 
     def get_detector_binning(self, detector_id: str) -> Optional[int]:
@@ -1345,7 +1525,8 @@ class JeolMicroscope(TemMicroscope):
             d = self._get_detector(detector_id)
             res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
             return res.binning_index
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[DET] GetBinning({detector_id}) failed: {e}")
             return None
 
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
@@ -1356,7 +1537,8 @@ class JeolMicroscope(TemMicroscope):
             d = self._get_detector(detector_id)
             res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
             return res.roi
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[DET] GetROI({detector_id}) failed: {e}")
             return None
 
     def get_detector_integration(self, detector_id: str) -> Optional[int]:
@@ -1367,7 +1549,8 @@ class JeolMicroscope(TemMicroscope):
             d = self._get_detector(detector_id)
             res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
             return res.frame_integration
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[DET] GetIntegration({detector_id}) failed: {e}")
             return None
 
     def get_detector_inserted(self, detector_id: str) -> bool:
@@ -1385,8 +1568,8 @@ class JeolMicroscope(TemMicroscope):
                             if isinstance(v, str):
                                 return v.strip().upper() in ("IN", "INSERT", "ON")
                             return bool(v)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[DET] GetInserted({detector_id}) failed: {e}")
         return True
 
     def get_detector_frame_rate(self, detector_id: str) -> Optional[Quantity]:
@@ -1396,48 +1579,78 @@ class JeolMicroscope(TemMicroscope):
         """Set detector exposure time."""
         if detector is None:
             return
-        d = self._get_detector(detector_id)
-        us = int(exposure.to(Units.US).magnitude)
-        if hasattr(d, "set_exposuretime_value"):
-            d.set_exposuretime_value(us)
-        elif hasattr(d, "set_exposuretime_index"):
-            d.set_exposuretime_index(us)
+
+        try:
+            d = self._get_detector(detector_id)
+            us = int(exposure.to(Units.US).magnitude)
+            logger.debug(f"[DET] SetExposure({detector_id}, {us}us)")
+
+            if hasattr(d, "set_exposuretime_value"):
+                d.set_exposuretime_value(us)
+            elif hasattr(d, "set_exposuretime_index"):
+                d.set_exposuretime_index(us)
+        except Exception as e:
+            logger.error(f"[DET] SetExposure failed: {e}")
+            raise
 
     def set_detector_binning(self, detector_id: str, index: int) -> None:
         """Set detector binning."""
         if detector is None:
             return
-        d = self._get_detector(detector_id)
-        if hasattr(d, "set_binningindex"):
-            d.set_binningindex(int(index))
+
+        try:
+            d = self._get_detector(detector_id)
+            logger.debug(f"[DET] SetBinning({detector_id}, {index})")
+            if hasattr(d, "set_binningindex"):
+                d.set_binningindex(int(index))
+        except Exception as e:
+            logger.error(f"[DET] SetBinning failed: {e}")
+            raise
 
     def set_detector_roi(self, detector_id: str, roi: Optional[ROI]) -> None:
         """Set detector ROI."""
         if detector is None:
             return
-        d = self._get_detector(detector_id)
-        if roi is None:
-            return
-        if hasattr(d, "set_areamode_imagingarea"):
-            d.set_areamode_imagingarea(int(roi.width), int(roi.height), int(roi.x), int(roi.y))
+
+        try:
+            d = self._get_detector(detector_id)
+            if roi:
+                logger.debug(f"[DET] SetROI({detector_id}, {roi})")
+                if hasattr(d, "set_areamode_imagingarea"):
+                    d.set_areamode_imagingarea(int(roi.width), int(roi.height), int(roi.x), int(roi.y))
+        except Exception as e:
+            logger.error(f"[DET] SetROI failed: {e}")
+            raise
 
     def set_detector_integration(self, detector_id: str, count: int) -> None:
         """Set frame integration count."""
         if detector is None:
             return
-        d = self._get_detector(detector_id)
-        if hasattr(d, "set_frameintegration"):
-            d.set_frameintegration(int(count))
+
+        try:
+            d = self._get_detector(detector_id)
+            logger.debug(f"[DET] SetIntegration({detector_id}, {count})")
+            if hasattr(d, "set_frameintegration"):
+                d.set_frameintegration(int(count))
+        except Exception as e:
+            logger.error(f"[DET] SetIntegration failed: {e}")
+            raise
 
     def set_detector_insertion(self, detector_id: str, inserted: bool) -> None:
         """Insert or retract detector."""
         if detector is None:
             return
-        d = self._get_detector(detector_id)
-        if inserted and hasattr(d, "insert"):
-            d.insert()
-        elif (not inserted) and hasattr(d, "retract"):
-            d.retract()
+
+        try:
+            d = self._get_detector(detector_id)
+            logger.debug(f"[DET] SetInsertion({detector_id}, {inserted})")
+            if inserted and hasattr(d, "insert"):
+                d.insert()
+            elif (not inserted) and hasattr(d, "retract"):
+                d.retract()
+        except Exception as e:
+            logger.error(f"[DET] SetInsertion failed: {e}")
+            raise
 
     def acquire_image(self, request: AcquisitionRequest) -> MicroscopeImage:
         """
@@ -1459,6 +1672,8 @@ class JeolMicroscope(TemMicroscope):
 
         if not det_id:
             raise RuntimeError("No detector_id provided and no primary detector available")
+
+        logger.debug(f"[DET] Acquiring Image on {det_id}")
         d = self._get_detector(det_id)
 
         # Apply temporary settings
@@ -1475,12 +1690,16 @@ class JeolMicroscope(TemMicroscope):
 
         # Trigger Capture
         raw = None
-        if hasattr(d, "snapshot_rawdata"):
-            raw = d.snapshot_rawdata()
-        elif hasattr(d, "get_image_cache"):
-            raw = d.get_image_cache()
-        elif hasattr(d, "livesnapshot"):
-            raw = d.livesnapshot("tif")
+        try:
+            if hasattr(d, "snapshot_rawdata"):
+                raw = d.snapshot_rawdata()
+            elif hasattr(d, "get_image_cache"):
+                raw = d.get_image_cache()
+            elif hasattr(d, "livesnapshot"):
+                raw = d.livesnapshot("tif")
+        except Exception as e:
+            logger.error(f"[DET] Acquisition Hardware Failure: {e}")
+            raise
 
         # Convert to numpy
         arr: np.ndarray
@@ -1611,14 +1830,12 @@ class JeolMicroscope(TemMicroscope):
     def get_valve_state(self, valve_name: str) -> str:
         """Get a valve state ('OPEN'/'CLOSED')."""
         vn = (valve_name or "").strip().lower()
-        if vn == "gun" and self.gun and hasattr(self.gun, "GetBeamValve"):
-            try:
-                return "OPEN" if int(self.gun.GetBeamValve()) == 1 else "CLOSED"
-            except Exception:
-                pass
 
-        if self.vac and hasattr(self.vac, "GetValveStatus"):
-            try:
+        try:
+            if vn == "gun" and self.gun and hasattr(self.gun, "GetBeamValve"):
+                return "OPEN" if int(self.gun.GetBeamValve()) == 1 else "CLOSED"
+
+            if self.vac and hasattr(self.vac, "GetValveStatus"):
                 status = self.vac.GetValveStatus()
                 if isinstance(status, (list, tuple)) and len(status) >= 2:
                     count = int(status[0]) if status[0] is not None else 0
@@ -1628,16 +1845,24 @@ class JeolMicroscope(TemMicroscope):
                     if bit is not None and bit < max(count, bit + 1):
                         is_open = ((bitfield >> bit) & 0x1) == 1
                         return "OPEN" if is_open else "CLOSED"
-            except Exception:
-                pass
+        except Exception as e:
+            logger.debug(f"[VAC] GetValveState({valve_name}) failed: {e}")
+
         return "UNKNOWN"
 
     def set_valve_state(self, valve_name: str, state: str) -> None:
         """Set valve state (only gun valve is supported here)."""
         vn = (valve_name or "").strip().lower()
         st = (state or "").strip().upper()
-        if vn == "gun" and self.gun:
-             self.gun.SetBeamValve(1 if st == "OPEN" else 0)
+
+        logger.debug(f"[VAC] SetValveState({vn}, {st})")
+
+        try:
+            if vn == "gun" and self.gun:
+                 self.gun.SetBeamValve(1 if st == "OPEN" else 0)
+        except Exception as e:
+            logger.error(f"[VAC] SetValveState failed: {e}")
+            raise
 
     def get_pressure(self, gauge_name: str) -> Optional[Quantity]:
         """Get pressure reading (P1/Pig or P4/Peg)."""
@@ -1652,8 +1877,8 @@ class JeolMicroscope(TemMicroscope):
                 val = self.vac.GetPegInfo()
                 if isinstance(val, (list, tuple)) and val:
                     return Q_(float(val[0]), Units.PA)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[VAC] GetPressure({gauge_name}) failed: {e}")
         return None
 
     # =========================================================================
@@ -1666,29 +1891,41 @@ class JeolMicroscope(TemMicroscope):
     def get_aperture(self, aperture_id: str) -> Aperture:
         """Get current aperture state (Size + Position)."""
         if not self.apt:
-            return Aperture(aperture_id=aperture_id, _mode="lenient")
+            return None
+
         kind_idx = self._APERTURE_MAP.get(aperture_id)
         if kind_idx is None:
-            return Aperture(aperture_id=aperture_id, _mode="lenient")
+            return None
 
-        self.apt.SelectExpKind(kind_idx)
-        size_idx = self.apt.GetExpSize(kind_idx)
-        pos_list = self.apt.GetPosition()
-        return jeol_adapter.from_jeol_aperture(aperture_id, size_idx, pos_list)
+        try:
+            self.apt.SelectExpKind(kind_idx)
+            size_idx = self.apt.GetExpSize(kind_idx)
+            pos_list = self.apt.GetPosition()
+            return jeol_adapter.from_jeol_aperture(aperture_id, size_idx, pos_list)
+        except Exception as e:
+            logger.debug(f"[APT] GetAperture({aperture_id}) failed: {e}")
+            return None
 
     def set_aperture(self, aperture_id: str, target: Aperture) -> None:
         """Set aperture state."""
         if not self.apt:
             return
+
         kind_idx = self._APERTURE_MAP.get(aperture_id)
         if kind_idx is None:
             return
 
-        self.apt.SelectExpKind(kind_idx)
-        if target.size_index is not None:
-            self.apt.SetExpSize(kind_idx, int(target.size_index))
-        if target.position is not None:
-            self.apt.SetPosition(int(target.position.x), int(target.position.y))
+        logger.debug(f"[APT] Setting {aperture_id}: Size={target.size_index}, Pos={target.position}")
+
+        try:
+            self.apt.SelectExpKind(kind_idx)
+            if target.size_index is not None:
+                self.apt.SetExpSize(kind_idx, int(target.size_index))
+            if target.position is not None:
+                self.apt.SetPosition(int(target.position.x), int(target.position.y))
+        except Exception as e:
+            logger.error(f"[APT] SetAperture({aperture_id}) failed: {e}")
+            raise
 
     # =========================================================================
     # 10. Helpers
@@ -1714,7 +1951,10 @@ class JeolMicroscope(TemMicroscope):
         if not hasattr(self.stage, "GetStatus"):
             time.sleep(0.5)
             return
+
+        logger.debug("[STAGE] Waiting for IDLE status...")
         start_time = time.time()
+
         while (time.time() - start_time) < timeout:
             try:
                 status = self.stage.GetStatus()
@@ -1724,4 +1964,5 @@ class JeolMicroscope(TemMicroscope):
             except Exception:
                 pass
             time.sleep(0.2)
+
         logger.warning(f"Stage move timed out after {timeout}s (GetStatus never settled).")

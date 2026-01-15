@@ -94,6 +94,52 @@ All Atomic interfaces use strict typing:
     `10 nm` to the `1e-8 meters` expected by a specific API).
 
 ===============================================================================
+V. Logging Strategy (Intent vs. IO)
+===============================================================================
+
+To maintain readability and traceability, drivers must strictly follow these
+logging rules:
+
+1. Layered Logging Levels
+   - **Orchestrator (INFO):** Logs high-level intent.
+     *Example:* `[STAGE] Executing Move: Target=(x=10um)...`
+   - **Helper (WARNING):** Logs safety interventions or clamps.
+     *Example:* `[BEAM] Spot Size 12 clamped to 5.`
+   - **Atomic (DEBUG):** Logs raw hardware I/O.
+     *Example:* `[PyJEM] Write: HT3.SetHtValue(200000)`
+
+2. Implementation Rules (Atomic Layer)
+   Drivers must implement Atomic methods using this specific pattern:
+
+   A. **Consistent Logging (Setters):**
+      Always log the value *before* the hardware call.
+      *Pattern:* `logger.debug(f"[{TAG}] Setting {Name}: {Value}")`
+
+   B. **Consistent Error Handling:**
+      - **Getters (Read):** Catch Exception -> Log DEBUG -> Return None.
+        *Reason:* "Null means Unknown". Logging as ERROR causes log spam during
+        high-frequency polling.
+        *Code:*
+          ```python
+          try:
+              return hardware.get_value()
+          except Exception as e:
+              logger.debug(f"[{TAG}] Read failed: {e}")
+              return None
+          ```
+
+      - **Setters (Write):** Catch Exception -> Log ERROR -> Raise.
+        *Reason:* "Fail Loudly". Writes change state; silent failure is dangerous.
+        *Code:*
+          ```python
+          try:
+              hardware.set_value(val)
+          except Exception as e:
+              logger.error(f"[{TAG}] Write failed: {e}")
+              raise
+          ```
+
+===============================================================================
 Usage
 ===============================================================================
 
@@ -335,6 +381,10 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid StageMoveRequest: {request}")
 
+        # LOG INTENT
+        tgt_str = f"Target={request.target}" if not request.relative else f"Delta={request.target}"
+        logger.info(f"[STAGE] Executing Move: {tgt_str} (Mode: {request.drive_type})")
+
         # 1. Resolve Target (Absolute)
         current = self.get_stage_position()
         target_abs = request.target
@@ -356,6 +406,7 @@ class TemMicroscope(ABC):
                 relative=request.relative
             )
             if not check:
+                logger.error(f"[STAGE] Unsafe move rejected. Reasons: {check.reasons}")
                 raise RuntimeError(f"Unsafe move rejected: {check.reasons}")
 
             # 3. Execution (via Safe Mover)
@@ -371,6 +422,8 @@ class TemMicroscope(ABC):
         """
         if not request.validate():
             raise ValueError(f"Invalid StageControlRequest: {request}")
+
+        logger.info(f"[STAGE] Executing Control: {request.action}")
 
         if request.action == "STOP":
             self.stop_stage()
@@ -510,11 +563,13 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid BeamControlRequest: {request}")
 
-        # Safety Check
+        logger.info(f"[BEAM] Executing Control: Setting {list(request.target.__dict__.keys())}")
+
         sys = self.system_settings.beam_system
         if sys:
             check = sys.is_safe_beam(request.target)
             if not check:
+                logger.error(f"[BEAM] Unsafe settings rejected: {check.reasons}")
                 raise RuntimeError(f"Unsafe beam settings rejected: {check.reasons}")
 
         if request.target:
@@ -651,10 +706,13 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid ProjectionControlRequest: {request}")
 
+        logger.info("[PROJ] Executing Control Request")
+
         sys = self.system_settings.projection_system
         if sys:
             check = sys.is_safe_projection(request.target)
             if not check:
+                logger.error(f"[PROJ] Unsafe settings rejected: {check.reasons}")
                 raise RuntimeError(f"Unsafe projection settings rejected: {check.reasons}")
 
         if request.target:
@@ -762,12 +820,14 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid ScanControlRequest: {request}")
 
-        # Safety Check if applying new settings
+        logger.info(f"[SCAN] Executing Control: Action={request.action}")
+
         if request.target and request.action in ("START", "SINGLE_FRAME"):
             sys = self.system_settings.scan_system
             if sys:
                 check = sys.is_safe_scan(request.target)
                 if not check:
+                    logger.error(f"[SCAN] Unsafe settings rejected: {check.reasons}")
                     raise RuntimeError(f"Unsafe scan settings rejected: {check.reasons}")
             self.apply_scan_settings(request.target)
 
@@ -894,11 +954,14 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid DetectorControlRequest: {request}")
 
+        logger.info(f"[DET] Executing Control: {request.action or 'Configure'} on {request.detector_id}")
+
         sys = self.system_settings.detector_system
         if sys and request.target:
             # Check if capabilities support the request
             check = sys.is_supported(request.target)
             if not check:
+                logger.error(f"[DET] Unsupported settings: {check.reasons}")
                 raise RuntimeError(f"Detector settings not supported: {check.reasons}")
 
         if request.action == "INSERT":
@@ -956,6 +1019,7 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid VacuumControlRequest: {request}")
 
+        logger.info("[VAC] Executing Control Request")
         if request.target:
             self.apply_vacuum_settings(request.target)
 
@@ -993,6 +1057,8 @@ class TemMicroscope(ABC):
         """
         if not request.validate():
             raise ValueError(f"Invalid ApertureControlRequest: {request}")
+
+        logger.info(f"[APT] Executing Control on '{request.aperture_id}'")
 
         final_target = request.target
 
