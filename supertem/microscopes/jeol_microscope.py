@@ -448,28 +448,66 @@ class JeolMicroscope(TemMicroscope):
         """
         if not self.stage:
             return
+
+        dt = (drive_type or "motor").strip().lower()
+        is_piezo = (dt == "piezo")
+
         t_args = jeol_adapter.to_jeol_stage_args(target)
 
         def _dispatch():
-            # Send commands for all axes present in the target
-            if 'x' in t_args and hasattr(self.stage, "SetX"):
-                self.stage.SetX(t_args['x'])
-            if 'y' in t_args and hasattr(self.stage, "SetY"):
-                self.stage.SetY(t_args['y'])
-            if 'z' in t_args and hasattr(self.stage, "SetZ"):
-                self.stage.SetZ(t_args['z'])
-            if 'tx' in t_args and hasattr(self.stage, "SetTiltXAngle"):
-                self.stage.SetTiltXAngle(t_args['tx'])
-            if 'ty' in t_args and hasattr(self.stage, "SetTiltYAngle"):
-                self.stage.SetTiltYAngle(t_args['ty'])
+            if is_piezo:
+                # --- PIEZO PATH (SelDrvMode = 1) ---
+                if not hasattr(self.stage, "SelDrvMode"):
+                    logger.error("Hardware mismatch: 'SelDrvMode' not found. Cannot perform piezo move.")
+                    return
 
-        # 1. Fire Initial Move
+                # Warn if unsupported axes are requested
+                if any(k in t_args for k in ['z', 'tx', 'ty']):
+                    logger.warning("Piezo mode supports X/Y only. Z/Tilt requests will be ignored.")
+
+                try:
+                    # 1. Switch to Piezo Mode
+                    self.stage.SelDrvMode(1)
+
+                    # 2. Issue Moves (X/Y Only)
+                    if 'x' in t_args and hasattr(self.stage, "SetX"):
+                        self.stage.SetX(t_args['x'])
+                    if 'y' in t_args and hasattr(self.stage, "SetY"):
+                        self.stage.SetY(t_args['y'])
+
+                finally:
+                    # 3. Restore to Motor Mode (Safety)
+                    # We restore immediately so subsequent calls default to standard behavior
+                    self.stage.SelDrvMode(0)
+
+            else:
+                # --- MOTOR PATH (SelDrvMode = 0) ---
+                if hasattr(self.stage, "SelDrvMode"):
+                    self.stage.SelDrvMode(0)
+
+                if 'x' in t_args and hasattr(self.stage, "SetX"):
+                    self.stage.SetX(t_args['x'])
+                if 'y' in t_args and hasattr(self.stage, "SetY"):
+                    self.stage.SetY(t_args['y'])
+                if 'z' in t_args and hasattr(self.stage, "SetZ"):
+                    self.stage.SetZ(t_args['z'])
+                if 'tx' in t_args and hasattr(self.stage, "SetTiltXAngle"):
+                    self.stage.SetTiltXAngle(t_args['tx'])
+                if 'ty' in t_args and hasattr(self.stage, "SetTiltYAngle"):
+                    self.stage.SetTiltYAngle(t_args['ty'])
+
+        # Execute
         _dispatch()
 
         if not wait:
             return
 
-        # 2. Verification & Correction Loop
+        # Piezo is open-loop/instant; no retry needed.
+        if is_piezo:
+            time.sleep(0.1)
+            return
+
+        # Motor requires hysteresis retry loop
         for attempt in range(max_retries + 1):
             # Wait for status to settle (Idle)
             self._wait_for_stage(timeout=30.0)
@@ -498,9 +536,17 @@ class JeolMicroscope(TemMicroscope):
             self.stage.Stop()
 
     def home_stage(self) -> None:
-        """Homing is not supported by the standard PyJEM Stage3 interface."""
-        logger.warning("home_stage() not supported by this driver.")
-        pass
+        """
+        Move the stage to the mechanical origin (0, 0, 0, 0, 0).
+        Wraps `TEM3.Stage3.SetOrg`.
+        """
+        if not self.stage:
+            return
+
+        if hasattr(self.stage, "SetOrg"):
+            self.stage.SetOrg()
+        else:
+            logger.warning("home_stage() failed: 'SetOrg' method not found on hardware interface.")
 
     # =========================================================================
     # 4. Beam Control (Atomic Getters)
@@ -714,13 +760,13 @@ class JeolMicroscope(TemMicroscope):
                 "Use BeamSettings.extra.vendor['JEOL']['alpha_index']."
             )
 
-        if settings.beam_shift and settings.beam_shift.x is not None:
+        if settings.beam_shift is not None and settings.beam_shift.x is not None:
              self.set_beam_shift(settings.beam_shift.x, settings.beam_shift.y)
 
-        if settings.condenser_stigmation and settings.condenser_stigmation.x is not None:
+        if settings.condenser_stigmation is not None and settings.condenser_stigmation.x is not None:
             self.set_condenser_stigmation(settings.condenser_stigmation.x, settings.condenser_stigmation.y)
 
-        if settings.gun_tilt and settings.gun_tilt.x is not None:
+        if settings.gun_tilt is not None and settings.gun_tilt.x is not None:
             self.set_gun_tilt(settings.gun_tilt.x, settings.gun_tilt.y)
 
         # Vendor-native: alpha selector
@@ -1248,6 +1294,8 @@ class JeolMicroscope(TemMicroscope):
         self._scan_cfg["active"] = bool(active)
         detector_handled = False
         d = self._get_scan_controller_detector()
+
+        # Detector-specific logic (Preferred)
         if d is not None:
             if active and hasattr(d, "livestart"):
                 d.livestart()
@@ -1255,6 +1303,8 @@ class JeolMicroscope(TemMicroscope):
             elif (not active) and hasattr(d, "livestop"):
                 d.livestop()
                 detector_handled = True
+
+        # Fallback to internal scan generator if detector control failed/missing
         if not detector_handled and self.scan and hasattr(self.scan, "SetExtScanMode"):
             self.scan.SetExtScanMode(1 if active else 0)
 
