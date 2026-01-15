@@ -43,7 +43,7 @@ enforces a strict separation of concerns via three distinct execution layers:
        b. Check Canonical Hardware Capabilities (`system.is_safe_...`).
        c. Delegate to Helpers/Atomic methods for execution.
      - Behavior:
-       - **Strict Safety:** Raises `SafetyViolationError` to prevent unsafe moves.
+       - **Strict Safety:** Raises `RuntimeError` or `ValueError` to prevent unsafe moves.
        - **Bubble Up:** Does NOT catch hardware errors. If the Atomic/Helper layers explode,
          the Orchestrator lets the exception pass through to the user script.
 
@@ -1065,6 +1065,10 @@ class TemMicroscope(ABC):
         # Handle Relative Movement logic
         if request.relative and request.target.position:
             current = self.get_aperture(request.aperture_id)
+            if current is None:
+                raise RuntimeError(
+                    f"Cannot execute relative move: Failed to read current state of '{request.aperture_id}'")
+
             if current.position:
                 new_pos = replace(request.target.position)
                 # Apply delta to current position (manual vector addition)
@@ -1102,6 +1106,10 @@ class TemMicroscope(ABC):
             return
 
         current = self.get_stage_position()
+
+        if current is None:
+            raise RuntimeError("Safe Move Failed: Cannot read current stage position to calculate steps.")
+
         max_step_nm = sys.max_step_distance.to(Units.NM).magnitude
 
         # Calculate max delta across active axes

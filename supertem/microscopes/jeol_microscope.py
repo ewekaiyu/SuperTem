@@ -55,6 +55,77 @@ III. Hardware Quirks & Workarounds
 
   - **Lazy Loading:** `PyJEM` is imported only upon instantiation. This allows
     the class to be imported in simulation/offline environments without crashing.
+
+===============================================================================
+IV. Developer Guide (Atomic Method Boilerplate)
+===============================================================================
+
+When adding new hardware controls, strictly follow these patterns to maintain
+architectural compliance.
+
+**Pattern A: Atomic Getter (Null means Unknown)**
+    def get_hardware_value(self) -> Optional[Type]:
+        if not self.hardware:
+            # Log at DEBUG (not ERROR) to prevent spam during polling
+            logger.debug("[TAG] GetValue failed: Hardware disconnected.")
+            return None
+
+        try:
+            val = self.hardware.GetValue()
+            return _clean_or_convert(val)
+        except Exception as e:
+            logger.debug(f"[TAG] GetValue failed: {e}")
+            return None
+
+**Pattern B: Atomic Setter (Fail Loudly)**
+    def set_hardware_value(self, value: Type) -> None:
+        if not self.hardware:
+            # Setters MUST fail loudly if hardware is missing
+            logger.error("[TAG] SetValue failed: Hardware disconnected.")
+            raise RuntimeError("Hardware disconnected.")
+
+        logger.debug(f"[TAG] SetValue({value})")  # Log intent BEFORE action
+        try:
+            self.hardware.SetValue(value)
+        except Exception as e:
+            logger.error(f"[TAG] SetValue failed: {e}")  # ERROR log
+            raise  # Always re-raise
+
+===============================================================================
+V. Configuration Example
+===============================================================================
+
+The JEOL driver relies on specific `extra.vendor["JEOL"]` keys for features that
+do not map to standard physics (e.g. Alpha Selector, OLc DAC).
+
+    settings = MicroscopeSettings(
+        system=SystemSettings(
+            # ... standard limits ...
+        ),
+        # GLOBAL VENDOR EXTRAS
+        extra=Extras(vendor={"JEOL": {}})
+    )
+
+    # 1. BEAM SETTINGS (Alpha Selector)
+    # The driver reads 'alpha_index' from here to set the convergence angle.
+    beam_req = BeamSettings(
+        voltage=Q_(200, "kV"),
+        extra=Extras(vendor={"JEOL": {
+            "alpha_index": 3  # Sets CLA/Alpha selector to index 3
+        }})
+    )
+
+    # 2. PROJECTION SETTINGS (Raw DACs)
+    # If 'defocus_scale' is missing, the driver reads/writes 'defocus_olc_dac'.
+    proj_req = ProjectionSettings(
+        magnification_index=15,
+        extra=Extras(vendor={"JEOL": {
+            "defocus_olc_dac": 32768  # Direct hardware value
+        }})
+    )
+
+    scope = JeolMicroscope(settings)
+    scope.connect("localhost")
 """
 import time
 import logging
@@ -377,7 +448,8 @@ class JeolMicroscope(TemMicroscope):
         Handles the complexity of selecting TEM/STEM mode first, then Function mode.
         """
         if not self.eos:
-            return
+            logger.error(f"[LENS] SelectFunctionMode({key}) failed: EOS hardware not connected.")
+            raise RuntimeError("EOS hardware not connected.")
 
         logger.debug(f"[LENS] SelectFunctionMode({key})")
 
@@ -427,7 +499,11 @@ class JeolMicroscope(TemMicroscope):
 
     def set_mode(self, mode: str) -> None:
         """Set the main observation mode ('TEM' or 'STEM')."""
-        if not self.eos or not hasattr(self.eos, "SelectTemStem"):
+        if not self.eos:
+            logger.error("[EOS] SelectTemStem failed: Hardware not connected.")
+            raise RuntimeError("EOS hardware not connected.")
+
+        if not hasattr(self.eos, "SelectTemStem"):
             return
 
         m = (mode or "").strip().upper()
@@ -451,6 +527,7 @@ class JeolMicroscope(TemMicroscope):
         Wraps `TEM3.Stage3.GetPos`.
         """
         if not self.stage or not hasattr(self.stage, "GetPos"):
+            logger.debug("[STAGE] GetPos failed: Hardware not connected.")
             return None
         try:
             return jeol_adapter.from_jeol_stage_position(self.stage.GetPos())
@@ -472,7 +549,8 @@ class JeolMicroscope(TemMicroscope):
             the command if the final position is not within tolerance.
         """
         if not self.stage:
-            return
+            logger.error("[STAGE] Move failed: Hardware not connected.")
+            raise RuntimeError("Stage hardware not connected.")
 
         dt = (drive_type or "motor").strip().lower()
         is_piezo = (dt == "piezo")
@@ -485,7 +563,7 @@ class JeolMicroscope(TemMicroscope):
                 # --- PIEZO PATH (SelDrvMode = 1) ---
                 if not hasattr(self.stage, "SelDrvMode"):
                     logger.error("[STAGE] Hardware mismatch: 'SelDrvMode' not found.")
-                    return
+                    raise RuntimeError("Piezo control not supported by this stage driver.")
 
                 # Warn if unsupported axes are requested
                 if any(k in t_args for k in ['z', 'tx', 'ty']):
@@ -567,21 +645,34 @@ class JeolMicroscope(TemMicroscope):
 
     def stop_stage(self) -> None:
         """Immediately halt stage movement."""
-        if self.stage and hasattr(self.stage, "Stop"):
-            logger.debug("[STAGE] Stop()")
-            self.stage.Stop()
+        try:
+            if self.stage and hasattr(self.stage, "Stop"):
+                logger.debug("[STAGE] Stop()")
+                self.stage.Stop()
+            elif not self.stage:
+                logger.error("[STAGE] Stop failed: Hardware not connected.")
+                raise RuntimeError("Stage hardware not connected.")
+        except Exception as e:
+            logger.error(f"[STAGE] Stop failed: {e}")
+            raise
 
     def home_stage(self) -> None:
         """
         Move the stage to the mechanical origin (0, 0, 0, 0, 0).
         Wraps `TEM3.Stage3.SetOrg`.
         """
-        if self.stage and hasattr(self.stage, "SetOrg"):
-            logger.debug("[STAGE] SetOrg() (Homing)")
-            self.stage.SetOrg()
-        else:
-            logger.warning("[STAGE] 'SetOrg' method not found on hardware interface.")
-
+        try:
+            if self.stage and hasattr(self.stage, "SetOrg"):
+                logger.debug("[STAGE] SetOrg() (Homing)")
+                self.stage.SetOrg()
+            elif not self.stage:
+                logger.error("[STAGE] Homing failed: Hardware not connected.")
+                raise RuntimeError("Stage hardware not connected.")
+            else:
+                logger.warning("[STAGE] 'SetOrg' method not found on hardware interface.")
+        except Exception as e:
+            logger.error(f"[STAGE] SetOrg failed: {e}")
+            raise
     # =========================================================================
     # 4. Beam Control (Atomic Getters)
     # =========================================================================
@@ -589,6 +680,7 @@ class JeolMicroscope(TemMicroscope):
     def get_acceleration_voltage(self) -> Optional[Quantity]:
         """Get HT voltage. Wraps `TEM3.HT3.GetHtValue`."""
         if not self.ht or not hasattr(self.ht, "GetHtValue"):
+            logger.debug("[BEAM] GetHtValue failed: Hardware not connected.")
             return None
         try:
             v = float(self.ht.GetHtValue())
@@ -605,6 +697,8 @@ class JeolMicroscope(TemMicroscope):
                 return Q_(val, Units.UA).to(Units.NA)
             except Exception as e:
                 logger.debug(f"[BEAM] GetEmissionCurrent failed: {e}")
+        else:
+            logger.debug("[BEAM] GetEmissionCurrent failed: Hardware not connected.")
         return None
 
     def get_spot_size(self) -> Optional[int]:
@@ -614,6 +708,8 @@ class JeolMicroscope(TemMicroscope):
                 return int(self.eos.GetSpotSize())
             except Exception as e:
                 logger.debug(f"[BEAM] GetSpotSize failed: {e}")
+        else:
+            logger.debug("[BEAM] GetSpotSize failed: Hardware not connected.")
         return None
 
     def get_convergence_angle(self) -> Optional[Quantity]:
@@ -632,6 +728,8 @@ class JeolMicroscope(TemMicroscope):
                     return res
             except Exception as e:
                 logger.debug(f"[BEAM] GetCLA1 failed: {e}")
+        else:
+            logger.debug("[BEAM] GetCLA1 failed: Hardware not connected.")
         return (None, None)
 
     def get_condenser_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
@@ -643,6 +741,8 @@ class JeolMicroscope(TemMicroscope):
                     return res
             except Exception as e:
                 logger.debug(f"[BEAM] GetCLs failed: {e}")
+        else:
+            logger.debug("[BEAM] GetCLs failed: Hardware not connected.")
         return (None, None)
 
     def get_gun_tilt(self) -> Tuple[Optional[float], Optional[float]]:
@@ -654,6 +754,8 @@ class JeolMicroscope(TemMicroscope):
                     return res
             except Exception as e:
                 logger.debug(f"[BEAM] GetAngBal failed: {e}")
+        else:
+            logger.debug("[BEAM] GetAngBal failed: Hardware not connected.")
         return (None, None)
 
     def get_beam_blank(self) -> bool:
@@ -663,6 +765,8 @@ class JeolMicroscope(TemMicroscope):
                 return bool(self.def_.GetBeamBlank())
             except Exception as e:
                 logger.debug(f"[BEAM] GetBeamBlank failed: {e}")
+        else:
+            logger.debug("[BEAM] GetBeamBlank failed: Hardware not connected.")
         return False
 
     # =========================================================================
@@ -672,7 +776,8 @@ class JeolMicroscope(TemMicroscope):
     def set_acceleration_voltage(self, voltage: Quantity) -> None:
         """Set HT voltage. Wraps `TEM3.HT3.SetHtValue`."""
         if not self.ht:
-            return
+            logger.error("[BEAM] SetHtValue failed: Hardware not connected.")
+            raise RuntimeError("Beam hardware (HT3) not connected.")
         v = float(voltage.to("V").magnitude)
         logger.debug(f"[BEAM] SetHtValue({v})")
         try:
@@ -683,18 +788,20 @@ class JeolMicroscope(TemMicroscope):
 
     def set_beam_current(self, current: Quantity) -> None:
         """Not directly supported; use spot size to control current."""
-        logger.warning("set_beam_current not directly supported; use spot_size.")
-        pass
+        logger.error("set_beam_current not supported by JEOL hardware; use spot_size.")
+        raise NotImplementedError("Direct beam current control not supported. Use set_spot_size.")
 
     def set_spot_size(self, index: int) -> None:
         """Set spot size index. Wraps `TEM3.EOS3.SelectSpotSize`."""
-        if self.eos:
-            logger.debug(f"[BEAM] SelectSpotSize({index})")
-            try:
-                self.eos.SelectSpotSize(int(index))
-            except Exception as e:
-                logger.error(f"[BEAM] SelectSpotSize failed: {e}")
-                raise
+        if not self.eos:
+            logger.error("[BEAM] SelectSpotSize failed: Hardware not connected.")
+            raise RuntimeError("EOS hardware not connected.")
+        logger.debug(f"[BEAM] SelectSpotSize({index})")
+        try:
+            self.eos.SelectSpotSize(int(index))
+        except Exception as e:
+            logger.error(f"[BEAM] SelectSpotSize failed: {e}")
+            raise
 
     def set_convergence_angle(self, angle: Quantity) -> None:
         """Physical angle setting not supported. Use `set_alpha_index`."""
@@ -702,49 +809,62 @@ class JeolMicroscope(TemMicroscope):
 
     def set_beam_shift(self, x: float, y: float) -> None:
         """Set Beam Shift (CLA1). Wraps `TEM3.Def3.SetCLA1`."""
-        if self.def_:
-            logger.debug(f"[BEAM] SetCLA1({x}, {y})")
-            try:
-                self.def_.SetCLA1(int(x), int(y))
-            except Exception as e:
-                logger.error(f"[BEAM] SetCLA1 failed: {e}")
-                raise
+        if not self.def_:
+            logger.error("[BEAM] SetCLA1 failed: Hardware not connected.")
+            raise RuntimeError("Deflector hardware not connected.")
+
+        logger.debug(f"[BEAM] SetCLA1({x}, {y})")
+        try:
+            self.def_.SetCLA1(int(x), int(y))
+        except Exception as e:
+            logger.error(f"[BEAM] SetCLA1 failed: {e}")
+            raise
 
     def set_condenser_stigmation(self, x: float, y: float) -> None:
         """Set Condenser Stigmation (CLs). Wraps `TEM3.Def3.SetCLs`."""
-        if self.def_:
-            logger.debug(f"[BEAM] SetCLs({x}, {y})")
-            try:
-                self.def_.SetCLs(int(x), int(y))
-            except Exception as e:
-                logger.error(f"[BEAM] SetCLs failed: {e}")
-                raise
+        if not self.def_:
+            logger.error("[BEAM] SetCLs failed: Hardware not connected.")
+            raise RuntimeError("Deflector hardware not connected.")
+
+        logger.debug(f"[BEAM] SetCLs({x}, {y})")
+        try:
+            self.def_.SetCLs(int(x), int(y))
+        except Exception as e:
+            logger.error(f"[BEAM] SetCLs failed: {e}")
+            raise
 
     def set_gun_tilt(self, x: float, y: float) -> None:
         """Set Gun Tilt (AngBal). Wraps `TEM3.Def3.SetAngBal`."""
-        if self.def_:
-            logger.debug(f"[BEAM] SetAngBal({x}, {y})")
-            try:
-                self.def_.SetAngBal(int(x), int(y))
-            except Exception as e:
-                logger.error(f"[BEAM] SetAngBal failed: {e}")
-                raise
+        if not self.def_:
+            logger.error("[BEAM] SetAngBal failed: Hardware not connected.")
+            raise RuntimeError("Deflector hardware not connected.")
+
+        logger.debug(f"[BEAM] SetAngBal({x}, {y})")
+        try:
+            self.def_.SetAngBal(int(x), int(y))
+        except Exception as e:
+            logger.error(f"[BEAM] SetAngBal failed: {e}")
+            raise
 
     def set_beam_blank(self, blank: bool) -> None:
         """Set Beam Blanker. Wraps `TEM3.Def3.SetBeamBlank`."""
-        if self.def_:
-            logger.debug(f"[BEAM] SetBeamBlank({blank})")
-            try:
-                self.def_.SetBeamBlank(1 if blank else 0)
-            except Exception as e:
-                logger.error(f"[BEAM] SetBeamBlank failed: {e}")
-                raise
+        if not self.def_:
+            logger.error("[BEAM] SetBeamBlank failed: Hardware not connected.")
+            raise RuntimeError("Deflector hardware not connected.")
+
+        logger.debug(f"[BEAM] SetBeamBlank({blank})")
+        try:
+            self.def_.SetBeamBlank(1 if blank else 0)
+        except Exception as e:
+            logger.error(f"[BEAM] SetBeamBlank failed: {e}")
+            raise
 
     # --- Vendor Specific ---
 
     def get_alpha_index(self) -> Optional[int]:
         """Get Alpha Selector index. Wraps `TEM3.EOS3.GetAlpha`."""
         if not self.eos or not hasattr(self.eos, "GetAlpha"):
+            logger.debug("[BEAM] GetAlpha failed: Hardware not connected.")
             return None
         try:
             return int(self.eos.GetAlpha())
@@ -755,7 +875,9 @@ class JeolMicroscope(TemMicroscope):
     def set_alpha_index(self, idx: int) -> None:
         """Set Alpha Selector index. Wraps `TEM3.EOS3.SetAlphaSelector`."""
         if not self.eos:
-            return
+            logger.error("[BEAM] SetAlphaSelector failed: Hardware not connected.")
+            raise RuntimeError("EOS hardware not connected.")
+
         logger.debug(f"[BEAM] SetAlphaSelector({idx})")
         try:
             self.eos.SetAlphaSelector(int(idx))
@@ -883,6 +1005,7 @@ class JeolMicroscope(TemMicroscope):
             2. If unavailable, use `GetSelector()` to look up the value in static tables (`EOS_MODE_TABLES`).
         """
         if not self.eos:
+            logger.debug("[LENS] GetMagValue failed: Hardware not connected.")
             return None
 
         # Method 1: Direct Hardware Query
@@ -937,6 +1060,7 @@ class JeolMicroscope(TemMicroscope):
         Logic: Only valid if in 'DIFF' or 'STEM' mode. Uses `GetMagValue` (TEM) or `GetStemCamValue` (STEM).
         """
         if not self.eos:
+            logger.debug("[LENS] GetCameraLength failed: Hardware not connected.")
             return None
 
         key = self._get_eos_mode_key() or ""
@@ -972,12 +1096,14 @@ class JeolMicroscope(TemMicroscope):
                 return Q_(val / (self.defocus_scale or 1.0), Units.NM)
             except Exception as e:
                 logger.debug(f"[LENS] GetOLc failed: {e}")
-
+        else:
+            logger.debug("[LENS] GetOLc failed: Hardware not connected.")
         return None
 
     def get_screen_position(self) -> str:
         """Get Phosphor Screen state ('UP'/'DOWN')."""
         if not self.det3:
+            logger.debug("[LENS] GetScreen failed: Hardware not connected.")
             return None
         try:
             if hasattr(self.det3, "GetScreen"):
@@ -996,6 +1122,8 @@ class JeolMicroscope(TemMicroscope):
                     return res
             except Exception as e:
                 logger.debug(f"[LENS] GetOLs failed: {e}")
+        else:
+            logger.debug("[LENS] GetOLs failed: Hardware not connected.")
         return (None, None)
 
     def get_image_shift(self) -> Tuple[Optional[float], Optional[float]]:
@@ -1008,6 +1136,8 @@ class JeolMicroscope(TemMicroscope):
                     return self._coerce_xy(self.def_.GetIS()) or (None, None)
             except Exception as e:
                 logger.debug(f"[LENS] GetIS/IS1 failed: {e}")
+        else:
+            logger.debug("[LENS] GetIS failed: Hardware not connected.")
         return (None, None)
 
     def get_diffraction_shift(self) -> Tuple[Optional[float], Optional[float]]:
@@ -1019,6 +1149,8 @@ class JeolMicroscope(TemMicroscope):
                     return res
             except Exception as e:
                 logger.debug(f"[LENS] GetPLA failed: {e}")
+        else:
+            logger.debug("[LENS] GetPLA failed: Hardware not connected.")
         return (None, None)
 
     # =========================================================================
@@ -1031,7 +1163,8 @@ class JeolMicroscope(TemMicroscope):
         Logic: Maps 'IMAGING'/'DIFFRACTION' to JEOL-specific keys (e.g. 'TEM:MAG', 'TEM:DIFF').
         """
         if not mode:
-            return
+            logger.error("[LENS] SetProjectionMode failed: Empty mode provided.")
+            raise ValueError("Mode cannot be empty.")
 
         m = mode.strip().upper()
         logger.debug(f"[LENS] SwitchFunctionMode({m})")
@@ -1053,18 +1186,24 @@ class JeolMicroscope(TemMicroscope):
         Logic: Finds the closest selector index in `EOS_MODE_TABLES` for the requested value.
         """
         if not self.eos:
-            return
+            logger.error("[LENS] SetMagnification failed: Hardware not connected.")
+            raise RuntimeError("EOS hardware not connected.")
 
         logger.debug(f"[LENS] SetSelector({index})")
         key = self._normalize_eos_key(self._get_eos_mode_key() or "")
         if not key:
-            return
+            logger.error("[LENS] SetMagnification failed: Could not determine EOS mode key.")
+            raise RuntimeError("Cannot resolve EOS mode for magnification lookup.")
+
         try:
             mag_list = get_list(key, "MagList") or []
         except Exception:
-            return
+            mag_list = []
+
         if not mag_list or str(mag_list[0][1]).strip().upper() != "X":
-            return
+            logger.error(f"[LENS] SetMagnification failed: MagList unavailable for mode {key}.")
+            raise RuntimeError(f"Magnification table not found for mode {key}.")
+
         target = float(index)
         best_i = 0
         for i, (v, _, _) in enumerate(mag_list):
@@ -1080,22 +1219,33 @@ class JeolMicroscope(TemMicroscope):
                 self.eos.SetSelector(int(best_i))
             except Exception as e:
                 logger.error(f"[LENS] SetSelector failed: {e}")
+                raise
 
     def set_camera_length(self, length: Quantity) -> None:
         """
         Set diffraction camera length.
         Logic: Finds the closest selector index in `MagList` (TEM) or `StemCamList` (STEM).
         """
-        logger.debug(f"[LENS] SetCameraLength({length}) [Not Implemented: Table Lookup Required]")
+        logger.debug(f"[LENS] SetCameraLength({length})")
 
-        if not self.eos or length is None:
-            return
+        if not self.eos:
+            # FIX: Fail Loudly
+            logger.error("[LENS] SetCameraLength failed: Hardware not connected.")
+            raise RuntimeError("EOS hardware not connected.")
+
+        if length is None:
+            raise ValueError("Camera length cannot be None.")
+
         key, list_name = self._resolve_eos_table_info()
         if not key or not list_name:
-            return
+            logger.error("[LENS] SetCameraLength failed: Could not resolve table info (Not in DIFF/STEM mode?).")
+            raise RuntimeError(f"Camera length control unavailable in mode: {self.get_mode()}")
+
         targets = get_list(key, list_name) or []
         if not targets:
-            return
+            logger.error(f"[LENS] SetCameraLength failed: Lookup list '{list_name}' is empty/missing for {key}.")
+            raise RuntimeError(f"Camera length table empty for mode {key}")
+
         target_mm = length.to(Units.MM).magnitude
         best_i, best_err = 0, float("inf")
         for i, (val, unit, _) in enumerate(targets):
@@ -1107,11 +1257,19 @@ class JeolMicroscope(TemMicroscope):
                     best_i = i
             except Exception:
                 continue
+
         selector = int(best_i + 1)
-        if key.startswith("STEM:") and hasattr(self.eos, "SetStemCamSelector"):
-            self.eos.SetStemCamSelector(selector)
-        elif hasattr(self.eos, "SetSelector"):
-            self.eos.SetSelector(selector)
+
+        try:
+            if key.startswith("STEM:") and hasattr(self.eos, "SetStemCamSelector"):
+                self.eos.SetStemCamSelector(selector)
+            elif hasattr(self.eos, "SetSelector"):
+                self.eos.SetSelector(selector)
+            else:
+                raise AttributeError("No suitable selector method found on EOS3.")
+        except Exception as e:
+            logger.error(f"[LENS] SetCameraLength failed (Selector={selector}): {e}")
+            raise
 
     def set_defocus(self, defocus: Quantity) -> None:
         """
@@ -1121,21 +1279,25 @@ class JeolMicroscope(TemMicroscope):
         if not self._has_defocus_calibration:
             raise ValueError("JEOL driver cannot set physical defocus without calibration.")
 
-        if self.lens and hasattr(self.lens, "SetOLc"):
-            val = float(defocus.to(Units.NM).magnitude)
-            dac = int(val * (self.defocus_scale or 1.0))
+        if not self.lens:
+            logger.error("[LENS] SetOLc failed: Hardware not connected.")
+            raise RuntimeError("Lens hardware not connected.")
 
-            logger.debug(f"[LENS] SetOLc({dac})")
-            try:
-                self.lens.SetOLc(dac)
-            except Exception as e:
-                logger.error(f"[LENS] SetOLc failed: {e}")
-                raise
+        val = float(defocus.to(Units.NM).magnitude)
+        dac = int(val * (self.defocus_scale or 1.0))
+
+        logger.debug(f"[LENS] SetOLc({dac})")
+        try:
+            self.lens.SetOLc(dac)
+        except Exception as e:
+            logger.error(f"[LENS] SetOLc failed: {e}")
+            raise
 
     def set_screen_position(self, position: str) -> None:
         """Set Phosphor Screen ('UP'/'DOWN')."""
         if not self.det3:
-            return
+            logger.error("[LENS] SetScreen failed: Hardware not connected.")
+            raise RuntimeError("Detector3 hardware not connected.")
 
         p = (position or "").strip().upper()
         logger.debug(f"[LENS] SetScreen({p})")
@@ -1151,36 +1313,45 @@ class JeolMicroscope(TemMicroscope):
 
     def set_objective_stigmation(self, x: float, y: float) -> None:
         """Set Objective Stigmation (OLs)."""
-        if self.def_:
-            logger.debug(f"[LENS] SetOLs({x}, {y})")
-            try:
-                self.def_.SetOLs(int(x), int(y))
-            except Exception as e:
-                logger.error(f"[LENS] SetOLs failed: {e}")
-                raise
+        if not self.def_:
+            logger.error("[LENS] SetOLs failed: Hardware not connected.")
+            raise RuntimeError("Deflector hardware not connected.")
+
+        logger.debug(f"[LENS] SetOLs({x}, {y})")
+        try:
+            self.def_.SetOLs(int(x), int(y))
+        except Exception as e:
+            logger.error(f"[LENS] SetOLs failed: {e}")
+            raise
 
     def set_image_shift(self, x: float, y: float) -> None:
         """Set Image Shift (IS1 or IS)."""
-        if self.def_:
-            logger.debug(f"[LENS] SetIS({x}, {y})")
-            try:
-                if hasattr(self.def_, "SetIS1"):
-                    self.def_.SetIS1(int(x), int(y))
-                else:
-                    self.def_.SetIS(int(x), int(y))
-            except Exception as e:
-                logger.error(f"[LENS] SetIS failed: {e}")
-                raise
+        if not self.def_:
+            logger.error("[LENS] SetIS failed: Hardware not connected.")
+            raise RuntimeError("Deflector hardware not connected.")
+
+        logger.debug(f"[LENS] SetIS({x}, {y})")
+        try:
+            if hasattr(self.def_, "SetIS1"):
+                self.def_.SetIS1(int(x), int(y))
+            else:
+                self.def_.SetIS(int(x), int(y))
+        except Exception as e:
+            logger.error(f"[LENS] SetIS failed: {e}")
+            raise
 
     def set_diffraction_shift(self, x: float, y: float) -> None:
         """Set Diffraction Shift (PLA)."""
-        if self.def_:
-            logger.debug(f"[LENS] SetPLA({x}, {y})")
-            try:
-                self.def_.SetPLA(int(x), int(y))
-            except Exception as e:
-                logger.error(f"[LENS] SetPLA failed: {e}")
-                raise
+        if not self.def_:
+            logger.error("[LENS] SetPLA failed: Hardware not connected.")
+            raise RuntimeError("Deflector hardware not connected.")
+
+        logger.debug(f"[LENS] SetPLA({x}, {y})")
+        try:
+            self.def_.SetPLA(int(x), int(y))
+        except Exception as e:
+            logger.error(f"[LENS] SetPLA failed: {e}")
+            raise
 
     # --- Vendor Specific ---
 
@@ -1191,17 +1362,22 @@ class JeolMicroscope(TemMicroscope):
                 return int(self.lens.GetOLc())
             except Exception as e:
                 logger.debug(f"[LENS] GetOLc (DAC) failed: {e}")
+        else:
+            logger.debug("[LENS] GetOLc (DAC) failed: Hardware not connected.")
         return None
 
     def set_defocus_dac(self, dac: int) -> None:
         """Set raw OLc DAC value."""
-        if self.lens:
-            logger.debug(f"[LENS] SetOLc(DAC={dac})")
-            try:
-                self.lens.SetOLc(int(dac))
-            except Exception as e:
-                logger.error(f"[LENS] SetOLc (DAC) failed: {e}")
-                raise
+        if not self.lens:
+            logger.error("[LENS] SetOLc(DAC) failed: Hardware not connected.")
+            raise RuntimeError("Lens hardware not connected.")
+
+        logger.debug(f"[LENS] SetOLc(DAC={dac})")
+        try:
+            self.lens.SetOLc(int(dac))
+        except Exception as e:
+            logger.error(f"[LENS] SetOLc (DAC) failed: {e}")
+            raise
 
     # =========================================================================
     # 5c. Projection Control (Logic Overrides)
@@ -1327,11 +1503,11 @@ class JeolMicroscope(TemMicroscope):
 
     def get_scan_pixel_dwell(self) -> Quantity:
         """Get pixel dwell time (cached from config, as HW read is unreliable)."""
-        return Q_(float(self._scan_cfg.get("pixel_dwell_us", 10.0)), Units.US)
+        return None
 
     def get_scan_flyback(self) -> Quantity:
         """Get flyback time (cached from config)."""
-        return Q_(float(self._scan_cfg.get("flyback_us", 100.0)), Units.US)
+        return None
 
     def get_scan_rotation(self) -> Optional[Quantity]:
         """Get scan rotation."""
@@ -1382,14 +1558,18 @@ class JeolMicroscope(TemMicroscope):
         logger.debug(f"[SCAN] Setting Mode: {val}")
 
         d = self._get_scan_controller_detector()
-        if d is not None and hasattr(d, "set_scanmode"):
-             try:
-                 d.set_scanmode(int(val))
-                 self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
-                 return
-             except Exception as e:
-                 logger.error(f"[SCAN] SetMode failed: {e}")
-                 raise
+        if d is None:
+            logger.error("[SCAN] SetMode failed: No scan controller detector found.")
+            raise RuntimeError("Scan detector hardware not connected.")
+
+        if hasattr(d, "set_scanmode"):
+            try:
+                d.set_scanmode(int(val))
+                self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
+                return
+            except Exception as e:
+                logger.error(f"[SCAN] SetMode failed: {e}")
+                raise
 
         self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
 
@@ -1397,19 +1577,19 @@ class JeolMicroscope(TemMicroscope):
         """Set scanning sub-region (Imaging Area)."""
         d = self._get_scan_controller_detector()
         if d is None:
-            return
+            logger.error("[SCAN] SetImagingArea failed: No scan controller detector found.")
+            raise RuntimeError("Scan detector hardware not connected.")
 
         w = int(width if width is not None else self._scan_cfg.get("width_px", 512))
         h = int(height if height is not None else self._scan_cfg.get("height_px", 512))
         xx = int(x if x is not None else self._scan_cfg.get("x_px", 0))
         yy = int(y if y is not None else self._scan_cfg.get("y_px", 0))
 
-        self._scan_cfg.update({"width_px": w, "height_px": h, "x_px": xx, "y_px": yy})
-
         if hasattr(d, "set_imaging_area"):
             logger.debug(f"[SCAN] SetImagingArea({w}x{h} @ {xx},{yy})")
             try:
                 d.set_imaging_area(w, h, xx, yy)
+                self._scan_cfg.update({"width_px": w, "height_px": h, "x_px": xx, "y_px": yy})
             except Exception as e:
                 logger.error(f"[SCAN] SetImagingArea failed: {e}")
                 raise
@@ -1421,33 +1601,30 @@ class JeolMicroscope(TemMicroscope):
         self._set_imaging_area(height=int(height))
 
     def set_scan_pixel_dwell(self, time: Quantity) -> None:
-        try:
-            us = float(time.to(Units.US).magnitude)
-        except Exception:
-            us = float(time.magnitude)
-        self._scan_cfg["pixel_dwell_us"] = us
+        logger.error("[SCAN] set_scan_pixel_dwell not supported by JEOL driver IO.")
+        raise NotImplementedError("Hardware dwell time control not supported.")
 
     def set_scan_flyback(self, time: Quantity) -> None:
-        try:
-            us = float(time.to(Units.US).magnitude)
-        except Exception:
-            us = float(time.magnitude)
-        self._scan_cfg["flyback_us"] = us
+        logger.error("[SCAN] set_scan_flyback not supported by JEOL driver IO.")
+        raise NotImplementedError("Hardware flyback time control not supported.")
 
     def set_scan_rotation(self, angle: Quantity) -> None:
         deg = float(angle.to(Units.DEG).magnitude)
-        self._scan_cfg["rotation_deg"] = deg
-
         logger.debug(f"[SCAN] SetRotation({deg})")
 
         d = self._get_scan_controller_detector()
+        detector_success = False
+
+        # Try Detector First
         if d is not None and hasattr(d, "set_scanrotation"):
             try:
                 d.set_scanrotation(float(deg))
+                detector_success = True
                 return
             except Exception as e:
-                logger.error(f"[SCAN] Detector SetRotation failed: {e}")
+                logger.warning(f"[SCAN] Detector SetRotation failed, attempting fallback: {e}")
 
+        # Try Scan Coils Fallback
         if self.scan:
             try:
                 if hasattr(self.scan, "SetRotationAngleEx"):
@@ -1455,16 +1632,20 @@ class JeolMicroscope(TemMicroscope):
                     return
                 if hasattr(self.scan, "SetRotationAngle"):
                     self.scan.SetRotationAngle(int(round(deg)) % 360)
+                    return
             except Exception as e:
                 logger.error(f"[SCAN] Hardware SetRotation failed: {e}")
                 raise
 
+        # If we reached here, neither worked
+        if not detector_success:
+            logger.error("[SCAN] SetRotation failed: No capable hardware found.")
+            raise RuntimeError("SetRotation failed on both detector and scan coils.")
+
     def set_scan_active(self, active: bool) -> None:
         """Start or stop the scan engine."""
-        self._scan_cfg["active"] = bool(active)
         detector_handled = False
         d = self._get_scan_controller_detector()
-
         logger.debug(f"[SCAN] SetActive({active})")
 
         # Detector-specific logic (Preferred)
@@ -1477,15 +1658,20 @@ class JeolMicroscope(TemMicroscope):
                     d.livestop()
                     detector_handled = True
             except Exception as e:
-                logger.error(f"[SCAN] Detector Live Control failed: {e}")
+                logger.warning(f"[SCAN] Detector Live Control failed, attempting fallback: {e}")
 
-        # Fallback to internal scan generator if detector control failed/missing
-        if not detector_handled and self.scan and hasattr(self.scan, "SetExtScanMode"):
-            try:
-                self.scan.SetExtScanMode(1 if active else 0)
-            except Exception as e:
-                logger.error(f"[SCAN] SetExtScanMode failed: {e}")
-                raise
+        # Fallback to internal scan generator
+        if not detector_handled:
+            if self.scan and hasattr(self.scan, "SetExtScanMode"):
+                try:
+                    self.scan.SetExtScanMode(1 if active else 0)
+                except Exception as e:
+                    logger.error(f"[SCAN] SetExtScanMode failed: {e}")
+                    raise
+            else:
+                # If detector failed and no fallback exists
+                logger.error("[SCAN] SetActive failed: Detector failed and no internal scan control.")
+                raise RuntimeError("Scan control failed.")
 
     # =========================================================================
     # 7. Detector Control (Atomic)
@@ -1508,6 +1694,7 @@ class JeolMicroscope(TemMicroscope):
     def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
         """Get detector exposure time."""
         if detector is None:
+            logger.debug("[DET] GetExposure failed: Hardware not connected.")
             return None
         try:
             d = self._get_detector(detector_id)
@@ -1520,6 +1707,7 @@ class JeolMicroscope(TemMicroscope):
     def get_detector_binning(self, detector_id: str) -> Optional[int]:
         """Get binning index."""
         if detector is None:
+            logger.debug("[DET] GetBinning failed: Hardware not connected.")
             return None
         try:
             d = self._get_detector(detector_id)
@@ -1532,6 +1720,7 @@ class JeolMicroscope(TemMicroscope):
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
         """Get Region of Interest."""
         if detector is None:
+            logger.debug("[DET] GetROI failed: Hardware not connected.")
             return None
         try:
             d = self._get_detector(detector_id)
@@ -1544,6 +1733,7 @@ class JeolMicroscope(TemMicroscope):
     def get_detector_integration(self, detector_id: str) -> Optional[int]:
         """Get frame integration count."""
         if detector is None:
+            logger.debug("[DET] GetIntegration failed: Hardware not connected.")
             return None
         try:
             d = self._get_detector(detector_id)
@@ -1556,6 +1746,7 @@ class JeolMicroscope(TemMicroscope):
     def get_detector_inserted(self, detector_id: str) -> bool:
         """Check if detector is mechanically inserted."""
         if detector is None:
+            logger.debug("[DET] GetInserted failed: Hardware not connected.")
             return True
         try:
             d = self._get_detector(detector_id)
@@ -1578,7 +1769,8 @@ class JeolMicroscope(TemMicroscope):
     def set_detector_exposure(self, detector_id: str, exposure: Quantity) -> None:
         """Set detector exposure time."""
         if detector is None:
-            return
+            logger.error("[DET] SetExposure failed: Detector hardware not connected.")
+            raise RuntimeError("Detector hardware not connected.")
 
         try:
             d = self._get_detector(detector_id)
@@ -1596,7 +1788,8 @@ class JeolMicroscope(TemMicroscope):
     def set_detector_binning(self, detector_id: str, index: int) -> None:
         """Set detector binning."""
         if detector is None:
-            return
+            logger.error("[DET] SetBinning failed: Detector hardware not connected.")
+            raise RuntimeError("Detector hardware not connected.")
 
         try:
             d = self._get_detector(detector_id)
@@ -1610,7 +1803,8 @@ class JeolMicroscope(TemMicroscope):
     def set_detector_roi(self, detector_id: str, roi: Optional[ROI]) -> None:
         """Set detector ROI."""
         if detector is None:
-            return
+            logger.error("[DET] SetROI failed: Detector hardware not connected.")
+            raise RuntimeError("Detector hardware not connected.")
 
         try:
             d = self._get_detector(detector_id)
@@ -1625,7 +1819,8 @@ class JeolMicroscope(TemMicroscope):
     def set_detector_integration(self, detector_id: str, count: int) -> None:
         """Set frame integration count."""
         if detector is None:
-            return
+            logger.error("[DET] SetIntegration failed: Detector hardware not connected.")
+            raise RuntimeError("Detector hardware not connected.")
 
         try:
             d = self._get_detector(detector_id)
@@ -1639,7 +1834,8 @@ class JeolMicroscope(TemMicroscope):
     def set_detector_insertion(self, detector_id: str, inserted: bool) -> None:
         """Insert or retract detector."""
         if detector is None:
-            return
+            logger.error("[DET] SetInsertion failed: Detector hardware not connected.")
+            raise RuntimeError("Detector hardware not connected.")
 
         try:
             d = self._get_detector(detector_id)
@@ -1771,8 +1967,8 @@ class JeolMicroscope(TemMicroscope):
             exposure_ms = None
 
         try:
-            mag_idx = self.get_magnification_index()
-            magnification = float(mag_idx) if mag_idx is not None else None
+            mag = self.get_magnification()
+            magnification = float(mag) if mag is not None else None
         except Exception:
             magnification = None
 
@@ -1858,8 +2054,14 @@ class JeolMicroscope(TemMicroscope):
         logger.debug(f"[VAC] SetValveState({vn}, {st})")
 
         try:
-            if vn == "gun" and self.gun:
-                 self.gun.SetBeamValve(1 if st == "OPEN" else 0)
+            if vn == "gun":
+                if not self.gun:
+                    logger.error("[VAC] SetValveState failed: Gun hardware not connected.")
+                    raise RuntimeError("Gun hardware not connected.")
+                self.gun.SetBeamValve(1 if st == "OPEN" else 0)
+            else:
+                logger.error(f"[VAC] SetValveState failed: Valve '{vn}' control not supported.")
+                raise NotImplementedError(f"Control for valve '{vn}' is not supported by this driver.")
         except Exception as e:
             logger.error(f"[VAC] SetValveState failed: {e}")
             raise
@@ -1867,6 +2069,7 @@ class JeolMicroscope(TemMicroscope):
     def get_pressure(self, gauge_name: str) -> Optional[Quantity]:
         """Get pressure reading (P1/Pig or P4/Peg)."""
         if not self.vac:
+            logger.debug(f"[VAC] GetPressure({gauge_name}) failed: Hardware not connected.")
             return None
         try:
             if hasattr(self.vac, "GetPigInfo"):
@@ -1891,6 +2094,7 @@ class JeolMicroscope(TemMicroscope):
     def get_aperture(self, aperture_id: str) -> Aperture:
         """Get current aperture state (Size + Position)."""
         if not self.apt:
+            logger.debug(f"[APT] GetAperture({aperture_id}) failed: Hardware not connected.")
             return None
 
         kind_idx = self._APERTURE_MAP.get(aperture_id)
@@ -1909,11 +2113,13 @@ class JeolMicroscope(TemMicroscope):
     def set_aperture(self, aperture_id: str, target: Aperture) -> None:
         """Set aperture state."""
         if not self.apt:
-            return
+            logger.error(f"[APT] SetAperture({aperture_id}) failed: Hardware not connected.")
+            raise RuntimeError("Aperture hardware not connected.")
 
         kind_idx = self._APERTURE_MAP.get(aperture_id)
         if kind_idx is None:
-            return
+            logger.error(f"[APT] SetAperture failed: Invalid ID '{aperture_id}'.")
+            raise ValueError(f"Unknown aperture ID: {aperture_id}")
 
         logger.debug(f"[APT] Setting {aperture_id}: Size={target.size_index}, Pos={target.position}")
 
