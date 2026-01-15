@@ -1040,6 +1040,8 @@ class FieldParser:
             self._record(name, val, TypeError(f"{name} must be dict, got {type(val).__name__}"))
             return out
         for k, v in val.items():
+            if v is None:
+                continue
             key_norm = self.id(k, f"{name}.key")
             if key_norm is None: continue
 
@@ -1048,13 +1050,8 @@ class FieldParser:
 
             if obj is None:
                 self._record(obj_key, v, TypeError(f"Invalid object for key '{key_norm}'"))
-                if not self.strict:
-                    try:
-                        obj = cls(_mode=self.mode)  # type: ignore
-                    except:
-                        pass
 
-            if obj is not None:
+            else:
                 if id_field and hasattr(obj, id_field):
                     internal_id = getattr(obj, id_field, None)
                     if internal_id is None:
@@ -1599,9 +1596,9 @@ class StageSystemSettings:
         p = FieldParser(self, self._mode, "StageSystemSettings")
         # Category A: Apply Defaults (Booleans)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
-        self.can_x = p.bool(self.can_x, "can_x", default=True)
-        self.can_y = p.bool(self.can_y, "can_y", default=True)
-        self.can_z = p.bool(self.can_z, "can_z", default=True)
+        self.can_x = p.bool(self.can_x, "can_x", default=False)
+        self.can_y = p.bool(self.can_y, "can_y", default=False)
+        self.can_z = p.bool(self.can_z, "can_z", default=False)
         self.can_r = p.bool(self.can_r, "can_r", default=False)
         self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=False)
         self.can_tilt_y = p.bool(self.can_tilt_y, "can_tilt_y", default=False)
