@@ -1246,20 +1246,32 @@ class JeolMicroscope(TemMicroscope):
             logger.error(f"[LENS] SetCameraLength failed: Lookup list '{list_name}' is empty/missing for {key}.")
             raise RuntimeError(f"Camera length table empty for mode {key}")
 
+        first_unit = str(targets[0][1]).strip().lower()
+        if first_unit not in ['cm', 'mm', 'm']:
+            logger.error(f"[LENS] SetCameraLength failed: Current mode '{key}' uses non-length units '{first_unit}'.")
+            raise RuntimeError(f"Cannot set Camera Length in mode {key} (Table unit: {first_unit})")
+
         target_mm = length.to(Units.MM).magnitude
         best_i, best_err = 0, float("inf")
+
+        found_match = False  # Track if we actually calculated a valid error
         for i, (val, unit, _) in enumerate(targets):
             try:
+                # This conversion might still fail if there's garbage data,
+                # so we keep the try/except but track success.
                 mm = Q_(float(val), str(unit)).to(Units.MM).magnitude
                 err = abs(mm - target_mm)
                 if err < best_err:
                     best_err = err
                     best_i = i
+                    found_match = True
             except Exception:
                 continue
 
-        selector = int(best_i + 1)
+        if not found_match:
+            raise RuntimeError(f"No valid camera length entries found in table for {key}")
 
+        selector = int(best_i + 1)
         try:
             if key.startswith("STEM:") and hasattr(self.eos, "SetStemCamSelector"):
                 self.eos.SetStemCamSelector(selector)

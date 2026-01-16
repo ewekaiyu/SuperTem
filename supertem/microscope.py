@@ -418,7 +418,8 @@ class TemMicroscope(ABC):
             check = sys.is_safe_move(
                 target=request.target if request.relative else target_abs,
                 current=current,
-                relative=request.relative
+                relative=request.relative,
+                ignore_step_limit=True
             )
             if not check:
                 logger.error(f"[STAGE] Unsafe move rejected. Reasons: {check.reasons}")
