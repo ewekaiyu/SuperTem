@@ -70,6 +70,34 @@ def _jeol_bin_to_tuple(x: Any) -> Optional[Tuple[int, int]]:
         return None
     return (int(x.get("Width", 1)), int(x.get("Height", 1)))
 
+def _parse_jeol_roi_limit(val: Any) -> Optional[Tuple[int, int]]:
+    """
+    Robustly parse JEOL size limits.
+    Handles both dict {'Width': w, 'Height': h} and string 'w, h' formats.
+    Returns: (width, height)
+    """
+    if isinstance(val, dict):
+        return (int(val.get("Width", 0)), int(val.get("Height", 0)))
+
+    # Handle string format "1072, 1072" found in some PyJEM versions
+    if isinstance(val, str) and "," in val:
+        try:
+            parts = [p.strip() for p in val.split(",")]
+            if len(parts) >= 2:
+                # Assuming "Width, Height" or "X, Y" (usually symmetric)
+                return (int(parts[0]), int(parts[1]))
+        except (ValueError, IndexError):
+            pass
+
+    # Fallback for single integer strings or numbers (assuming square)
+    try:
+        val_int = int(val)
+        return (val_int, val_int)
+    except (TypeError, ValueError):
+        pass
+
+    return None
+
 
 # =============================================================================
 # 1. Detector Adapters
@@ -104,6 +132,19 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
         "_mode": "lenient"
     }
 
+    # OPTIONAL: Try to parse frame rate if available
+    fr_val = _pop_any(["FrameRate", "frameRate"])
+    if fr_val:
+        try:
+            if isinstance(fr_val, (int, float)):
+                settings_kwargs["frame_rate"] = Q_(float(fr_val), Units.HZ)
+            elif isinstance(fr_val, str) and fr_val.strip():
+                clean_fr = fr_val.lower().replace("fps", "").replace("hz", "").strip()
+                if clean_fr:
+                     settings_kwargs["frame_rate"] = Q_(float(clean_fr), Units.HZ)
+        except Exception:
+            pass
+
     rot_val = _pop_any(["DigitalRotation", "RotationAngle"])
     if rot_val is not None:
         settings_kwargs["digital_rotation"] = Q_(float(rot_val), Units.DEG)
@@ -134,13 +175,65 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
         "_mode": "lenient"
     }
 
-    roi_max_dict = _pop_any(["ImagingAreaMaximum", "imagingAreaMaximum"], {})
-    if roi_max_dict:
-        caps_kwargs["roi_size_max"] = (int(roi_max_dict.get("Width", 0)), int(roi_max_dict.get("Height", 0)))
+    # Exposure Limits (Missing in previous version)
+    # Check both Value limits and Index limits (fallback)
+    exp_min = _pop_any(["ExposureTimeMinimum", "ExposureTimeMin", "ExposureTimeIndexMinimum"])
+    if exp_min is not None:
+        try:
+             caps_kwargs["exposure_min"] = Q_(float(exp_min), Units.MS)
+        except Exception:
+             pass
+
+    exp_max = _pop_any(["ExposureTimeMaximum", "ExposureTimeMax", "ExposureTimeIndexMaximum"])
+    if exp_max is not None:
+        try:
+            caps_kwargs["exposure_max"] = Q_(float(exp_max), Units.MS)
+        except Exception:
+            pass
+
+    # Rotation Limits
+    rot_min = _pop_any(["DigitalRotationMinimum", "RotationAngleMinimum"])
+    if rot_min is not None:
+        caps_kwargs["digital_rotation_min"] = Q_(float(rot_min), Units.DEG)
+
+    rot_max = _pop_any(["DigitalRotationMaximum", "RotationAngleMaximum"])
+    if rot_max is not None:
+        caps_kwargs["digital_rotation_max"] = Q_(float(rot_max), Units.DEG)
+
+    # Frame Integration Limits
+    fi_min = _pop_any(["frameIntegrationMinimum", "FrameIntegrationMinimum"])
+    if fi_min is not None:
+        caps_kwargs["frame_integration_min"] = int(fi_min)
+
+    fi_max = _pop_any(["frameIntegrationMaximum", "FrameIntegrationMaximum"])
+    if fi_max is not None:
+        caps_kwargs["frame_integration_max"] = int(fi_max)
+
+    # ROI Limits (Using robust parser)
+    roi_max_raw = _pop_any(["ImagingAreaMaximum", "imagingAreaMaximum"])
+    roi_size_max = _parse_jeol_roi_limit(roi_max_raw)
+    if roi_size_max:
+        caps_kwargs["roi_size_max"] = roi_size_max
+
+    roi_min_raw = _pop_any(["ImagingAreaMinimum", "imagingAreaMinimum"])
+    roi_size_min = _parse_jeol_roi_limit(roi_min_raw)
+    if roi_size_min:
+        caps_kwargs["roi_size_min"] = roi_size_min
 
     # Pack leftovers into Extras
     caps_extra_dict = {}
     settings_extra_dict = {}
+
+    # OPTIONAL: Pre-calculate Pixel Size from 'OutputImageInformation'
+    out_info = p.get("OutputImageInformation")
+    if isinstance(out_info, dict):
+        ppm = out_info.get("PixelsPerMeter")
+        if isinstance(ppm, dict):
+            # Usually symmetric, take Horizontal
+            hz = ppm.get("Horizontal")
+            if hz and float(hz) > 0:
+                pixel_nm = 1e9 / float(hz)
+                settings_extra_dict["calculated_pixel_size_nm"] = pixel_nm
 
     for k, v in list(p.items()):
         if any(x in k for x in ["Max", "Min", "Can", "Information"]):

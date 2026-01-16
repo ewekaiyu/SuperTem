@@ -168,7 +168,9 @@ def setup_session(
         settings.system.info.manufacturer = manufacturer
 
     # Update dynamic output path
-    settings.image.path = str(session_dir / "images")
+    image_dir = session_dir / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    settings.image.path = str(image_dir)
 
     # 5. Final Validation before hardware handoff
     if not settings.validate():

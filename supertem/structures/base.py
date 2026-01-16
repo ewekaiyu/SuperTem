@@ -1641,6 +1641,7 @@ class StageSystemSettings:
         # 3. Value Checks
         v.check_gt_zero(self.max_step_distance, "max_step_distance", unit_aware=True, reset_to=Q_(50000.0, Units.NM))
         v.check_ge_zero(self.settle_time, "settle_time", unit_aware=True, reset_to=Q_(0.2, Units.SEC))
+        v.check_ge_zero(self.timeout, "timeout", unit_aware=True, reset_to=Q_(10.0, Units.SEC))
 
         # 4. Eucentric Check
         if self.eucentric_z is not None and self.z_limits:
