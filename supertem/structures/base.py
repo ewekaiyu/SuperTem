@@ -335,7 +335,26 @@ command to change the microscope's state.
       Requests are transient. They are created, validated, executed by the
       Manager/Driver, and then discarded. They are rarely stored long-term.
 
-3. How to Write a New Request
+3. Command vs Patch Requests
+-------------------------------------------------------------------------------
+This module defines two high-level request shapes:
+
+1) Command Requests (action-driven)
+   - Examples: StageControlRequest, ScanControlRequest
+   - Intent is carried by an explicit `action` enum (e.g. STOP, HOME, START, ABORT).
+   - Validation MUST require `action` to be present. `extra` may provide optional parameters,
+     but it MUST NOT be used as a substitute for `action` (avoids ambiguous vendor-only commands).
+
+2) Patch Requests (diff-driven)
+   - Examples: BeamControlRequest, ProjectionControlRequest, DetectorControlRequest,
+               VacuumControlRequest, ApertureControlRequest, StageMoveRequest
+   - Intent is carried by providing at least one non-None field in the payload (a "patch").
+   - The "empty patch" guard MUST treat vendor extras as intent:
+       payload.extra.vendor[...] (and/or payload.extra.unknown[...]) counts as a non-empty patch.
+     This ensures vendor-specific updates (e.g. JEOL-only keys) are not rejected as "empty".
+
+
+4. How to Write a New Request
 -------------------------------------------------------------------------------
    1. Define the class with `_mode: ParseMode = ParseMode.STRICT`.
    2. Include the ID field (e.g. `beam_id`) and validate its presence.
@@ -613,6 +632,32 @@ class Extras:
                     except:
                         ex.raw[f"{owner}.extra.{k}"] = repr(v)
         return ex
+
+def _has_actionable_extras(extra: "Extras") -> bool:
+    """Return True if `extra` carries explicit user intent.
+
+    Notes:
+        - In control-plane requests, vendor-specific settings may be carried only
+          in `extra.vendor[...]`. Such requests should not be treated as "empty".
+        - We intentionally ignore `raw` and `notes` here to avoid counting parse/
+          validation diagnostics as user intent.
+    """
+    if extra is None:
+        return False
+
+    def _has_non_none(v):
+        if v is None:
+            return False
+        if isinstance(v, dict):
+            return any(_has_non_none(x) for x in v.values())
+        if isinstance(v, (list, tuple, set)):
+            return any(_has_non_none(x) for x in v)
+        if isinstance(v, str):
+            return len(v.strip()) > 0
+        return True  # numbers / bools / objects
+
+    return _has_non_none(getattr(extra, 'vendor', None)) or _has_non_none(getattr(extra, 'unknown', None))
+
 
 @dataclass
 class SafetyCheck:
@@ -3478,7 +3523,10 @@ class StageMoveRequest:
 
         # Check emptiness of target
         axes = [self.target.x, self.target.y, self.target.z, self.target.r, self.target.tilt_x, self.target.tilt_y]
-        v.check(any(a is not None for a in axes), "empty", "StageMoveRequest has no target coordinates")
+        has_intent = any(a is not None for a in axes)
+        has_intent = has_intent or _has_actionable_extras(getattr(self.target, 'extra', None))
+        has_intent = has_intent or _has_actionable_extras(getattr(self, 'extra', None))
+        v.check(has_intent, "empty", "StageMoveRequest has no target coordinates")
 
         if self.drive_type == StageDriveType.PIEZO.value and self.relative:
             # Heuristic: Warn if requesting massive moves (> 5um) on Piezo
@@ -3601,6 +3649,11 @@ class DetectorControlRequest:
                 has_settings_intent = True
                 break
 
+        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
+        if (not has_settings_intent) and _has_actionable_extras(self.target.extra):
+            has_settings_intent = True
+
+
         # 2. Check if action is present
         has_action = self.action is not None
 
@@ -3653,6 +3706,11 @@ class BeamControlRequest:
                 has_intent = True
                 break
 
+        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
+        if (not has_intent) and _has_actionable_extras(self.target.extra):
+            has_intent = True
+
+
         v.check(has_intent, "empty_target", "Beam request has no parameters set")
         return v.valid
 
@@ -3694,6 +3752,11 @@ class ProjectionControlRequest:
             if f.name not in ["extra", "_mode"] and getattr(self.target, f.name) is not None:
                 has_intent = True
                 break
+
+        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
+        if (not has_intent) and _has_actionable_extras(self.target.extra):
+            has_intent = True
+
 
         v.check(has_intent, "empty_target", "Projection request has no parameters set")
 
@@ -3790,6 +3853,10 @@ class VacuumControlRequest:
                       self.target.gun_valve_state is not None or
                       self.target.turbo_pump_state is not None)
 
+        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
+        has_intent = has_intent or _has_actionable_extras(getattr(self.target, 'extra', None))
+        has_intent = has_intent or _has_actionable_extras(getattr(self, 'extra', None))
+
         v.check(has_intent, "empty_target", "Request must specify at least one state change")
         return v.valid
 
@@ -3851,6 +3918,9 @@ class ApertureControlRequest:
         # No-Op Check
         has_intent = (
                 self.target.inserted is not None or self.target.size_index is not None or self.target.position is not None)
+        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
+        has_intent = has_intent or _has_actionable_extras(getattr(self.target, 'extra', None))
+        has_intent = has_intent or _has_actionable_extras(getattr(self, 'extra', None))
         v.check(has_intent, "empty_payload", "Request contains no changes")
 
         return v.valid

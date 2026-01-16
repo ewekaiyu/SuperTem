@@ -238,6 +238,66 @@ class TemMicroscope(ABC):
         """Access the system limits and capabilities configuration."""
         return self._settings.system
 
+
+    # ---------------------------------------------------------------------
+    # Internal helpers (Intent summaries & Extras)
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _summarize_extras(extra) -> str:
+        """Return a compact summary of actionable extras keys.
+
+        We treat vendor/unknown dict keys with non-None values as actionable.
+        raw/notes are intentionally ignored.
+        """
+        if extra is None:
+            return ""
+        parts = []
+        vend = getattr(extra, "vendor", None)
+        if isinstance(vend, dict):
+            for vname, payload in vend.items():
+                if isinstance(payload, dict):
+                    keys = [k for k, v in payload.items() if v is not None]
+                    if keys:
+                        parts.append(f"vendor.{vname}({', '.join(keys)})")
+                elif payload is not None:
+                    parts.append(f"vendor.{vname}")
+        unk = getattr(extra, "unknown", None)
+        if isinstance(unk, dict):
+            keys = [k for k, v in unk.items() if v is not None]
+            if keys:
+                parts.append(f"unknown({', '.join(keys)})")
+        return "; ".join(parts)
+
+    @classmethod
+    def _summarize_patch(cls, target) -> str:
+        """Summarize non-None canonical fields + actionable extras."""
+        if target is None:
+            return "<none>"
+        fields = []
+        for name, val in getattr(target, "__dict__", {}).items():
+            if name.startswith("_") or name == "extra":
+                continue
+            if val is not None:
+                fields.append(name)
+        extra_s = cls._summarize_extras(getattr(target, "extra", None))
+        if extra_s:
+            fields.append(extra_s)
+        return ", ".join(fields) if fields else "<empty>"
+
+    @staticmethod
+    def _require_point_complete(p, name: str) -> None:
+        """Reject partially-specified Point values.
+
+        For 2D coil fields (Point), we require both x and y if either is provided.
+        """
+        if p is None:
+            return
+        x = getattr(p, "x", None)
+        y = getattr(p, "y", None)
+        if (x is None) ^ (y is None):
+            raise ValueError(f"{name} requires both x and y when provided (got x={x}, y={y}).")
+
     # =========================================================================
     # 1. Connection & Lifecycle
     # =========================================================================
@@ -554,8 +614,11 @@ class TemMicroscope(ABC):
     def apply_beam_settings(self, settings: BeamSettings) -> None:
         """
         Helper: Applies a partial beam configuration.
-        Iterates over the `settings` object. If a field is NOT None, the
-        corresponding atomic setter is called.
+
+        Notes:
+        - Canonical fields are applied when not None.
+        - For 2D coil fields (Point), partial specification is rejected (strict).
+        - Vendor-specific extras are validated/applied by vendor overrides.
         """
         if settings.voltage is not None:
             self.set_acceleration_voltage(settings.voltage)
@@ -566,20 +629,29 @@ class TemMicroscope(ABC):
         if settings.convergence_angle is not None:
             self.set_convergence_angle(settings.convergence_angle)
 
-        if settings.beam_shift:
-            self.set_beam_shift(settings.beam_shift.x or 0.0, settings.beam_shift.y or 0.0)
-        if settings.condenser_stigmation:
-            self.set_condenser_stigmation(settings.condenser_stigmation.x or 0.0,
-                                          settings.condenser_stigmation.y or 0.0)
-        if settings.gun_tilt:
-            self.set_gun_tilt(settings.gun_tilt.x or 0.0, settings.gun_tilt.y or 0.0)
+        # 2D coil fields
+        if settings.beam_shift is not None:
+            self._require_point_complete(settings.beam_shift, 'beam_shift')
+            if settings.beam_shift.x is not None and settings.beam_shift.y is not None:
+                self.set_beam_shift(float(settings.beam_shift.x), float(settings.beam_shift.y))
+
+        if settings.condenser_stigmation is not None:
+            self._require_point_complete(settings.condenser_stigmation, 'condenser_stigmation')
+            if settings.condenser_stigmation.x is not None and settings.condenser_stigmation.y is not None:
+                self.set_condenser_stigmation(float(settings.condenser_stigmation.x),
+                                              float(settings.condenser_stigmation.y))
+
+        if settings.gun_tilt is not None:
+            self._require_point_complete(settings.gun_tilt, 'gun_tilt')
+            if settings.gun_tilt.x is not None and settings.gun_tilt.y is not None:
+                self.set_gun_tilt(float(settings.gun_tilt.x), float(settings.gun_tilt.y))
 
     def execute_beam_control(self, request: BeamControlRequest) -> None:
         """Orchestrator: Handle BeamControlRequest."""
         if not request.validate():
             raise ValueError(f"Invalid BeamControlRequest: {request}")
 
-        logger.info(f"[BEAM] Executing Control: Setting {list(request.target.__dict__.keys())}")
+        logger.info(f"[BEAM] Executing Control: {self._summarize_patch(request.target)}")
 
         sys = self.system_settings.beam_system
         if sys:
@@ -697,7 +769,13 @@ class TemMicroscope(ABC):
         )
 
     def apply_projection_settings(self, settings: ProjectionSettings) -> None:
-        """Helper: Applies partial projection settings."""
+        """Helper: Applies partial projection settings.
+
+        Notes:
+        - Canonical fields are applied when not None.
+        - For 2D coil fields (Point), partial specification is rejected (strict).
+        - Vendor-specific extras are validated/applied by vendor overrides.
+        """
         if settings.optical_mode is not None:
             self.set_projection_mode(settings.optical_mode)
         if settings.magnification is not None:
@@ -709,20 +787,29 @@ class TemMicroscope(ABC):
         if settings.screen_position is not None:
             self.set_screen_position(settings.screen_position)
 
-        if settings.objective_stigmation:
-            self.set_objective_stigmation(settings.objective_stigmation.x or 0.0,
-                                          settings.objective_stigmation.y or 0.0)
-        if settings.image_shift:
-            self.set_image_shift(settings.image_shift.x or 0.0, settings.image_shift.y or 0.0)
-        if settings.diffraction_shift:
-            self.set_diffraction_shift(settings.diffraction_shift.x or 0.0,
-                                       settings.diffraction_shift.y or 0.0)
+        if settings.objective_stigmation is not None:
+            self._require_point_complete(settings.objective_stigmation, 'objective_stigmation')
+            if settings.objective_stigmation.x is not None and settings.objective_stigmation.y is not None:
+                self.set_objective_stigmation(float(settings.objective_stigmation.x),
+                                              float(settings.objective_stigmation.y))
+
+        if settings.image_shift is not None:
+            self._require_point_complete(settings.image_shift, 'image_shift')
+            if settings.image_shift.x is not None and settings.image_shift.y is not None:
+                self.set_image_shift(float(settings.image_shift.x), float(settings.image_shift.y))
+
+        if settings.diffraction_shift is not None:
+            self._require_point_complete(settings.diffraction_shift, 'diffraction_shift')
+            if settings.diffraction_shift.x is not None and settings.diffraction_shift.y is not None:
+                self.set_diffraction_shift(float(settings.diffraction_shift.x),
+                                           float(settings.diffraction_shift.y))
+
 
     def execute_projection_control(self, request: ProjectionControlRequest) -> None:
         if not request.validate():
             raise ValueError(f"Invalid ProjectionControlRequest: {request}")
 
-        logger.info("[PROJ] Executing Control Request")
+        logger.info(f"[PROJ] Executing Control: {self._summarize_patch(request.target)}")
 
         sys = self.system_settings.projection_system
         if sys:
@@ -1023,12 +1110,17 @@ class TemMicroscope(ABC):
         )
 
     def apply_vacuum_settings(self, settings: VacuumSettings) -> None:
-        """Helper: Apply vacuum state changes."""
-        if settings.column_valve_state:
+        """Helper: Apply vacuum state changes.
+
+        Notes:
+        - Canonical fields are applied when not None.
+        - Vendor-specific extras are validated/applied by vendor overrides.
+        """
+        if settings.column_valve_state is not None:
             self.set_valve_state('column', settings.column_valve_state)
-        if settings.gun_valve_state:
+        if settings.gun_valve_state is not None:
             self.set_valve_state('gun', settings.gun_valve_state)
-        if settings.turbo_pump_state:
+        if settings.turbo_pump_state is not None:
             self.set_valve_state('turbo', settings.turbo_pump_state)
 
     def execute_vacuum_control(self, request: VacuumControlRequest) -> None:
@@ -1036,7 +1128,7 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid VacuumControlRequest: {request}")
 
-        logger.info("[VAC] Executing Control Request")
+        logger.info(f"[VAC] Executing Control: {self._summarize_patch(request.target)}")
         if request.target:
             self.apply_vacuum_settings(request.target)
 
@@ -1075,7 +1167,7 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid ApertureControlRequest: {request}")
 
-        logger.info(f"[APT] Executing Control on '{request.aperture_id}'")
+        logger.info(f"[APT] Executing Control on '{request.aperture_id}': target={request.target}")
 
         final_target = request.target
 

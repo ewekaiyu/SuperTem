@@ -946,12 +946,21 @@ class JeolMicroscope(TemMicroscope):
         )
 
     def apply_beam_settings(self, settings: BeamSettings) -> None:
+        """Apply (partial) beam settings.
+
+        Vendor responsibilities (JEOL):
+            - Validate and apply `alpha_index` from `settings.extra.vendor['JEOL']`.
+            - Reject `convergence_angle` because JEOL cannot set a physical angle
+              without calibration; use alpha_index instead.
+
+        Canonical responsibilities:
+            - Apply known fields when not None.
+            - Reject partially-specified 2D coil Points (x without y, or y without x).
+
+        Raises:
+            ValueError: for invalid/unsafe vendor indices or malformed Point fields.
         """
-        Applies beam settings.
-        Override Reason:
-            1. Validates `alpha_index` limits (0-8) to prevent hardware errors.
-            2. Intercepts `convergence_angle` to raise error (unsupported).
-        """
+        # --- Canonical fields ---
         if settings.voltage is not None:
             self.set_acceleration_voltage(settings.voltage)
         if settings.beam_current is not None:
@@ -959,30 +968,49 @@ class JeolMicroscope(TemMicroscope):
         if settings.spot_size is not None:
             self.set_spot_size(settings.spot_size)
 
+        # JEOL cannot set a physical convergence angle reliably.
         if settings.convergence_angle is not None:
             raise ValueError(
                 "JEOL driver cannot apply BeamSettings.convergence_angle without calibration. "
                 "Use BeamSettings.extra.vendor['JEOL']['alpha_index']."
             )
 
+        # --- 2D coil fields (require complete x/y) ---
         if settings.beam_shift is not None:
-            if settings.beam_shift.x is not None:
-                 self.set_beam_shift(settings.beam_shift.x, settings.beam_shift.y)
+            x, y = settings.beam_shift.x, settings.beam_shift.y
+            if (x is None) ^ (y is None):
+                raise ValueError(f"beam_shift requires both x and y when provided (got x={x}, y={y}).")
+            if x is not None and y is not None:
+                self.set_beam_shift(float(x), float(y))
 
         if settings.condenser_stigmation is not None:
-             if settings.condenser_stigmation.x is not None:
-                self.set_condenser_stigmation(settings.condenser_stigmation.x, settings.condenser_stigmation.y)
+            x, y = settings.condenser_stigmation.x, settings.condenser_stigmation.y
+            if (x is None) ^ (y is None):
+                raise ValueError(
+                    f"condenser_stigmation requires both x and y when provided (got x={x}, y={y})."
+                )
+            if x is not None and y is not None:
+                self.set_condenser_stigmation(float(x), float(y))
 
         if settings.gun_tilt is not None:
-            if settings.gun_tilt.x is not None:
-                self.set_gun_tilt(settings.gun_tilt.x, settings.gun_tilt.y)
+            x, y = settings.gun_tilt.x, settings.gun_tilt.y
+            if (x is None) ^ (y is None):
+                raise ValueError(f"gun_tilt requires both x and y when provided (got x={x}, y={y}).")
+            if x is not None and y is not None:
+                self.set_gun_tilt(float(x), float(y))
 
-        # Vendor-native: alpha selector
-        vend = getattr(settings.extra, "vendor", None) or {}
-        jeol_v = vend.get("JEOL") if isinstance(vend, dict) else None
-
-        if isinstance(jeol_v, dict) and "alpha_index" in jeol_v:
-            idx = int(jeol_v["alpha_index"])
+        # --- Vendor-native (JEOL) extras ---
+        vend = getattr(settings.extra, 'vendor', None)
+        jeol_v = vend.get('JEOL') if isinstance(vend, dict) else None
+        if isinstance(jeol_v, dict) and 'alpha_index' in jeol_v:
+            raw = jeol_v.get('alpha_index')
+            if raw is None:
+                # Explicit None -> no-op
+                return
+            try:
+                idx = int(raw)
+            except Exception as e:
+                raise ValueError(f"JEOL alpha_index must be an int-like value (got {raw!r}): {e}")
             if not (0 <= idx <= 8):
                 raise ValueError(f"Unsafe Command: JEOL Alpha Index {idx} is out of bounds (0-8).")
             self.set_alpha_index(idx)
@@ -1422,8 +1450,10 @@ class JeolMicroscope(TemMicroscope):
         try:
             vend = getattr(settings.extra, "vendor", None) or {}
             jeol_v = vend.get("JEOL") if isinstance(vend, dict) else None
-            if isinstance(jeol_v, dict) and "defocus_olc_dac" in jeol_v:
-                self.set_defocus_dac(int(jeol_v["defocus_olc_dac"]))
+            if isinstance(jeol_v, dict) and 'defocus_olc_dac' in jeol_v:
+                v = jeol_v.get('defocus_olc_dac')
+                if v is not None:
+                    self.set_defocus_dac(int(v))
         except Exception:
             raise
 
