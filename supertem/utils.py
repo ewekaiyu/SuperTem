@@ -18,6 +18,8 @@ This function manages the transition from static configuration to live execution
   1) Configuration Resolution
      - Instantiates a `RegistryManager` tied to the provided `SuperTEMContext`.
      - Queries the registry to locate the active hardware profile.
+     - **Profile Override:** Optionally accepts a specific `profile_name` to
+       bypass the system default (e.g., for temporary testing of new settings).
      - Ingests YAML data into `MicroscopeSettings` using STRICT mode to ensure
        control-plane safety before hardware handoff.
 
@@ -31,7 +33,22 @@ This function manages the transition from static configuration to live execution
      - Instantiates the `TemMicroscope` controller.
 
 ===============================================================================
-II. Unit-Aware Persistence & Serialization
+II. State Persistence (The Snapshot Lifecycle)
+===============================================================================
+
+This module enables the "Clone & Patch" pattern for configuration management
+via `save_live_config()`. This allows operators to use the microscope as a
+GUI editor for the configuration files:
+
+  1) Tune: Adjust microscope parameters (Voltage, Spotsize, etc.) interactively.
+  2) Clone: The system deep-copies the active static limits (Validation Layer).
+  3) Patch: The system queries the hardware for current values (Hardware Layer)
+     and writes them into the `default_` fields of the settings object.
+  4) Save: The result is serialized to a new YAML profile, ready for immediate
+     use via `setup_session(..., profile_name="new_profile")`.
+
+===============================================================================
+III. Unit-Aware Persistence & Serialization
 ===============================================================================
 
 The utility layer provides specialized I/O handlers that respect the
@@ -40,7 +57,7 @@ The utility layer provides specialized I/O handlers that respect the
 - `get_saved_positions`: Re-hydrates Floats -> Pint units (for Safety).
 
 ===============================================================================
-III. Media & Diagnostic Helpers
+IV. Media & Diagnostic Helpers
 ===============================================================================
 
 - MicroscopeImage Integration: Media helpers (like `create_gif`) utilize the
@@ -48,7 +65,7 @@ III. Media & Diagnostic Helpers
 - Logging: Standardized formatting for cross-module traceability.
 
 ===============================================================================
-IV. The Wiring Contract (Dependency Injection)
+V. The Wiring Contract (Dependency Injection)
 ===============================================================================
 
 All functions in this module are **Context-Dependent**. They do not assume
@@ -67,6 +84,7 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Any
+from copy import deepcopy
 
 import yaml
 from PIL import Image
@@ -140,11 +158,17 @@ def setup_session(
     ip_address: Optional[str] = None,
     manufacturer: Optional[str] = None,
     debug: bool = False,
+    profile_name: Optional[str] = None
 ) -> Tuple[TemMicroscope, MicroscopeSettings]:
     """Setup microscope session using registry-aware loading."""
 
     # 1. Instantiate Registry for this context
     registry = RegistryManager(context)
+
+    if profile_name:
+        if profile_name not in registry.microscope_index:
+            raise ValueError(f"Profile '{profile_name}' not found in registry.")
+        registry.active_config_name = profile_name
 
     # 2. Load settings (Uses base.py STRICT mode for control-plane safety)
     settings = load_microscope(registry, config_path, protocol_path, mode=ParseMode.STRICT)
@@ -225,6 +249,73 @@ def load_microscope(
             config_dict["protocol"] = protocol_dict
 
     return MicroscopeSettings.from_dict(config_dict, mode=mode)
+
+def save_live_config(
+        microscope: TemMicroscope,
+        context: SuperTEMContext,
+        name: str,
+        update_defaults: bool = True
+) -> None:
+    """
+    Saves the current microscope configuration and system limits to a new profile.
+
+    Args:
+        microscope: The active microscope instance.
+        context: The runtime context (for path resolution).
+        name: The name of the new profile (e.g. 'high-res-stem').
+        update_defaults: If True, updates the startup defaults (Beam/Projection)
+                         to match the microscope's current live state.
+    """
+    registry = RegistryManager(context)
+
+    # 1. Clone the active settings (preserves limits/safety)
+    new_settings = deepcopy(microscope._settings)
+
+    # 2. Update the "Default" fields with live values
+    if update_defaults:
+        sys = new_settings.system
+
+        # Capture Beam
+        try:
+            live_beam = microscope.get_beam_settings()
+            if live_beam:
+                sys.beam_system.default_beam = live_beam
+        except Exception as e:
+            print(f"Warning: Could not capture live beam: {e}")
+
+        # Capture Projection
+        try:
+            live_proj = microscope.get_projection_settings()
+            if live_proj:
+                sys.projection_system.default_projection = live_proj
+        except Exception as e:
+            print(f"Warning: Could not capture live projection: {e}")
+
+        # Capture Detectors
+        try:
+            for det_id in microscope.list_detectors():
+                live_det = microscope.get_detector_settings(det_id)
+                if live_det and sys.detector_system.defaults_by_id:
+                    sys.detector_system.defaults_by_id[det_id] = live_det
+        except Exception as e:
+            print(f"Warning: Could not capture live detectors: {e}")
+
+    # 3. Save to Disk
+    filename = f"{name}.yaml"
+    full_path = context.config_path / filename
+
+    # Use base.py's serialization to handle units
+    save_yaml(full_path, new_settings.to_dict())
+    print(f"Configuration saved to {full_path}")
+
+    # 4. Update the Index (Register the file)
+    index_data = registry._load_yaml(registry.microscope_index_path, default={})
+    if "configurations" not in index_data:
+        index_data["configurations"] = {}
+
+    index_data["configurations"][name] = {"path": filename}
+    registry._atomic_dump(registry.microscope_index_path, index_data)
+    print(f"Profile '{name}' registered in index.")
 
 # =============================================================================
 # Stage Position Management

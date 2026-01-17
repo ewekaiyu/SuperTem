@@ -135,11 +135,13 @@ class SuperTEMContext:
 # Constants & Defaults
 # =============================================================================
 
-METADATA_VERSION = "1.0.0"
+from supertem.structures.base import SCHEMA_VERSION
 __DEFAULT_MANUFACTURER__ = "JEOL"
 __DEFAULT_IP_ADDRESS__ = "192.168.0.1"
 
 DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
+    "version": SCHEMA_VERSION,
+
     "system": {
         "info": {
             "name": "default-configuration",
@@ -332,6 +334,11 @@ class RegistryManager:
         data = self._load_yaml(full_path, None)
         if data is None:
             return False
+
+        file_version = data.get("version", "0.0.0")
+        if file_version != SCHEMA_VERSION:
+            logging.warning(f"Config '{name}' version mismatch! File: v{file_version}, Code: v{SCHEMA_VERSION}")
+            # Future: self._migrate_config(data, file_version)
 
         try:
             # Ingest and validate

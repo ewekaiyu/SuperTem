@@ -483,10 +483,7 @@ import tifffile as tff
 # Versioning & Imports
 # =============================================================================
 
-try:
-    from supertem.config import METADATA_VERSION  # type: ignore
-except Exception:
-    METADATA_VERSION = "1"
+SCHEMA_VERSION = "1.0.0"
 
 from importlib.metadata import version, PackageNotFoundError
 
@@ -3146,7 +3143,7 @@ class MicroscopeImageMetadata:
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "MicroscopeImageMetadata")
-        self.version = p.str(self.version, "version", default=str(METADATA_VERSION))
+        self.version = p.str(self.version, "version", default=SCHEMA_VERSION)
         self.created_at = p.str(self.created_at, "created_at",
                                 default=datetime.datetime.now(datetime.timezone.utc).isoformat())
         self.magnification = p.float(self.magnification, "magnification")
