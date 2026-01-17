@@ -1205,6 +1205,33 @@ class Validator:
             heal=lambda: setattr(self.obj, name.split('.')[-1], reset_to)
         )
 
+    def check_has_intent(self, obj: Any, key_suffix: str, error_msg: str,
+                         ignore: Iterable[str] = ()) -> bool:
+        """
+        Validates that 'obj' has at least one non-None field (excluding internal/ignored fields)
+        OR has actionable extras.
+        """
+        if obj is None:
+            return self.check(False, key_suffix, error_msg)
+
+        has_intent = False
+
+        # 1. Check Standard Fields
+        # Always ignore internal framework fields
+        ignore_set = set(ignore) | {"extra", "_mode"}
+
+        if dataclasses.is_dataclass(obj):
+            for f in dataclasses.fields(obj):
+                if f.name not in ignore_set and getattr(obj, f.name) is not None:
+                    has_intent = True
+                    break
+
+        # 2. Check Extras (Vendor Extensions)
+        if not has_intent:
+            has_intent = _has_actionable_extras(getattr(obj, "extra", None))
+
+        return self.check(has_intent, key_suffix, error_msg)
+
 def _auto_to_dict(obj: Any, unit_map: Dict[str, str] = None, key_map: Dict[str, str] = None) -> Dict[str, Any]:
     """
     Automatically converts a dataclass to a dict using introspection and mapping rules.
@@ -3198,6 +3225,7 @@ class MicroscopeImage:
             clipped = np.clip(mean_val, 0.0, 255.0).astype(np.uint8)
             return np.full_like(a, clipped, dtype=np.uint8)
         scaled = (af - lo) * (255.0 / rng)
+        scaled = np.nan_to_num(scaled, nan=0.0, posinf=255.0, neginf=0.0)
         return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
 
     @classmethod
@@ -3640,25 +3668,10 @@ class DetectorControlRequest:
         v.check(bool(self.detector_id), "detector_id", "detector_id is required")
         v.check_nested(self.target)
 
-        # Logic Check: Ensure we are doing *something*
-        # 1. Check if settings has any non-None fields (Intent)
-        has_settings_intent = False
-        for f in dataclasses.fields(self.target):
-            # Ignore internal fields and the ID itself (which is just identity, not a change)
-            if f.name not in ["extra", "_mode", "detector_id"] and getattr(self.target, f.name) is not None:
-                has_settings_intent = True
-                break
-
-        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
-        if (not has_settings_intent) and _has_actionable_extras(self.target.extra):
-            has_settings_intent = True
-
-
-        # 2. Check if action is present
-        has_action = self.action is not None
-
-        v.check(has_settings_intent or has_action, "empty_intent",
-                "Request must have either settings to apply or an action to execute")
+        if not self.action:
+            v.check_has_intent(self.target, "empty_intent",
+                               "Request must have either settings to apply or an action to execute",
+                               ignore=["detector_id"])
 
         if self.action:
             valid_actions = {"INSERT", "RETRACT", "COOLDOWN", "WARMUP", "RESET"}
@@ -3698,20 +3711,7 @@ class BeamControlRequest:
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_nested(self.target)
-
-        # Check for empty intent
-        has_intent = False
-        for f in dataclasses.fields(self.target):
-            if f.name not in ["extra", "_mode"] and getattr(self.target, f.name) is not None:
-                has_intent = True
-                break
-
-        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
-        if (not has_intent) and _has_actionable_extras(self.target.extra):
-            has_intent = True
-
-
-        v.check(has_intent, "empty_target", "Beam request has no parameters set")
+        v.check_has_intent(self.target, "empty_target", "Beam request has no parameters set")
         return v.valid
 
     def to_dict(self) -> dict:
@@ -3745,20 +3745,7 @@ class ProjectionControlRequest:
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_nested(self.target)
-
-        # Check for empty intent
-        has_intent = False
-        for f in dataclasses.fields(self.target):
-            if f.name not in ["extra", "_mode"] and getattr(self.target, f.name) is not None:
-                has_intent = True
-                break
-
-        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
-        if (not has_intent) and _has_actionable_extras(self.target.extra):
-            has_intent = True
-
-
-        v.check(has_intent, "empty_target", "Projection request has no parameters set")
+        v.check_has_intent(self.target, "empty_target", "Projection request has no parameters set")
 
         # Specific Logic: If switching to DIFFRACTION, you must provide a camera length
         if self.target.optical_mode == "DIFFRACTION":
@@ -3809,6 +3796,8 @@ class ScanControlRequest:
         # 2. Settings required if Starting
         if self.action in {"START", "SINGLE_FRAME"}:
             v.check_nested(self.target)
+            v.check_has_intent(self.target, "target.empty",
+                               "Scan START requires explicit settings.")
 
         return v.valid
 
@@ -3848,16 +3837,8 @@ class VacuumControlRequest:
         v = Validator(self, mode)
         v.check_nested(self.target)
 
-        # Ensure at least one valve/pump state is being requested
-        has_intent = (self.target.column_valve_state is not None or
-                      self.target.gun_valve_state is not None or
-                      self.target.turbo_pump_state is not None)
-
-        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
-        has_intent = has_intent or _has_actionable_extras(getattr(self.target, 'extra', None))
-        has_intent = has_intent or _has_actionable_extras(getattr(self, 'extra', None))
-
-        v.check(has_intent, "empty_target", "Request must specify at least one state change")
+        v.check_has_intent(self.target, "empty_target",
+                           "Request must specify at least one state change")
         return v.valid
 
     def to_dict(self) -> dict:
@@ -3979,6 +3960,10 @@ class AcquisitionRequest:
             v.check(False, "id_mismatch",
                     f"Ambiguous IDs: outer={self.detector_id}, inner={self.detector.detector_id}",
                     heal=lambda: setattr(self.detector, 'detector_id', self.detector_id))
+
+        v.check_has_intent(self.detector, "detector.empty",
+                           "Acquisition requires explicit detector settings.",
+                           ignore=["detector_id"])
         return v.valid
 
     def to_dict(self) -> dict:
