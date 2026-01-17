@@ -335,24 +335,39 @@ command to change the microscope's state.
       Requests are transient. They are created, validated, executed by the
       Manager/Driver, and then discarded. They are rarely stored long-term.
 
-3. Command vs Patch Requests
+3. Command, Patch, and Hybrid Requests
 -------------------------------------------------------------------------------
-This module defines two high-level request shapes:
+This module defines three high-level request shapes based on how "Intent" is
+structured and validated:
 
-1) Command Requests (action-driven)
-   - Examples: StageControlRequest, ScanControlRequest
-   - Intent is carried by an explicit `action` enum (e.g. STOP, HOME, START, ABORT).
-   - Validation MUST require `action` to be present. `extra` may provide optional parameters,
-     but it MUST NOT be used as a substitute for `action` (avoids ambiguous vendor-only commands).
+1) Command Requests (Action-Driven)
+   - Examples: StageControlRequest
+   - Intent is carried solely by an explicit `action` enum (e.g. STOP, HOME).
+   - Validation MUST require `action` to be present. The `target` payload is
+     usually not required (or logically ignored) for these operations.
 
-2) Patch Requests (diff-driven)
-   - Examples: BeamControlRequest, ProjectionControlRequest, DetectorControlRequest,
-               VacuumControlRequest, ApertureControlRequest, StageMoveRequest
-   - Intent is carried by providing at least one non-None field in the payload (a "patch").
-   - The "empty patch" guard MUST treat vendor extras as intent:
-       payload.extra.vendor[...] (and/or payload.extra.unknown[...]) counts as a non-empty patch.
-     This ensures vendor-specific updates (e.g. JEOL-only keys) are not rejected as "empty".
+2) Patch Requests (Diff-Driven)
+   - Examples: BeamControlRequest, ProjectionControlRequest, VacuumControlRequest,
+               ApertureControlRequest, StageMoveRequest
+   - Intent is carried by providing at least one non-None field in the `target`
+     payload (a "patch").
+   - The "empty patch" guard ensures that vendor extras in the payload count
+     as valid intent (avoids rejecting vendor-specific updates as empty).
 
+3) Hybrid Requests (Context-Dependent)
+   - Examples: DetectorControlRequest, ScanControlRequest
+   - The validation logic shifts based on the specific operation mode:
+     A. Action-Only (Command-like):
+        Example: Detector "INSERT", Scan "STOP".
+        Intent is carried by the `action`; `target` settings are optional/ignored.
+     B. Payload-Only (Patch-like):
+        Example: Detector "Set Exposure" (action=None, target=Settings(...)).
+        Intent is carried by the `target` payload settings.
+     C. Composite (Action + Payload):
+        Example: Scan "START".
+        Requires both an `action` (to trigger the engine) AND a `target` (to
+        define parameters like dwell time). Validation enforces the presence
+        of the payload when the specific action demands it.
 
 4. How to Write a New Request
 -------------------------------------------------------------------------------
