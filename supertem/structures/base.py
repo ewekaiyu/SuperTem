@@ -1395,15 +1395,15 @@ class Point:
 
     Role:     Structure
     Context:  Both (Data-plane / Control-plane)
-    Category: A (Config)
+    Category: C / D (Measured State / Intent)
 
     Attributes:
         x (Optional[float]): X coordinate.
-            None Behavior: Defaulted to 0.0.
+            None Behavior: Preserved as None (Intent/Unknown).
         y (Optional[float]): Y coordinate.
-            None Behavior: Defaulted to 0.0.
+            None Behavior: Preserved as None (Intent/Unknown).
         z (Optional[float]): Z coordinate.
-            None Behavior: Defaulted to 0.0.
+            None Behavior: Preserved as None (Intent/Unknown).
         name (Optional[str]): Label for this point.
             None Behavior: Preserved as None.
     """
@@ -1416,16 +1416,22 @@ class Point:
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, "Point")
-        # Category A: Apply Defaults (0.0) safely
-        self.x = p.float(self.x, "x", default=0.0)
-        self.y = p.float(self.y, "y", default=0.0)
-        self.z = p.float(self.z, "z", default=0.0)
+        # Category C/D: Preserve None (Intent/State pattern)
+        # We REMOVED default=0.0 to prevent accidental zeroing of axes
+        self.x = p.float(self.x, "x", default=None)
+        self.y = p.float(self.y, "y", default=None)
+        self.z = p.float(self.z, "z", default=None)
         self.name = p.str(self.name, "name")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        for axis in ["x", "y", "z"]:
-            v.check_finite(getattr(self, axis), f"coordinates.{axis}", reset_to=0.0)
+        # Only validate finite-ness if a value is actually present
+        if self.x is not None:
+            v.check_finite(self.x, "coordinates.x", reset_to=0.0)
+        if self.y is not None:
+            v.check_finite(self.y, "coordinates.y", reset_to=0.0)
+        if self.z is not None:
+            v.check_finite(self.z, "coordinates.z", reset_to=0.0)
         return v.valid
 
     def to_dict(self) -> dict:
@@ -1434,7 +1440,13 @@ class Point:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Point":
         if isinstance(d, (list, tuple)) and len(d) in (2, 3):
-            return Point(x=d[0], y=d[1], z=d[2] if len(d) == 3 else 0.0, _mode=as_parse_mode(mode))
+            # Map list input to x, y, (z)
+            return Point(
+                x=d[0],
+                y=d[1],
+                z=d[2] if len(d) == 3 else None,
+                _mode=as_parse_mode(mode)
+            )
         return _auto_from_dict(Point, d, mode)
 
 @dataclass
