@@ -167,3 +167,71 @@ def test_session_directory_structure(mock_context, mock_hardware_stack):
 
     # Check that settings pointed to the data path
     assert str(mock_context.base_path) in str(settings.image.path)
+
+
+def test_setup_session_demo_driver_fallback(mock_context):
+    """Requesting manufacturer='DEMO' should load the DemoMicroscope and set manufacturer."""
+    with patch("supertem.microscopes.demo_microscope.DemoMicroscope") as MockDemoClass:
+        scope, settings = setup_session(
+            context=mock_context,
+            manufacturer="DEMO",
+            setup_logging=False,
+        )
+
+    MockDemoClass.assert_called_once()
+    assert settings.system.info.manufacturer == "DEMO"
+
+
+def test_setup_session_creates_log_file_when_enabled(mock_context):
+    """When setup_logging=True, setup_session should create a .log file in the session folder."""
+    with patch("supertem.microscopes.demo_microscope.DemoMicroscope"):
+        _, settings = setup_session(
+            context=mock_context,
+            manufacturer="DEMO",
+            setup_logging=True,
+        )
+
+    session_dir = Path(settings.image.path).parent
+    assert any(session_dir.glob("*.log"))
+
+
+def test_setup_session_ip_address_override_is_applied(mock_context):
+    """If ip_address is provided, it should be written into settings.system.info.ip_address."""
+    with patch("supertem.microscopes.demo_microscope.DemoMicroscope"):
+        _, settings = setup_session(
+            context=mock_context,
+            manufacturer="DEMO",
+            ip_address="127.0.0.1",
+            setup_logging=False,
+        )
+
+    assert settings.system.info.ip_address == "127.0.0.1"
+
+
+def test_setup_session_strict_validation_failure(mock_context, mock_registry):
+    """Invalid config types should cause strict parsing/validation to raise."""
+    config_path = mock_registry.default_microscope_config_path
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    # Inject an invalid type where a numeric is expected.
+    data["system"]["beam_system"]["voltage_limits_kv"] = ["NOT_A_NUMBER", "INVALID"]
+    config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    with patch("supertem.microscopes.jeol_microscope.JeolMicroscope"):
+        with pytest.raises(Exception):
+            setup_session(context=mock_context, manufacturer="JEOL", setup_logging=False)
+
+
+def test_setup_session_instantiates_jeol_driver(mock_context):
+    """setup_session should instantiate JeolMicroscope and call connect() exactly once."""
+    with patch("supertem.microscopes.jeol_microscope.JeolMicroscope") as MockJeolClass:
+        mock_instance = MockJeolClass.return_value
+
+        setup_session(
+            context=mock_context,
+            manufacturer="JEOL",
+            setup_logging=False,
+        )
+
+    MockJeolClass.assert_called_once()
+    mock_instance.connect.assert_called_once()

@@ -300,3 +300,133 @@ def test_pack_vendor_extras_none():
     """Ensure empty input returns None (cleaner object graph)."""
     assert jeol_adapter._pack_vendor_extras({}) is None
     assert jeol_adapter._pack_vendor_extras(None) is None
+
+
+# =============================================================================
+# 7. Coverage pins for helper branches & error handling
+# =============================================================================
+
+
+def test_roi_helpers_non_dict_and_none_roundtrip():
+    """Hit defensive branches: non-dict ROI input and None ROI output."""
+    assert jeol_adapter._jeol_roi_to_struct([1, 2, 3]) is None
+    assert jeol_adapter._struct_to_jeol_roi(None) is None
+
+
+def test_binning_helper_non_dict_returns_none():
+    assert jeol_adapter._jeol_bin_to_tuple("not a dict") is None
+
+
+@pytest.mark.parametrize(
+    "val, expected",
+    [
+        ({"Width": 10, "Height": 20}, (10, 20)),
+        ("1, bad", None),  # triggers ValueError in the string parser
+        ("123", (123, 123)),  # fallback single integer path
+        (None, None),
+    ],
+)
+def test_parse_jeol_roi_limit_variants(val, expected):
+    assert jeol_adapter._parse_jeol_roi_limit(val) == expected
+
+
+def test_detector_response_parsing_error_branches_and_limits():
+    """Exercise optional parsing branches that tolerate bad vendor payloads."""
+    payload = {
+        # FrameRate numeric -> direct float path
+        "FrameRate": 12.0,
+        # DigitalRotation -> maps to quantity
+        "DigitalRotation": 33,
+        # Limits present but malformed -> exception-tolerant blocks
+        "ExposureTimeMin": "not-a-number",
+        "ExposureTimeMax": "also-not-a-number",
+        "DigitalRotationMinimum": 1,
+        "DigitalRotationMaximum": 2,
+        "frameIntegrationMinimum": 1,
+        # Imaging area minimum as dict -> ROI size min
+        "ImagingAreaMinimum": {"Width": 16, "Height": 8},
+        # ROI provided in lower-case keys (exercise casing fallback)
+        "ImagingArea": {"x": 1, "y": 2, "width": 3, "height": 4},
+        # binningSize absent -> keep None
+        # FrameRate string that fails float conversion -> handled
+        "frameRate": "oops fps",
+    }
+
+    settings, caps = jeol_adapter.from_jeol_detector_response(payload, detector_id="D")
+
+    assert settings.roi is not None
+    assert settings.roi.x == 1
+    assert settings.roi.y == 2
+    assert settings.roi.width == 3
+    assert settings.roi.height == 4
+    assert settings.frame_rate.to(Units.HZ).magnitude == 12.0
+    assert settings.digital_rotation.to(Units.DEG).magnitude == 33.0
+
+    # Rotation and frame integration limits
+    assert caps.digital_rotation_min.to(Units.DEG).magnitude == 1.0
+    assert caps.digital_rotation_max.to(Units.DEG).magnitude == 2.0
+    assert caps.frame_integration_min == 1
+    assert caps.roi_size_min == (16, 8)
+
+
+def test_detector_frame_rate_string_parse_failure_is_ignored():
+    """Hit the exception-tolerant frame-rate parsing branch."""
+    payload = {
+        "frameRate": "oops fps",
+        "exposureTime": 1,
+    }
+    settings, _ = jeol_adapter.from_jeol_detector_response(payload, detector_id="D")
+    assert settings.frame_rate is None
+
+
+def test_from_jeol_beam_stats_includes_shift_point_when_dac_present():
+    s = jeol_adapter.from_jeol_beam_stats(
+        voltage_val=200000,
+        current_ua=10,
+        spot_size_idx=1,
+        alpha_idx=2,
+        beam_shift_dac=(123, -456),
+        raw_flags=None,
+    )
+    assert s.beam_shift is not None
+    assert s.beam_shift.x == pytest.approx(123.0)
+    assert s.beam_shift.y == pytest.approx(-456.0)
+
+
+def test_from_jeol_beam_stats_merges_raw_flags_into_extras():
+    s = jeol_adapter.from_jeol_beam_stats(
+        voltage_val=200000,
+        current_ua=10,
+        spot_size_idx=1,
+        alpha_idx=2,
+        beam_shift_dac=None,
+        raw_flags={"X": 1},
+    )
+    assert s.extra is not None
+    assert s.extra.vendor["JEOL"]["X"] == 1
+
+
+def test_to_jeol_detector_config_includes_optional_fields():
+    """Cover serialization of non-core detector fields."""
+    s = DetectorSettings(
+        detector_id="D",
+        exposure=Q_(10, Units.MS),
+        roi=ROI(x=0, y=0, width=64, height=32),
+        binning_index=1,
+        frame_integration=7,
+        gain_index=2,
+        offset_index=3,
+        digital_rotation=Q_(45, Units.DEG),
+        _mode=ParseMode.STRICT,
+    )
+    out = jeol_adapter.to_jeol_detector_config(s)
+    assert out["frameIntegration"] == 7
+    assert out["GainIndex"] == 2
+    assert out["OffsetIndex"] == 3
+    assert out["DigitalRotation"] == 45.0
+
+
+def test_from_jeol_stage_position_applies_extra_flags():
+    pos = jeol_adapter.from_jeol_stage_position([1, 2, 3, 4, 5], extra_flags={"LIMIT": 1})
+    assert pos.extra is not None
+    assert pos.extra.vendor["JEOL"]["LIMIT"] == 1

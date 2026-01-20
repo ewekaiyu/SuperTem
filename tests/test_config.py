@@ -300,3 +300,127 @@ def test_protocol_registry_resolution(mock_registry):
     # 4. Assert switch
     assert mock_registry.active_protocol_name == new_proto_name
     assert mock_registry.get_active_protocol_path().name == new_proto_file
+
+
+def test_set_default_config_raises_on_unknown_name(mock_registry):
+    """Test that attempting to switch to a non-existent profile raises ValueError."""
+    with pytest.raises(ValueError) as excinfo:
+        mock_registry.set_default_microscope_config("ghost-microscope")
+
+    assert "Unknown config: ghost-microscope" in str(excinfo.value)
+
+
+def test_set_default_config_aborts_switch_on_validation_failure(mock_registry):
+    """
+    Critical Safety Test:
+    Ensure active_config_name does NOT change if the target profile is invalid.
+    """
+    # 1. Setup: Start at default
+    assert mock_registry.active_config_name == "default-configuration"
+
+    # 2. Create a broken config file
+    bad_name = "hazardous-scope"
+    bad_file = mock_registry.context.config_path / "hazardous.yaml"
+    bad_file.write_text("broken: [yaml", encoding="utf-8")  # Invalid YAML syntax
+
+    # 3. Register it manually
+    mock_registry.microscope_index[bad_name] = {"path": "hazardous.yaml"}
+
+    # 4. Attempt switch (Should fail silently or log error, but NOT switch)
+    # Note: The method currently assumes success if validation passes, but
+    # simply does nothing if validation fails. We verify state retention.
+    mock_registry.set_default_microscope_config(bad_name)
+
+    # 5. Assert we are still on the safe default
+    assert mock_registry.active_config_name == "default-configuration"
+    assert mock_registry.active_config_name != bad_name
+
+def test_validate_profile_handles_missing_file(mock_registry):
+    """
+    Test logic:
+    path_str = self.microscope_index.get(name)...
+    if not full_path.exists(): return False
+    """
+    # 1. Register a file that does not exist
+    ghost_name = "ghost-scope"
+    mock_registry.microscope_index[ghost_name] = {"path": "does_not_exist.yaml"}
+
+    # 2. Validate
+    is_valid = mock_registry.validate_profile(ghost_name)
+
+    # 3. Assert it returns False (handled gracefully) rather than crashing
+    assert is_valid is False
+
+
+import logging
+from supertem.structures.base import SCHEMA_VERSION
+
+
+def test_validate_profile_warns_on_version_mismatch(mock_registry, caplog):
+    """
+    Test logic:
+    if file_version != SCHEMA_VERSION: logging.warning(...)
+    """
+    old_name = "legacy-scope"
+    old_file = mock_registry.context.config_path / "legacy.yaml"
+
+    # Create valid config but with old version string
+    from supertem.config import DEFAULT_MICROSCOPE_CONFIGURATION_YAML
+    data = DEFAULT_MICROSCOPE_CONFIGURATION_YAML.copy()
+    data["version"] = "0.0.1"  # Deliberately old
+
+    old_file.write_text(yaml.safe_dump(data), encoding="utf-8")
+    mock_registry.microscope_index[old_name] = {"path": "legacy.yaml"}
+
+    # Validate
+    with caplog.at_level(logging.WARNING):
+        is_valid = mock_registry.validate_profile(old_name)
+
+    # Assert
+    assert is_valid is True  # It is valid...
+    # ...but it warned us
+    assert "version mismatch" in caplog.text
+    assert f"Code: v{SCHEMA_VERSION}" in caplog.text
+
+
+def test_production_context_structure():
+    """Ensure Production context defines the exact expected sub-paths."""
+    ctx = SuperTEMContext.production()
+
+    # Verify strict path ending structure
+    assert ctx.config_path.parts[-2:] == ("supertem", "config")
+    assert ctx.db_path.name == "supertem.db"
+
+    # FIX: config.py defines this as .../log/data/ml, so checking the last 3 parts
+    # must include 'log'.
+    assert ctx.data_ml_path.parts[-3:] == ("log", "data", "ml")
+
+
+def test_validate_profile_handles_non_yaml_garbage(mock_registry):
+    """
+    Test that a file existing but containing garbage text is handled gracefully.
+    Hits the `if data is None: return False` branch in validate_profile.
+    """
+    garbage_name = "garbage-scope"
+    garbage_file = mock_registry.context.config_path / "garbage.yaml"
+
+    # Write pure text that isn't valid YAML
+    garbage_file.write_text("::: this is not yaml :::", encoding="utf-8")
+
+    # Register it
+    mock_registry.microscope_index[garbage_name] = {"path": "garbage.yaml"}
+
+    # Validate (Should return False, not crash)
+    assert mock_registry.validate_profile(garbage_name) is False
+
+
+def test_validate_profile_handles_missing_path_key(mock_registry):
+    """
+    Test an index entry that is missing the 'path' key entirely.
+    Hits the `if not path_str: return False` branch.
+    """
+    # Register a malformed entry (no 'path')
+    mock_registry.microscope_index["incomplete-entry"] = {"description": "Missing path"}
+
+    # Validate
+    assert mock_registry.validate_profile("incomplete-entry") is False

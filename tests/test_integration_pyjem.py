@@ -26,6 +26,12 @@ from supertem.structures.base import (
     StageMoveRequest,
     AcquisitionRequest,
     DetectorSettings,
+    BeamControlRequest,
+    BeamSettings,
+    ProjectionControlRequest,
+    ProjectionSettings,
+    ScanControlRequest,
+    ScanSettings,
     Q_
 )
 
@@ -35,153 +41,244 @@ pytestmark = pytest.mark.skipif(not PYJEM_AVAILABLE, reason="PyJEM library not f
 @pytest.fixture
 def offline_hardware_stack():
     """
-    Injects PyJEM.offline modules and patches specific methods to ensure stability.
+    Injects PyJEM.offline modules and patches specific methods to ensure stateful stability.
+    This creates a 'Virtual Microscope' that remembers what you set.
     """
-    # 1. Instantiate Stage (Stateful Wrapper)
-    # OfflineTEM3 is a module, so we instantiate the class inside it
+    # --- 1. Stage Mock (Stateful) ---
     stage = OfflineTEM3.Stage3()
-    state = {"x": 0.0, "y": 0.0}
+    stage_state = {"x": 0.0, "y": 0.0, "z": 0.0}
+    stage.SetX = MagicMock(side_effect=lambda v: stage_state.update({"x": float(v)}))
+    stage.SetY = MagicMock(side_effect=lambda v: stage_state.update({"y": float(v)}))
+    stage.SetZ = MagicMock(side_effect=lambda v: stage_state.update({"z": float(v)}))
+    stage.GetPos = MagicMock(side_effect=lambda: [stage_state["x"], stage_state["y"], stage_state["z"], 0.0, 0.0])
+    stage.GetStatus = MagicMock(return_value=[0, 0, 0, 0, 0])
 
-    def set_x(v): state["x"] = float(v)
-    def set_y(v): state["y"] = float(v)
-    def get_pos(): return [state["x"], state["y"], 0.0, 0.0, 0.0]
-    def get_status(): return [0, 0, 0, 0, 0]
+    # --- 2. Beam/HT Mock (Stateful) ---
+    ht = OfflineTEM3.HT3()
+    beam_state = {"voltage": 200000.0} # Volts
+    ht.SetHtValue = MagicMock(side_effect=lambda v: beam_state.update({"voltage": float(v)}))
+    ht.GetHtValue = MagicMock(side_effect=lambda: beam_state["voltage"])
 
-    stage.SetX = MagicMock(side_effect=set_x)
-    stage.SetY = MagicMock(side_effect=set_y)
-    stage.GetPos = MagicMock(side_effect=get_pos)
-    stage.GetStatus = MagicMock(side_effect=get_status)
+    # --- 3. EOS/Lens Mock (Stateful) ---
+    eos = OfflineTEM3.EOS3()
+    eos_state = {"spot": 1, "alpha": 3, "mode": 0} # 0=TEM
+    eos.SelectSpotSize = MagicMock(side_effect=lambda v: eos_state.update({"spot": int(v)}))
+    eos.GetSpotSize = MagicMock(side_effect=lambda: eos_state["spot"])
+    eos.SetAlphaSelector = MagicMock(side_effect=lambda v: eos_state.update({"alpha": int(v)}))
+    eos.GetAlpha = MagicMock(side_effect=lambda: eos_state["alpha"])
+    # Mode logic
+    eos.SelectTemStem = MagicMock(side_effect=lambda v: eos_state.update({"mode": int(v)}))
+    eos.GetTemStemMode = MagicMock(side_effect=lambda: eos_state["mode"])
+    # Mag logic (Simple passthrough for integration test)
+    eos.SetSelector = MagicMock()
+    eos.GetMagValue = MagicMock(return_value=[50000.0, "X", "x50k"])
 
-    # 2. Instantiate Detector (Synthetic Image Wrapper)
+    # --- 4. Scan Mock ---
+    scan = OfflineTEM3.Scan3()
+    scan.SetRotationAngleEx = MagicMock() # Capture calls
+
+    # --- 5. Detector Mock ---
     real_detector_class = OfflineDetector.Detector
-
     class StableOfflineDetector(real_detector_class):
         def snapshot_rawdata(self):
-            # Return a 512x512 uint16 noise array as raw bytes
-            arr = np.random.randint(0, 1000, (512, 512), dtype=np.uint16)
-            return arr.tobytes()
-
+            return np.random.randint(0, 1000, (512, 512), dtype=np.uint16).tobytes()
         def get_image_cache(self):
             return self.snapshot_rawdata()
+        def get_detectorsetting(self):
+            # Return plausible JEOL dict
+            return {"BinningIndex": 1, "ExposureTimeValue": 100, "ImagingArea": {"Width": 512, "Height": 512}}
 
-    # Inject into the driver
+    # Inject into the driver via Patch
     with patch("supertem.microscopes.jeol_microscope.TEM3") as m_tem_module, \
          patch("supertem.microscopes.jeol_microscope.detector") as m_det_mod:
 
         m_tem_module.Stage3.return_value = stage
+        m_tem_module.HT3.return_value = ht
+        m_tem_module.EOS3.return_value = eos
+        m_tem_module.Scan3.return_value = scan
 
-        # Pass through other modules
-        m_tem_module.EOS3.side_effect = OfflineTEM3.EOS3
-        m_tem_module.HT3.side_effect = OfflineTEM3.HT3
+        # Pass through others as default offline
         m_tem_module.Def3.side_effect = OfflineTEM3.Def3
-        m_tem_module.Apt3.side_effect = OfflineTEM3.Apt3
         m_tem_module.Lens3.side_effect = OfflineTEM3.Lens3
-        m_tem_module.Scan3.side_effect = OfflineTEM3.Scan3
+        m_tem_module.Apt3.side_effect = OfflineTEM3.Apt3
         m_tem_module.VACUUM3.side_effect = OfflineTEM3.VACUUM3
         m_tem_module.FEG3.side_effect = OfflineTEM3.FEG3
         m_tem_module.GUN3.side_effect = OfflineTEM3.GUN3
 
-        # Use our Safe Detector Class
+        # Detector Injection
         m_det_mod.Detector.side_effect = StableOfflineDetector
-        m_det_mod.function = OfflineDetector.function
-
-        # Force detector discovery
         if hasattr(OfflineDetector, "get_attached_detector"):
              m_det_mod.get_attached_detector = MagicMock(return_value=["OfflineCam"])
-             if hasattr(m_det_mod.function, "get_attached_detector"):
-                 m_det_mod.function.get_attached_detector = MagicMock(return_value=["OfflineCam"])
 
-        yield
+        yield {
+            "stage": stage,
+            "ht": ht,
+            "eos": eos,
+            "scan": scan
+        }
 
-def test_pyjem_offline_workflow(mock_context, offline_hardware_stack):
-    """
-    Runs the full workflow using PyJEM.offline classes.
-    """
-    # 1. SETUP
+def setup_mock_session(context):
+    """Helper to bootstrap the session with a basic config."""
     config_data = {
         "system": {
             "stage_system": {
-                "max_step_nm": 50000.0,
+                "max_step_nm": 1000000.0,
                 "enabled": True,
-                "can_x": True, "can_y": True,
+                "can_x": True,
+                "can_y": True,
                 "x_limits": ["-2 mm", "2 mm"],
                 "y_limits": ["-2 mm", "2 mm"]
             },
-            "beam_system": {"voltage_limits_kv": [80, 300]}
+            "beam_system": {
+                "voltage_limits_kv": [60, 300],
+                "spot_size_limits": [1, 5]
+            }
         },
-        "image": {
-            "file_format": "tiff",
-            "path": "images/session_{date}"
-        },
-        "defocus_scale": 1.0
+        "image": {"file_format": "tiff", "path": "images/"}
     }
+    context.config_path.mkdir(parents=True, exist_ok=True)
+    (context.config_path / "microscope.yaml").write_text(yaml.safe_dump(config_data), encoding="utf-8")
 
-    mock_context.config_path.mkdir(parents=True, exist_ok=True)
-    (mock_context.config_path / "microscope.yaml").write_text(yaml.safe_dump(config_data), encoding="utf-8")
-
-    # 2. INITIALIZE
-    scope, settings = setup_session(
-        context=mock_context,
+    return setup_session(
+        context=context,
         manufacturer="JEOL",
-        config_path=mock_context.config_path / "microscope.yaml",
+        config_path=context.config_path / "microscope.yaml",
         setup_logging=True
     )
 
-    assert scope.is_connected()
+# =============================================================================
+# TESTS
+# =============================================================================
 
-    # 3. EXECUTE
+def test_pyjem_offline_workflow_basic(mock_context, offline_hardware_stack):
+    """
+    Original test: Moves stage and captures image.
+    """
+    scope, settings = setup_mock_session(mock_context)
 
-    # A. Move Stage
+    # Move
     target = StagePosition(x=Q_(1.5, "um"), y=Q_(0.5, "um"))
-    move_req = StageMoveRequest(target=target, wait_for_settle=True)
-    scope.execute_stage_move(move_req)
+    scope.execute_stage_move(StageMoveRequest(target=target))
 
-    # Verify State
-    final_pos = scope.get_stage_position()
-    assert final_pos.x.to("nm").magnitude == pytest.approx(1500.0)
+    # Verify via Mock
+    assert offline_hardware_stack["stage"].SetX.called
+    assert scope.get_stage_position().x.to("nm").magnitude == pytest.approx(1500.0)
 
-    # B. Acquire Image
-    acq_req = AcquisitionRequest(
-        detector=DetectorSettings(exposure=Q_(0.1, "s"))
+def test_beam_control_stateful(mock_context, offline_hardware_stack):
+    """
+    Tests Beam Control logic: Voltage, Spot Size, and Vendor Extras (Alpha).
+    """
+    scope, settings = setup_mock_session(mock_context)
+
+    # 1. Change Voltage (Standard Physics)
+    # Request: 200kV -> 80kV
+    req = BeamControlRequest(target=BeamSettings(voltage=Q_(80, "kV")))
+    scope.execute_beam_control(req)
+
+    # Verify Hardware call
+    offline_hardware_stack["ht"].SetHtValue.assert_called_with(80000.0)
+    # Verify Stateful Readback
+    assert scope.get_acceleration_voltage().magnitude == 80.0
+
+    # 2. Change Vendor Specific (Alpha Index) via Extras
+    # Note: Base BeamSettings doesn't have 'alpha_index', so we pass it in extras
+    req_vendor = BeamControlRequest(
+        target=BeamSettings(
+            spot_size=3,
+            extra={"vendor": {"JEOL": {"alpha_index": 5}}}
+        )
     )
-    image_obj = scope.acquire_image(acq_req)
+    scope.execute_beam_control(req_vendor)
 
-    # C. Save
-    out_dir = Path(settings.image.path)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "pyjem_offline_test.tif"
+    # Verify
+    offline_hardware_stack["eos"].SelectSpotSize.assert_called_with(3)
+    offline_hardware_stack["eos"].SetAlphaSelector.assert_called_with(5)
 
-    image_obj.save(out_path)
+    # Readback
+    assert scope.get_spot_size() == 3
+    assert scope.get_alpha_index() == 5
 
-    assert out_path.exists()
+def test_stem_mode_switch_and_scan(mock_context, offline_hardware_stack):
+    """
+    Tests switching optical modes (TEM->STEM) and configuring Scan parameters.
+    """
+    scope, settings = setup_mock_session(mock_context)
 
-    # 4. VERIFY METADATA
+    # 1. Switch to STEM
+    # In JEOL driver, Projection Mode "STEM:..." triggers mode switch
+    scope.set_projection_mode("STEM:MAG")
+
+    # Verify hardware call (1 = STEM in PyJEM)
+    offline_hardware_stack["eos"].SelectTemStem.assert_called_with(1)
+    assert scope.get_mode() == "STEM"
+
+    # 2. Configure Scan Rotation
+    scan_req = ScanControlRequest(
+        action="START",
+        target=ScanSettings(scan_rotation=Q_(45.0, "deg"))
+    )
+    scope.execute_scan_control(scan_req)
+
+    # Verify hardware call
+    offline_hardware_stack["scan"].SetRotationAngleEx.assert_called_with(45.0)
+
+def test_safety_guardrails(mock_context, offline_hardware_stack):
+    """
+    Tests that the Orchestrator layer prevents unsafe moves BEFORE they reach PyJEM.
+    """
+    scope, settings = setup_mock_session(mock_context)
+
+    # 1. Stage Safety (System Config Limit is +/- 2mm)
+    unsafe_pos = StagePosition(x=Q_(5, "mm")) # 5mm > 2mm limit
+
+    with pytest.raises(RuntimeError) as excinfo:
+        scope.execute_stage_move(StageMoveRequest(target=unsafe_pos))
+
+    assert "outside limits" in str(excinfo.value)
+    # Ensure hardware was NOT called
+    offline_hardware_stack["stage"].SetX.assert_not_called()
+
+    # 2. Vendor Specific Safety (Driver Level)
+    # JEOL Alpha selector valid range is 0-8. Try setting 9.
+    unsafe_beam = BeamControlRequest(
+        target=BeamSettings(
+            extra={"vendor": {"JEOL": {"alpha_index": 9}}}
+        )
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        scope.execute_beam_control(unsafe_beam)
+
+    assert "out of bounds" in str(excinfo.value)
+    assert "no parameters set" not in str(excinfo.value)
+
+def test_metadata_fidelity(mock_context, offline_hardware_stack):
+    """
+    Ensures that a captured image contains the full state of the microscope
+    in its metadata (Voltage, Stage, Mag).
+    """
+    scope, settings = setup_mock_session(mock_context)
+
+    # Setup State
+    scope.set_acceleration_voltage(Q_(200, "kV"))
+    scope.move_stage_absolute(StagePosition(x=Q_(10, "um")))
+    
+    # Acquire
+    img = scope.acquire_image(AcquisitionRequest(detector_id="OfflineCam"))
+
+    # Assertions on Image Object
+    assert img.metadata is not None
+    assert img.metadata.accelerating_voltage_kv == 200.0
+    
+    # Check deeply nested state
+    saved_stage = img.metadata.microscope_state.stage_position
+    assert saved_stage.x.to("um").magnitude == pytest.approx(10.0)
+
+    # Save and Check File
+    out_path = Path(settings.image.path) / "metadata_test.tif"
+    img.save(out_path)
+    
     with tifffile.TiffFile(out_path) as tf:
-        # 1. Check Data Presence
-        assert tf.asarray().size > 0
-
-        # 2. Check Metadata Extraction
-        # Strategy: Look in TIFF tags first (Standard), then Sidecar (Legacy)
-        meta_dict = {}
-
-        # Try TIFF Tags
-        try:
-            page = tf.pages[0]
-            if "ImageDescription" in page.tags:
-                desc_str = page.tags["ImageDescription"].value
-                meta_dict = json.loads(desc_str)
-        except Exception:
-            pass
-
-        # Try Sidecar if Tags failed
-        if not meta_dict:
-            sidecar = out_path.parent / (out_path.stem + ".json")
-            if sidecar.exists():
-                meta_dict = json.loads(sidecar.read_text())
-
-        # ASSERTIONS
-        # We must find the stage position we moved to (1500nm)
-        assert meta_dict, "No metadata found in TIFF Header or Sidecar JSON"
-
-        x_val = meta_dict.get("microscope_state", {}).get("stage_position", {}).get("x_nm")
-        assert x_val == pytest.approx(1500.0), f"Metadata missing updated stage position. Found: {x_val}"
+        desc = tf.pages[0].tags["ImageDescription"].value
+        meta_json = json.loads(desc)
+        assert meta_json["accelerating_voltage_kv"] == 200.0
