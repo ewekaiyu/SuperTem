@@ -333,25 +333,21 @@ class JeolMicroscope(TemMicroscope):
 
     def _refresh_detectors(self) -> None:
         """
-        Scan for attached detectors and cache their instances.
-
-        This prevents creating new PyJEM objects (and opening new sockets)
-        for every single image acquisition.
+        Scan for attached detectors, cache their instances, and update
+        SystemSettings.detector_system with their hardware capabilities.
         """
+        # 1. Reset Internal State
         self._active_detectors = {}
         self._primary_detector_id = None
-        # Default scan configuration
         self._scan_cfg = {
-            'pixel_dwell_us': 10.0,
-            'flyback_us': 0.0,
-            'width_px': 512,
-            'height_px': 512,
+            'pixel_dwell_us': 10.0, 'flyback_us': 0.0,
+            'width_px': 512, 'height_px': 512,
         }
 
         if detector is None:
             return
 
-        # Handle PyJEM version differences in module structure
+        # 2. PyJEM Discovery Logic
         fn_mod = getattr(detector, "function", None)
         if fn_mod is None:
             fn_mod = detector
@@ -362,19 +358,58 @@ class JeolMicroscope(TemMicroscope):
 
         try:
             ids = list(getter())
-            logger.debug(f"[DET] Discovered detectors: {ids}")
-        except Exception as e:
-            logger.debug(f"[DET] Failed to list attached detectors: {e}")
+            logger.info(f"[DET] Discovered detectors: {ids}")
+        except Exception:
             return
+
+        # 3. Load Capabilities
+        caps_map: Dict[str, DetectorCapabilities] = {}
 
         for det_id in ids:
             try:
-                self._active_detectors[det_id] = detector.Detector(det_id)
+                # Create and Cache
+                d_obj = detector.Detector(det_id)
+                self._active_detectors[det_id] = d_obj
+
+                # Extract Capabilities (Min/Max settings)
+                try:
+                    raw = d_obj.get_detectorsetting()
+                    _, caps = jeol_adapter.from_jeol_detector_response(raw, det_id)
+                    if caps:
+                        caps_map[det_id] = caps
+                except Exception:
+                    pass
             except Exception:
                 continue
 
         if ids:
             self._primary_detector_id = ids[0]
+
+        # 4. Update System Configuration (CORRECTED)
+        # We must write to: self.system_settings.detector_system.capabilities_by_id
+
+        sys_config = self.system_settings
+
+        # Ensure we have a valid place to write
+        if sys_config is not None:
+            if sys_config.detector_system is None:
+                # If missing, create a default container so we don't crash
+                # (Assuming DetectorSystemSettings is imported from base)
+                from supertem.structures.base import DetectorSystemSettings
+                sys_config.detector_system = DetectorSystemSettings()
+
+            det_sys = sys_config.detector_system
+
+            # Update Available IDs
+            det_sys.available_detector_ids = ids
+
+            # Update Capabilities
+            if det_sys.capabilities_by_id is None:
+                det_sys.capabilities_by_id = {}
+
+            det_sys.capabilities_by_id.update(caps_map)
+
+            logger.debug(f"[DET] System capabilities updated for: {list(caps_map.keys())}")
 
     def _get_detector(self, detector_id: str):
         """Retrieve a cached detector instance by ID, creating it if necessary."""
@@ -1890,81 +1925,152 @@ class JeolMicroscope(TemMicroscope):
             logger.error(f"[DET] SetInsertion failed: {e}")
             raise
 
+    # =========================================================================
+    # 7b. Detector Control (Overrides)
+    # =========================================================================
+
+    def get_detector_settings(self, detector_id: str) -> DetectorSettings:
+        """
+        Override: Get full detector state including vendor extras (Gain, Offset, etc).
+        Fetches the complete settings payload from hardware via `get_detectorsetting`
+        and uses the adapter to populate standard fields and extras.
+        """
+        if detector is None:
+            logger.debug("[DET] GetSettings failed: Hardware not connected.")
+            return DetectorSettings(detector_id=detector_id)
+
+        try:
+            d = self._get_detector(detector_id)
+            # Fetch raw dict from PyJEM (contains GainIndex, ScanMode, etc.)
+            raw = d.get_detectorsetting()
+
+            # Use adapter to parse standard fields AND pack unknown keys into extra.vendor['JEOL']
+            # Note: Expects adapter to return (DetectorSettings, DetectorCapabilities)
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings
+        except Exception as e:
+            logger.debug(f"[DET] GetSettings({detector_id}) failed: {e}")
+            return DetectorSettings(detector_id=detector_id)
+
+    def apply_detector_settings(self, detector_id: str, settings: DetectorSettings) -> None:
+        """
+        Override: Apply settings using bulk setter to handle extras (Gain, Offset).
+        Standard atomic setters (e.g. set_detector_exposure) do not cover all vendor
+        capabilities. This method constructs a full configuration dictionary
+        (merging standard fields + extra.vendor['JEOL']) and sends it via `set_detectorsetting`.
+        """
+        if detector is None:
+            logger.error("[DET] ApplySettings failed: Hardware not connected.")
+            raise RuntimeError("Detector hardware not connected.")
+
+        try:
+            d = self._get_detector(detector_id)
+
+            # Use adapter to convert standard fields + vendor extras back into a single JEOL dict
+            payload = jeol_adapter.to_jeol_detector_config(settings)
+
+            if not payload:
+                logger.debug(f"[DET] ApplySettings({detector_id}): No changes in payload.")
+                return
+
+            logger.debug(f"[DET] set_detectorsetting({list(payload.keys())})")
+            d.set_detectorsetting(payload)
+
+        except Exception as e:
+            logger.error(f"[DET] ApplySettings({detector_id}) failed: {e}")
+            raise
+
     def acquire_image(self, request: AcquisitionRequest) -> MicroscopeImage:
         """
         Execute an image acquisition.
 
-        Steps:
-        1. Resolve the detector ID.
-        2. Apply requested settings (Exposure, Binning, etc.).
-        3. Trigger acquisition (Snapshot).
-        4. Capture full microscope metadata (Stage, Beam, etc.).
-        5. Return structured MicroscopeImage.
+        This implementation uses the overridden `apply_detector_settings` to ensure
+        all vendor-specific properties (Gain, Offset, etc.) are applied to the hardware
+        before the snapshot is taken.
         """
+        # 1. Hardware Availability Check
         if detector is None:
-            raise RuntimeError("Detector module missing")
+            logger.error("[DET] Acquisition failed: PyJEM Detector module missing.")
+            raise RuntimeError("Detector module missing.")
 
+        # 2. Resolve Detector ID
+        # Priority: Request ID -> Request Object ID -> Primary Hardware ID -> First Available
         det_id = (request.detector_id
                   or getattr(request.detector, "detector_id", None)
                   or (self.get_primary_detector_id() or ""))
 
         if not det_id:
-            raise RuntimeError("No detector_id provided and no primary detector available")
+            logger.error("[DET] Acquisition failed: No detector selected or available.")
+            raise RuntimeError("No detector_id provided and no primary detector available.")
 
         logger.debug(f"[DET] Acquiring Image on {det_id}")
         d = self._get_detector(det_id)
 
-        # Apply temporary settings
+        # 3. Apply Settings (Bulk Configuration)
+        # We use apply_detector_settings instead of atomic setters.
+        # This allows Gain, Offset, and standard physics (Exposure) to be sent in one payload.
         det_req = request.detector
         if det_req is not None:
-            if det_req.exposure is not None:
-                self.set_detector_exposure(det_id, det_req.exposure)
-            if det_req.binning_index is not None:
-                self.set_detector_binning(det_id, int(det_req.binning_index))
-            if det_req.frame_integration is not None:
-                self.set_detector_integration(det_id, int(det_req.frame_integration))
-            if det_req.roi is not None:
-                self.set_detector_roi(det_id, det_req.roi)
+            try:
+                self.apply_detector_settings(det_id, det_req)
+            except Exception as e:
+                logger.error(f"[DET] Failed to apply settings before acquisition: {e}")
+                raise
 
-        # Trigger Capture
+        # 4. Trigger Capture (Snapshot)
         raw = None
         try:
+            # PyJEM allows multiple ways to grab data. We try them in order of preference.
             if hasattr(d, "snapshot_rawdata"):
+                # Preferred: Raw data often matches the sensor bit-depth best
                 raw = d.snapshot_rawdata()
             elif hasattr(d, "get_image_cache"):
+                # Fallback: Cached image
                 raw = d.get_image_cache()
             elif hasattr(d, "livesnapshot"):
+                # Fallback: Live view snapshot (often 8-bit, but better than nothing)
                 raw = d.livesnapshot("tif")
+            else:
+                raise RuntimeError(f"Detector {det_id} has no compatible snapshot methods.")
         except Exception as e:
-            logger.error(f"[DET] Acquisition Hardware Failure: {e}")
+            logger.error(f"[DET] Hardware Acquisition Failure: {e}")
             raise
 
-        # Convert to numpy
+        # 5. Process Raw Data -> Numpy Array
+        # PyJEM returns various formats (list of ints, byte strings, dicts).
         arr: np.ndarray
         if raw is None:
             arr = np.zeros((1, 1), dtype=np.uint16)
         elif isinstance(raw, (bytes, bytearray)):
+            # Binary buffer
             try:
                 arr = np.frombuffer(raw, dtype=np.uint16)
             except Exception:
                 arr = np.frombuffer(raw, dtype=np.uint8)
         elif isinstance(raw, list):
+            # List of integers
             arr = np.array(raw)
         elif isinstance(raw, dict) and "data" in raw:
+            # Json wrapper (common in newer PyJEM)
             arr = np.array(raw["data"])
         else:
+            # Fallback
             try:
                 arr = np.array(raw)
             except Exception:
                 arr = np.zeros((1, 1), dtype=np.uint16)
 
-        # Reshape logic for flat arrays (common in PyJEM)
+        # 6. Normalization (Type and Shape)
+        # Ensure uint16 for standard microscopy data
         if arr.dtype not in (np.uint8, np.uint16):
             try:
                 arr = arr.astype(np.uint16, copy=False)
             except Exception:
                 arr = np.array(arr, dtype=np.uint16)
 
+        # Handle 1D Flattened Arrays
+        # PyJEM often returns a flat list. We need to reshape it
+        # based on the requested ROI or the detected scan size.
         roi = None
         if det_req is not None and getattr(det_req, "roi", None) is not None:
             roi = det_req.roi
@@ -1975,53 +2081,62 @@ class JeolMicroscope(TemMicroscope):
                 roi = None
 
         if arr.ndim == 1:
-            cols = int(getattr(roi, "width", 0) or 0) if roi is not None else 0
-            rows = int(getattr(roi, "height", 0) or 0) if roi is not None else 0
+            cols = int(getattr(roi, "width", 0) or 0)
+            rows = int(getattr(roi, "height", 0) or 0)
+
+            # If ROI dimensions are valid and match data size, reshape
             if cols > 0 and rows > 0 and arr.size == cols * rows:
                 arr = arr.reshape((rows, cols))
+            else:
+                # Fallback: Try to guess square, or leave flat if impossible
+                side = int(np.sqrt(arr.size))
+                if side * side == arr.size:
+                    arr = arr.reshape((side, side))
 
+        # Handle 3D Arrays (e.g. RGB or Single Frame Stack)
         if arr.ndim == 3:
             if arr.shape[0] == 1:
                 arr = arr[0]
             elif arr.shape[-1] == 1:
                 arr = arr[..., 0]
+
+        # Ensure at least 2D
         if arr.ndim != 2:
             arr = np.atleast_2d(arr)
 
-        # Collect Metadata
+        # 7. Collect Metadata
         created_at = datetime.now(timezone.utc).isoformat()
-        try:
-            v = self.get_acceleration_voltage()
-            accelerating_voltage_kv = float(v.to(Units.KV).magnitude) if v is not None else None
-        except Exception:
-            accelerating_voltage_kv = None
 
-        try:
-            bc = self.get_beam_current()
-            beam_current_na = float(bc.to(Units.NA).magnitude) if bc is not None else None
-        except Exception:
-            beam_current_na = None
+        # Helper to safely get floats
+        def _safe_get(getter, unit_obj):
+            try:
+                val = getter()
+                return float(val.to(unit_obj).magnitude) if val is not None else None
+            except Exception:
+                return None
 
+        # Capture Microscope State
+        acc_kv = _safe_get(self.get_acceleration_voltage, Units.KV)
+        cur_na = _safe_get(self.get_beam_current, Units.NA)
         try:
+            # Exposure might need specific ID
             exp_q = self.get_detector_exposure(det_id)
-            exposure_ms = float(exp_q.to(Units.MS).magnitude) if exp_q is not None else None
+            exp_ms = float(exp_q.to(Units.MS).magnitude) if exp_q is not None else None
         except Exception:
-            exposure_ms = None
+            exp_ms = None
 
         try:
-            mag = self.get_magnification()
-            magnification = float(mag) if mag is not None else None
+            mag_val = self.get_magnification()
+            mag = float(mag_val) if mag_val is not None else None
         except Exception:
-            magnification = None
+            mag = None
 
-        try:
-            cl = self.get_camera_length()
-            camera_length_mm = float(cl.to(Units.MM).magnitude) if cl is not None else None
-        except Exception:
-            camera_length_mm = None
+        cam_mm = _safe_get(self.get_camera_length, Units.MM)
 
-        w, h = (int(arr.shape[1]), int(arr.shape[0])) if arr.ndim == 2 else (None, None)
+        # Image Dimensions
+        h, w = arr.shape
 
+        # Vendor Specific Metadata (Binning, Integration, ROI)
         jeol_vendor: Dict[str, Any] = {"detector_id": det_id}
         try:
             jeol_vendor["binning_index"] = int(self.get_detector_binning(det_id))
@@ -2031,34 +2146,36 @@ class JeolMicroscope(TemMicroscope):
             jeol_vendor["frame_integration"] = int(self.get_detector_integration(det_id))
         except Exception:
             pass
-        if roi is not None:
+        if roi:
             try:
                 jeol_vendor["roi"] = roi.to_dict() if hasattr(roi, "to_dict") else roi
             except Exception:
                 jeol_vendor["roi"] = None
 
-        state = None
+        # Full State Snapshot (Slow, but useful)
+        state_snapshot = None
         meta_extra = Extras(vendor={"JEOL": jeol_vendor})
         try:
-            state = self.get_full_state()
+            # We attempt to get full state, but don't fail acquisition if it errors
+            state_snapshot = self.get_full_state()
         except Exception as e:
-            try:
-                meta_extra.notes["MicroscopeImageMetadata.state_capture_failed"] = str(e)
-            except Exception:
-                pass
+            if meta_extra.notes is None: meta_extra.notes = {}
+            meta_extra.notes["MicroscopeImageMetadata.state_capture_failed"] = str(e)
 
+        # 8. Construct Result
         metadata = MicroscopeImageMetadata(
             created_at=created_at,
-            magnification=magnification,
-            camera_length_mm=camera_length_mm,
-            image_size_px=(w, h) if (w is not None and h is not None) else None,
-            accelerating_voltage_kv=accelerating_voltage_kv,
-            beam_current_na=beam_current_na,
-            exposure_ms=exposure_ms,
-            microscope_state=state,
+            magnification=mag,
+            camera_length_mm=cam_mm,
+            image_size_px=(w, h),
+            accelerating_voltage_kv=acc_kv,
+            beam_current_na=cur_na,
+            exposure_ms=exp_ms,
+            microscope_state=state_snapshot,
             extra=meta_extra,
             _mode="lenient",
         )
+
         return MicroscopeImage(data=arr, metadata=metadata)
 
     # =========================================================================
@@ -2169,8 +2286,10 @@ class JeolMicroscope(TemMicroscope):
             self.apt.SelectExpKind(kind_idx)
             if target.size_index is not None:
                 self.apt.SetExpSize(kind_idx, int(target.size_index))
+                time.sleep(5)
             if target.position is not None:
                 self.apt.SetPosition(int(target.position.x), int(target.position.y))
+                time.sleep(5)
         except Exception as e:
             logger.error(f"[APT] SetAperture({aperture_id}) failed: {e}")
             raise
