@@ -158,7 +158,8 @@ def setup_session(
     ip_address: Optional[str] = None,
     manufacturer: Optional[str] = None,
     debug: bool = False,
-    profile_name: Optional[str] = None
+    profile_name: Optional[str] = None,
+    offline: bool = False
 ) -> Tuple[TemMicroscope, MicroscopeSettings]:
     """Setup microscope session using registry-aware loading."""
 
@@ -190,6 +191,18 @@ def setup_session(
         settings.system.info.ip_address = ip_address
     if manufacturer:
         settings.system.info.manufacturer = manufacturer
+
+    if offline:
+        # We mark the model as offline. The JeolMicroscope driver looks for this string.
+        current_model = settings.system.info.model or "Unknown"
+        if "OFFLINE" not in current_model.upper():
+            settings.system.info.model = f"{current_model} (Offline)"
+
+        # Optional: Set a safe dummy IP so connect() doesn't hang looking for real hardware
+        if not ip_address:
+            settings.system.info.ip_address = "127.0.0.1"
+
+        logging.info(f"Session configured for EXPLICIT OFFLINE SIMULATION.")
 
     # Update dynamic output path
     image_dir = session_dir / "images"

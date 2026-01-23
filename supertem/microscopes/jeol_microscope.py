@@ -203,30 +203,69 @@ class JeolMicroscope(TemMicroscope):
         """
         super().__init__(config)
 
+        model_name = (self.system_settings.info.model or "").upper()
+        force_offline = "OFFLINE" in model_name
+
         # --- Lazy Loading Implementation ---
         global TEM3, detector
+
+        # ---------------------------------------------------------
+        # A. Load TEM3 Interface (Microscope Column Control)
+        # ---------------------------------------------------------
         if TEM3 is None:
-            try:
-                from PyJEM import TEM3 as _T3
-                TEM3 = _T3
-            except ImportError:
+            if force_offline:
+                logger.info("[INIT] Offline mode requested. Forcing PyJEM.offline.TEM3...")
                 try:
                     from PyJEM.offline import TEM3 as _T3
                     TEM3 = _T3
+                    logger.info("[INIT] PyJEM.offline.TEM3 imported successfully.")
+                except ImportError as e:
+                    logger.error(f"[INIT] Failed to import PyJEM.offline.TEM3: {e}")
+                    raise RuntimeError("Offline mode requested but PyJEM.offline is missing.") from e
+            else:
+                # Standard Auto-Detection
+                try:
+                    from PyJEM import TEM3 as _T3
+                    TEM3 = _T3
+                    logger.info("[INIT] PyJEM.TEM3 imported (Online Mode).")
                 except ImportError:
-                    TEM3 = None
-                    logger.warning("[INIT] PyJEM not found. JeolMicroscope will be non-functional.")
+                    logger.warning("[INIT] PyJEM.TEM3 missing. Falling back to PyJEM.offline...")
+                    try:
+                        from PyJEM.offline import TEM3 as _T3
+                        TEM3 = _T3
+                        logger.info("[INIT] PyJEM.offline.TEM3 imported (Fallback).")
+                    except ImportError:
+                        TEM3 = None
+                        logger.warning("[INIT] PyJEM.TEM3 module absent.")
 
+        # ---------------------------------------------------------
+        # B. Load Detector Interface (Camera Control)
+        # ---------------------------------------------------------
         if detector is None:
-            try:
-                from PyJEM import detector as _d
-                detector = _d
-            except ImportError:
+            if force_offline:
+                logger.info("[INIT] Offline mode requested. Forcing PyJEM.offline.detector...")
                 try:
                     from PyJEM.offline import detector as _d
                     detector = _d
+                    logger.info("[INIT] PyJEM.offline.detector imported successfully.")
+                except ImportError as e:
+                    # We don't raise here immediately because the microscope might run without a camera
+                    logger.error(f"[INIT] Failed to import PyJEM.offline.detector: {e}")
+            else:
+                # Standard Auto-Detection
+                try:
+                    from PyJEM import detector as _d
+                    detector = _d
+                    logger.info("[INIT] PyJEM.detector imported (Online Mode).")
                 except ImportError:
-                    detector = None
+                    logger.warning("[INIT] PyJEM.detector missing. Falling back to PyJEM.offline...")
+                    try:
+                        from PyJEM.offline import detector as _d
+                        detector = _d
+                        logger.info("[INIT] PyJEM.offline.detector imported (Fallback).")
+                    except ImportError:
+                        detector = None
+                        logger.warning("[INIT] PyJEM.detector module absent.")
 
         # Hardware Interface Placeholders
         self.stage = None
@@ -708,6 +747,7 @@ class JeolMicroscope(TemMicroscope):
         except Exception as e:
             logger.error(f"[STAGE] SetOrg failed: {e}")
             raise
+
     # =========================================================================
     # 4. Beam Control (Atomic Getters)
     # =========================================================================
@@ -1512,7 +1552,7 @@ class JeolMicroscope(TemMicroscope):
             return None
 
     @staticmethod
-    def _first_int(d: dict, keys: tuple[str, ...]) -> Optional[int]:
+    def _first_int(d: dict, keys: Tuple[str, ...]) -> Optional[int]:
         for k in keys:
             if k in d:
                 try:
@@ -1522,7 +1562,7 @@ class JeolMicroscope(TemMicroscope):
         return None
 
     @staticmethod
-    def _first_float(d: dict, keys: tuple[str, ...]) -> Optional[float]:
+    def _first_float(d: dict, keys: Tuple[str, ...]) -> Optional[float]:
         for k in keys:
             if k in d:
                 try:
@@ -2326,7 +2366,7 @@ class JeolMicroscope(TemMicroscope):
             try:
                 status = self.stage.GetStatus()
                 if isinstance(status, (list, tuple)):
-                    if all(s == 0 for s in status):
+                    if all(s != 1 for s in status):
                         return
             except Exception:
                 pass
