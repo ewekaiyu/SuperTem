@@ -447,12 +447,12 @@ and Telemetry (Dynamic/Snapshot).
 
    MicroscopeState
    ├── stage_position: StagePosition (x, y, z, tilt)
-   ├── beam: BeamState (Voltage, current, spot size)
+   ├── beam: BeamSettings (Voltage, current, spot size)
    ├── projection: ProjectionSettings (Defocus, magnification, optical mode)
    ├── scan: ScanSettings (Active dwell time, grid resolution)
    ├── vacuum: VacuumSettings (Valve states, pressures)
    ├── apertures: Dict[str, Aperture] (State of all inserted apertures)
-   └── detectors: Dict[str, DetectorState] (State of all active cameras)
+   └── detectors: Dict[str, DetectorSettings] (State of all active cameras)
 
 ===============================================================================
 Rationale
@@ -1943,9 +1943,6 @@ class BeamSettings:
             "convergence_angle": "convergence_angle_mrad"
         })
 
-# Alias for semantic clarity in Read-Only contexts
-BeamState = BeamSettings
-
 @dataclass
 class BeamSystemSettings:
     """
@@ -2375,9 +2372,6 @@ class DetectorSettings:
             "digital_rotation": "digital_rotation_deg",
             "frame_rate": "frame_rate_hz"
         })
-
-# Alias for semantic clarity in Read-Only contexts
-DetectorState = DetectorSettings
 
 @dataclass
 class DetectorCapabilities:
@@ -3083,14 +3077,14 @@ class MicroscopeState:
         # Category B: Structural Defaults
         self.stage_position = p.model(StagePosition, self.stage_position, "stage_position",
                                       default=StagePosition(_mode=p.mode))
-        self.beam = p.model(BeamState, self.beam, "beam", default=BeamState(_mode=p.mode))
+        self.beam = p.model(BeamSettings, self.beam, "beam", default=BeamSettings(_mode=p.mode))
         self.projection = p.model(ProjectionSettings, self.projection, "projection",
                                   default=ProjectionSettings(_mode=p.mode))
         self.scan = p.model(ScanSettings, self.scan, "scan", default=ScanSettings(_mode=p.mode))
         self.vacuum = p.model(VacuumSettings, self.vacuum, "vacuum", default=VacuumSettings(_mode=p.mode))  # <--- NEW
 
         self.apertures = p.map_model(Aperture, self.apertures, "apertures", "aperture_id")
-        self.detectors = p.map_model(DetectorState, self.detectors, "detectors", "detector_id")
+        self.detectors = p.map_model(DetectorSettings, self.detectors, "detectors", "detector_id")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
