@@ -153,7 +153,7 @@ from supertem.structures.base import (
     Quantity,
     Extras,
     Point,
-    ROI
+    ROI, DetectorCapabilities
 )
 
 # Import Vendor Adapters
@@ -161,10 +161,6 @@ from supertem.vendor.JEOL import jeol_adapter
 from supertem.vendor.JEOL.jeol_eos_tables import EOS_MODE_TABLES, get_list
 
 logger = logging.getLogger(__name__)
-
-# Global placeholders for Lazy Loading
-TEM3 = None
-detector = None
 
 
 class JeolMicroscope(TemMicroscope):
@@ -195,77 +191,17 @@ class JeolMicroscope(TemMicroscope):
     def __init__(self, config: MicroscopeSettings):
         """
         Initialize the driver.
-
-        Note:
-            We use 'Lazy Loading' for PyJEM. The library is imported here (inside __init__)
-            rather than at the module level. This ensures that importing this file in a
-            simulation or test environment (where PyJEM is missing) does not crash the process.
+        PyJEM modules are loaded into instance variables (self.tem3_mod, self.det_mod)
+        to allow independent instantiation and better testing support.
         """
         super().__init__(config)
 
-        model_name = (self.system_settings.info.model or "").upper()
-        force_offline = "OFFLINE" in model_name
+        # Instance variables for PyJEM modules
+        self.tem3_mod = None
+        self.det_mod = None
 
-        # --- Lazy Loading Implementation ---
-        global TEM3, detector
-
-        # ---------------------------------------------------------
-        # A. Load TEM3 Interface (Microscope Column Control)
-        # ---------------------------------------------------------
-        if TEM3 is None:
-            if force_offline:
-                logger.info("[INIT] Offline mode requested. Forcing PyJEM.offline.TEM3...")
-                try:
-                    from PyJEM.offline import TEM3 as _T3
-                    TEM3 = _T3
-                    logger.info("[INIT] PyJEM.offline.TEM3 imported successfully.")
-                except ImportError as e:
-                    logger.error(f"[INIT] Failed to import PyJEM.offline.TEM3: {e}")
-                    raise RuntimeError("Offline mode requested but PyJEM.offline is missing.") from e
-            else:
-                # Standard Auto-Detection
-                try:
-                    from PyJEM import TEM3 as _T3
-                    TEM3 = _T3
-                    logger.info("[INIT] PyJEM.TEM3 imported (Online Mode).")
-                except ImportError:
-                    logger.warning("[INIT] PyJEM.TEM3 missing. Falling back to PyJEM.offline...")
-                    try:
-                        from PyJEM.offline import TEM3 as _T3
-                        TEM3 = _T3
-                        logger.info("[INIT] PyJEM.offline.TEM3 imported (Fallback).")
-                    except ImportError:
-                        TEM3 = None
-                        logger.warning("[INIT] PyJEM.TEM3 module absent.")
-
-        # ---------------------------------------------------------
-        # B. Load Detector Interface (Camera Control)
-        # ---------------------------------------------------------
-        if detector is None:
-            if force_offline:
-                logger.info("[INIT] Offline mode requested. Forcing PyJEM.offline.detector...")
-                try:
-                    from PyJEM.offline import detector as _d
-                    detector = _d
-                    logger.info("[INIT] PyJEM.offline.detector imported successfully.")
-                except ImportError as e:
-                    # We don't raise here immediately because the microscope might run without a camera
-                    logger.error(f"[INIT] Failed to import PyJEM.offline.detector: {e}")
-            else:
-                # Standard Auto-Detection
-                try:
-                    from PyJEM import detector as _d
-                    detector = _d
-                    logger.info("[INIT] PyJEM.detector imported (Online Mode).")
-                except ImportError:
-                    logger.warning("[INIT] PyJEM.detector missing. Falling back to PyJEM.offline...")
-                    try:
-                        from PyJEM.offline import detector as _d
-                        detector = _d
-                        logger.info("[INIT] PyJEM.offline.detector imported (Fallback).")
-                    except ImportError:
-                        detector = None
-                        logger.warning("[INIT] PyJEM.detector module absent.")
+        # Load modules immediately
+        self._load_pyjem_modules()
 
         # Hardware Interface Placeholders
         self.stage = None
@@ -296,6 +232,64 @@ class JeolMicroscope(TemMicroscope):
         val = getattr(config, 'defocus_scale', cfg.get('defocus_scale', 1.0))
         self.defocus_scale: float = float(val)
 
+    def _load_pyjem_modules(self):
+        """Internal helper to import PyJEM modules into instance variables."""
+        model_name = (self.system_settings.info.model or "").upper()
+        force_offline = "OFFLINE" in model_name
+
+        # ---------------------------------------------------------
+        # A. Load TEM3 Interface
+        # ---------------------------------------------------------
+        if self.tem3_mod is None:
+            if force_offline:
+                logger.info("[INIT] Offline mode requested. Forcing PyJEM.offline.TEM3...")
+                try:
+                    from PyJEM.offline import TEM3 as _T3
+                    self.tem3_mod = _T3
+                except ImportError as e:
+                    logger.error(f"[INIT] Failed to import PyJEM.offline.TEM3: {e}")
+                    raise RuntimeError("Offline mode requested but PyJEM.offline is missing.") from e
+            else:
+                try:
+                    from PyJEM import TEM3 as _T3
+                    self.tem3_mod = _T3
+                    logger.info("[INIT] PyJEM.TEM3 imported (Online Mode).")
+                except ImportError:
+                    logger.warning("[INIT] PyJEM.TEM3 missing. Falling back to PyJEM.offline...")
+                    try:
+                        from PyJEM.offline import TEM3 as _T3
+                        self.tem3_mod = _T3
+                        logger.info("[INIT] PyJEM.offline.TEM3 imported (Fallback).")
+                    except ImportError:
+                        self.tem3_mod = None
+                        logger.warning("[INIT] PyJEM.TEM3 module absent.")
+
+        # ---------------------------------------------------------
+        # B. Load Detector Interface
+        # ---------------------------------------------------------
+        if self.det_mod is None:
+            if force_offline:
+                logger.info("[INIT] Offline mode requested. Forcing PyJEM.offline.detector...")
+                try:
+                    from PyJEM.offline import detector as _d
+                    self.det_mod = _d
+                except ImportError as e:
+                    logger.error(f"[INIT] Failed to import PyJEM.offline.detector: {e}")
+            else:
+                try:
+                    from PyJEM import detector as _d
+                    self.det_mod = _d
+                    logger.info("[INIT] PyJEM.detector imported (Online Mode).")
+                except ImportError:
+                    logger.warning("[INIT] PyJEM.detector missing. Falling back to PyJEM.offline...")
+                    try:
+                        from PyJEM.offline import detector as _d
+                        self.det_mod = _d
+                        logger.info("[INIT] PyJEM.offline.detector imported (Fallback).")
+                    except ImportError:
+                        self.det_mod = None
+                        logger.warning("[INIT] PyJEM.detector module absent.")
+
     # =========================================================================
     # 1. Connection & Lifecycle
     # =========================================================================
@@ -303,30 +297,27 @@ class JeolMicroscope(TemMicroscope):
     def connect(self, host: str, port: Optional[int] = None, **kwargs) -> None:
         """
         Connect to the JEOL TEM3 interface and initialize sub-modules.
-
-        Args:
-            host: The IP address of the TEM server (unused by standard PyJEM, but required by signature).
         """
-        if not TEM3:
+        if not self.tem3_mod:
             logger.error("[CONN] Cannot connect: PyJEM library not found.")
             raise RuntimeError("PyJEM library not found.")
 
         try:
             logger.info(f"[CONN] Connecting to TEM3 interface (Host: {host})...")
-            TEM3.connect()
+            self.tem3_mod.connect()
 
             # Initialize individual hardware controllers
-            self.stage = TEM3.Stage3()
-            self.eos = TEM3.EOS3()
-            self.ht = TEM3.HT3()
-            self.lens = TEM3.Lens3()
-            self.def_ = TEM3.Def3()
-            self.apt = TEM3.Apt3()
-            self.scan = TEM3.Scan3()
-            self.vac = TEM3.VACUUM3()
-            self.feg = TEM3.FEG3()
-            self.gun = TEM3.GUN3()
-            self.det3 = TEM3.Detector3()
+            self.stage = self.tem3_mod.Stage3()
+            self.eos = self.tem3_mod.EOS3()
+            self.ht = self.tem3_mod.HT3()
+            self.lens = self.tem3_mod.Lens3()
+            self.def_ = self.tem3_mod.Def3()
+            self.apt = self.tem3_mod.Apt3()
+            self.scan = self.tem3_mod.Scan3()
+            self.vac = self.tem3_mod.VACUUM3()
+            self.feg = self.tem3_mod.FEG3()
+            self.gun = self.tem3_mod.GUN3()
+            self.det3 = self.tem3_mod.Detector3()
 
             self._connected = True
             self._refresh_detectors()
@@ -365,10 +356,10 @@ class JeolMicroscope(TemMicroscope):
         Retrieve the PyJEM detector function module.
         Newer PyJEM versions nest functions under `detector.function`.
         """
-        if detector is None:
+        if self.det_mod is None:
             return None
-        fn_mod = getattr(detector, "function", None)
-        return fn_mod if fn_mod is not None else detector
+        fn_mod = getattr(self.det_mod, "function", None)
+        return fn_mod if fn_mod is not None else self.det_mod
 
     def _refresh_detectors(self) -> None:
         """
@@ -383,13 +374,13 @@ class JeolMicroscope(TemMicroscope):
             'width_px': 512, 'height_px': 512,
         }
 
-        if detector is None:
+        if self.det_mod is None:
             return
 
         # 2. PyJEM Discovery Logic
-        fn_mod = getattr(detector, "function", None)
+        fn_mod = getattr(self.det_mod, "function", None)
         if fn_mod is None:
-            fn_mod = detector
+            fn_mod = self.det_mod
 
         getter = getattr(fn_mod, "get_attached_detector", None)
         if not callable(getter):
@@ -407,7 +398,7 @@ class JeolMicroscope(TemMicroscope):
         for det_id in ids:
             try:
                 # Create and Cache
-                d_obj = detector.Detector(det_id)
+                d_obj = self.det_mod.Detector(det_id)
                 self._active_detectors[det_id] = d_obj
 
                 # Extract Capabilities (Min/Max settings)
@@ -452,12 +443,12 @@ class JeolMicroscope(TemMicroscope):
 
     def _get_detector(self, detector_id: str):
         """Retrieve a cached detector instance by ID, creating it if necessary."""
-        if detector is None:
+        if self.det_mod is None:
             raise RuntimeError("PyJEM detector module missing")
 
         d = self._active_detectors.get(detector_id)
         if d is None:
-            d = detector.Detector(detector_id)
+            d = self.det_mod.Detector(detector_id)
             self._active_detectors[detector_id] = d
             # If no primary is set, make this the primary
             if self._primary_detector_id is None:
@@ -1538,7 +1529,7 @@ class JeolMicroscope(TemMicroscope):
 
     def _get_scan_controller_detector(self):
         """Helper to find the Detector instance that controls scanning (STEM)."""
-        if detector is None:
+        if self.det_mod is None:
             return None
         try:
             det_id = self.get_primary_detector_id()
@@ -1810,7 +1801,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
         """Get detector exposure time."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetExposure failed: Hardware not connected.")
             return None
         try:
@@ -1823,7 +1814,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_binning(self, detector_id: str) -> Optional[int]:
         """Get binning index."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetBinning failed: Hardware not connected.")
             return None
         try:
@@ -1836,7 +1827,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
         """Get Region of Interest."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetROI failed: Hardware not connected.")
             return None
         try:
@@ -1849,7 +1840,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_integration(self, detector_id: str) -> Optional[int]:
         """Get frame integration count."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetIntegration failed: Hardware not connected.")
             return None
         try:
@@ -1862,7 +1853,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_inserted(self, detector_id: str) -> bool:
         """Check if detector is mechanically inserted."""
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetInserted failed: Hardware not connected.")
             return True
         try:
@@ -1885,7 +1876,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_exposure(self, detector_id: str, exposure: Quantity) -> None:
         """Set detector exposure time."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetExposure failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1904,7 +1895,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_binning(self, detector_id: str, index: int) -> None:
         """Set detector binning."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetBinning failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1919,7 +1910,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_roi(self, detector_id: str, roi: Optional[ROI]) -> None:
         """Set detector ROI."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetROI failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1935,7 +1926,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_integration(self, detector_id: str, count: int) -> None:
         """Set frame integration count."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetIntegration failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1950,7 +1941,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_insertion(self, detector_id: str, inserted: bool) -> None:
         """Insert or retract detector."""
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] SetInsertion failed: Detector hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -1975,7 +1966,7 @@ class JeolMicroscope(TemMicroscope):
         Fetches the complete settings payload from hardware via `get_detectorsetting`
         and uses the adapter to populate standard fields and extras.
         """
-        if detector is None:
+        if self.det_mod is None:
             logger.debug("[DET] GetSettings failed: Hardware not connected.")
             return DetectorSettings(detector_id=detector_id)
 
@@ -1999,7 +1990,7 @@ class JeolMicroscope(TemMicroscope):
         capabilities. This method constructs a full configuration dictionary
         (merging standard fields + extra.vendor['JEOL']) and sends it via `set_detectorsetting`.
         """
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] ApplySettings failed: Hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
@@ -2029,7 +2020,7 @@ class JeolMicroscope(TemMicroscope):
         before the snapshot is taken.
         """
         # 1. Hardware Availability Check
-        if detector is None:
+        if self.det_mod is None:
             logger.error("[DET] Acquisition failed: PyJEM Detector module missing.")
             raise RuntimeError("Detector module missing.")
 
