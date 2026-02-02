@@ -2526,7 +2526,7 @@ class JeolMicroscope(TemMicroscope):
             logger.debug(f"[APT] GetAperture({aperture_id}) failed: {e}")
             return None
 
-    def set_aperture(self, aperture_id: str, target: Aperture) -> None:
+    def set_aperture(self, aperture_id: str, target: ApertureSettings) -> None:
         """Set aperture state."""
         if not self.apt:
             logger.error(f"[APT] SetAperture({aperture_id}) failed: Hardware not connected.")

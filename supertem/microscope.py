@@ -376,7 +376,8 @@ class TemMicroscope(ABC):
             projection=self.get_projection_settings(),
             scan=self.get_scan_settings(),
             vacuum=self.get_vacuum_settings(),
-            apertures=self.get_all_apertures(),
+            apertures={a_id: self.get_aperture(a_id)
+                       for a_id in self.list_apertures()},
             detectors={d_id: self.get_detector_settings(d_id)
                        for d_id in self.list_detectors()},
             active_detector_ids=self.get_active_detector_ids(),
@@ -387,33 +388,49 @@ class TemMicroscope(ABC):
     # 3. Stage Control (Motion)
     # =========================================================================
 
-    # --- Atomic Layer ---
+    # --- Atomic Getters (Granular) ---
     @abstractmethod
-    def get_stage_position(self) -> Optional[StagePosition]:
-        """Atomic: Read current physical stage coordinates. Returns None if unknown."""
+    def get_stage_x(self) -> Optional[Quantity]:
+        """Atomic: Get X coordinate (nm)."""
+        pass
+
+    @abstractmethod
+    def get_stage_y(self) -> Optional[Quantity]:
+        """Atomic: Get Y coordinate (nm)."""
+        pass
+
+    @abstractmethod
+    def get_stage_z(self) -> Optional[Quantity]:
+        """Atomic: Get Z coordinate (nm)."""
+        pass
+
+    @abstractmethod
+    def get_stage_r(self) -> Optional[Quantity]:
+        """Atomic: Get Rotation (deg)."""
+        pass
+
+    @abstractmethod
+    def get_stage_tilt_x(self) -> Optional[Quantity]:
+        """Atomic: Get Alpha Tilt (deg)."""
+        pass
+
+    @abstractmethod
+    def get_stage_tilt_y(self) -> Optional[Quantity]:
+        """Atomic: Get Beta Tilt (deg)."""
         pass
 
     @abstractmethod
     def get_stage_coordinate_system(self) -> Optional[str]:
-        """Get the current reference frame name."""
+        """Atomic: Get the current reference frame name."""
         pass
 
+    # --- Atomic Coordinated Move (Vector) ---
     @abstractmethod
-    def move_stage_absolute(
-            self,
-            target: StagePosition,
-            drive_type: str = "default",
-            wait: bool = True,
-            tolerance_nm: float = 200.0,
-            tolerance_deg: float = 0.1,
-            max_retries: int = 3
-    ) -> None:
-        """Atomic: Move stage to a specific absolute coordinate."""
-        pass
-
-    @abstractmethod
-    def set_stage_coordinate_system(self, system_id: str) -> None:
-        """Atomic: Set the reference frame."""
+    def move_stage_absolute(self, target: StagePosition, wait: bool = True) -> None:
+        """
+        Atomic: Move multiple axes simultaneously (Vector Move).
+        Target fields that are None should be ignored (no motion).
+        """
         pass
 
     @abstractmethod
@@ -426,12 +443,32 @@ class TemMicroscope(ABC):
         """Atomic: Return stage to its mechanical origin/zero position."""
         pass
 
-    # --- Logic Layer ---
+    # --- Helper Layer (Aggregators) ---
+    def get_stage_position(self) -> StagePosition:
+        """
+        Helper: Aggregates atomic primitives into a consistent StagePosition object.
+        """
+        return StagePosition(
+            x=self.get_stage_x(),
+            y=self.get_stage_y(),
+            z=self.get_stage_z(),
+            r=self.get_stage_r(),
+            tilt_x=self.get_stage_tilt_x(),
+            tilt_y=self.get_stage_tilt_y(),
+            coordinate_system=self.get_stage_coordinate_system()
+        )
+
+    def apply_stage_position(self, target: StagePosition, wait: bool = True) -> None:
+        """
+        Helper: Prepares and executes a stage move.
+        Drivers can override this to handle vendor-specific 'extras' before moving.
+        """
+        # We use the coordinated atomic move to ensure vector motion (not stair-stepping)
+        self.move_stage_absolute(target, wait=wait)
+
+    # --- Orchestrator Layer ---
     def execute_stage_move(self, request: StageMoveRequest) -> None:
-        """
-        Orchestrator: Handle StageMoveRequest.
-        Validates safety, handles relative logic, and interpolates large moves.
-        """
+        """Orchestrator: Validates intent and checks safety limits."""
         if not request.validate():
             raise ValueError(f"Invalid StageMoveRequest: {request}")
 
@@ -460,10 +497,64 @@ class TemMicroscope(ABC):
                 logger.error(f"[STAGE] Unsafe move rejected. Reasons: {check.reasons}")
                 raise RuntimeError(f"Unsafe move rejected: {check.reasons}")
 
-            # 3. Safe Execution (interpolates if needed)
-            self.safe_move_stage(target_abs, drive_type=request.drive_type, wait=request.wait_for_settle)
-        else:
-            self.move_stage_absolute(target_abs, drive_type=request.drive_type, wait=request.wait_for_settle)
+        # 3. Execution (via Safety Helper)
+        self.safe_move_stage(target_abs, drive_type=request.drive_type, wait=request.wait_for_settle)
+
+    def safe_move_stage(self, target: StagePosition,
+                        drive_type: str = "default",
+                        wait: bool = True) -> None:
+        """
+        Safety Helper: Breaks large moves into smaller linear steps if required.
+        """
+        sys = self.system_settings.stage_system
+        if not sys or not sys.max_step_distance:
+            self.apply_stage_position(target, wait=wait)
+            return
+
+        current = self.get_stage_position()
+        if current is None:
+            raise RuntimeError("Safe Move Failed: Cannot read current stage position.")
+
+        max_step_nm = sys.max_step_distance.to(Units.NM).magnitude
+
+        # Calculate max delta in NM
+        def dist(c: Optional[Quantity], t: Optional[Quantity]) -> float:
+            if c is None or t is None: return 0.0
+            return abs(t.to(Units.NM).magnitude - c.to(Units.NM).magnitude)
+
+        d_x = dist(current.x, target.x)
+        d_y = dist(current.y, target.y)
+        d_z = dist(current.z, target.z)
+        max_dist = max(d_x, d_y, d_z)
+
+        if max_dist <= max_step_nm:
+            self.apply_stage_position(target, wait=wait)
+            return
+
+        # Linear Interpolation
+        steps = int(max_dist // max_step_nm) + 1
+        logger.info(f"[STAGE] Step Limit: {max_dist:.1f}nm > {max_step_nm:.1f}nm. Breaking into {steps} segments.")
+
+        for i in range(1, steps + 1):
+            frac = i / steps
+            interim = replace(current)  # Copy structure
+
+            # Interpolate known axes
+            def interp(c, t):
+                if c is None or t is None: return c
+                return c + (t - c) * frac
+
+            if target.x is not None: interim.x = interp(current.x, target.x)
+            if target.y is not None: interim.y = interp(current.y, target.y)
+            if target.z is not None: interim.z = interp(current.z, target.z)
+
+            # Pass-through rotation/tilt on the final step
+            if i == steps:
+                interim.r = target.r
+                interim.tilt_x = target.tilt_x
+                interim.tilt_y = target.tilt_y
+
+            self.apply_stage_position(interim, wait=True)
 
     def execute_stage_control(self, request: StageControlRequest) -> None:
         """Orchestrator: Handle StageControlRequest (STOP, HOME)."""
@@ -476,7 +567,6 @@ class TemMicroscope(ABC):
             self.stop_stage()
         elif request.action == "HOME":
             self.home_stage()
-        # Drivers can extend for RESET_ERROR etc.
 
     # =========================================================================
     # 4. Beam Control (Illumination)
@@ -1284,48 +1374,73 @@ class TemMicroscope(ABC):
     # 8. Vacuum Control
     # =========================================================================
 
-    # --- Atomic Methods ---
+    # --- Atomic Getters (Explicit) ---
     @abstractmethod
-    def get_valve_state(self, valve_name: str) -> str:
-        """Get Valve State ('OPEN', 'CLOSED' or 'UNKNOWN')."""
+    def get_column_valve_state(self) -> str:
+        """Atomic: Get Column Valve (V7/V4) state ('OPEN', 'CLOSED', 'UNKNOWN')."""
         pass
 
     @abstractmethod
-    def set_valve_state(self, valve_name: str, state: str) -> None:
-        """Set Valve State ('OPEN', 'CLOSED')."""
+    def get_gun_valve_state(self) -> str:
+        """Atomic: Get Gun Valve (V1) state ('OPEN', 'CLOSED', 'UNKNOWN')."""
         pass
 
     @abstractmethod
-    def get_pressure(self, gauge_name: str) -> Optional[Quantity]:
-        """Get Pressure (Pa). Returns None if unknown."""
+    def get_turbo_pump_state(self) -> str:
+        """Atomic: Get Turbo Pump state ('ON', 'OFF', 'UNKNOWN')."""
+        pass
+
+    @abstractmethod
+    def get_column_pressure(self) -> Optional[Quantity]:
+        """Atomic: Get Column Pressure (Pa)."""
+        pass
+
+    @abstractmethod
+    def get_gun_pressure(self) -> Optional[Quantity]:
+        """Atomic: Get Gun Pressure (Pa)."""
+        pass
+
+    @abstractmethod
+    def get_buffer_tank_pressure(self) -> Optional[Quantity]:
+        """Atomic: Get Buffer Tank Pressure (Pa)."""
+        pass
+
+    # --- Atomic Setters (Explicit) ---
+    @abstractmethod
+    def set_column_valve_state(self, state: str) -> None:
+        """Atomic: Set Column Valve state ('OPEN', 'CLOSED')."""
+        pass
+
+    @abstractmethod
+    def set_gun_valve_state(self, state: str) -> None:
+        """Atomic: Set Gun Valve state ('OPEN', 'CLOSED')."""
+        pass
+
+    @abstractmethod
+    def set_turbo_pump_state(self, state: str) -> None:
+        """Atomic: Set Turbo Pump state ('ON', 'OFF')."""
         pass
 
     # --- Logic Layer ---
-
     def get_vacuum_settings(self) -> VacuumSettings:
         """Aggregator: returns full vacuum status."""
         return VacuumSettings(
-            column_valve_state=self.get_valve_state('column'),
-            gun_valve_state=self.get_valve_state('gun'),
-            turbo_pump_state=self.get_valve_state('turbo'),
-            column_pressure=self.get_pressure('column'),
-            gun_pressure=self.get_pressure('gun'),
-            buffer_tank_pressure=self.get_pressure('buffer')
+            column_valve_state=self.get_column_valve_state(),
+            gun_valve_state=self.get_gun_valve_state(),
+            turbo_pump_state=self.get_turbo_pump_state(),
+            column_pressure=self.get_column_pressure(),
+            gun_pressure=self.get_gun_pressure(),
+            buffer_tank_pressure=self.get_buffer_tank_pressure()
         )
 
     def apply_vacuum_settings(self, settings: VacuumSettings) -> None:
-        """Helper: Apply vacuum state changes.
-
-        Notes:
-        - Canonical fields are applied when not None.
-        - Vendor-specific extras are validated/applied by vendor overrides.
-        """
+        """Helper: Apply vacuum state changes."""
         if settings.column_valve_state is not None:
-            self.set_valve_state('column', settings.column_valve_state)
+            self.set_column_valve_state(settings.column_valve_state)
         if settings.gun_valve_state is not None:
-            self.set_valve_state('gun', settings.gun_valve_state)
+            self.set_gun_valve_state(settings.gun_valve_state)
         if settings.turbo_pump_state is not None:
-            self.set_valve_state('turbo', settings.turbo_pump_state)
+            self.set_turbo_pump_state(settings.turbo_pump_state)
 
     def execute_vacuum_control(self, request: VacuumControlRequest) -> None:
         """Orchestrator: Handle VacuumControlRequest."""
@@ -1340,26 +1455,58 @@ class TemMicroscope(ABC):
     # 9. Aperture Control
     # =========================================================================
 
-    # --- Atomic Methods ---
+    # --- Atomic Getters (Granular) ---
     @abstractmethod
     def list_apertures(self) -> List[str]:
-        """List supported aperture mechanism IDs (e.g. 'CLA', 'OLA')."""
+        """Atomic: List supported aperture mechanism IDs."""
         pass
 
     @abstractmethod
-    def get_aperture(self, aperture_id: str) -> Optional[ApertureSettings]:
-        """Get state of an aperture. Returns None if unknown."""
+    def get_aperture_inserted(self, aperture_id: str) -> bool:
+        """Atomic: Return True if aperture is in the beam path."""
         pass
 
     @abstractmethod
-    def set_aperture(self, aperture_id: str, target: ApertureSettings) -> None:
-        """Set aperture state."""
+    def get_aperture_size_index(self, aperture_id: str) -> Optional[int]:
+        """Atomic: Get the current size index."""
+        pass
+
+    @abstractmethod
+    def get_aperture_size_label(self, aperture_id: str) -> Optional[str]:
+        """Atomic: Get human-readable size label (optional)."""
+        pass
+
+    @abstractmethod
+    def get_aperture_position(self, aperture_id: str) -> Optional[Point]:
+        """Atomic: Get the mechanical XY position."""
+        pass
+
+    # --- Atomic Setters (Granular) ---
+    @abstractmethod
+    def set_aperture_inserted(self, aperture_id: str, inserted: bool) -> None:
+        """Atomic: Insert or Retract the mechanism."""
+        pass
+
+    @abstractmethod
+    def set_aperture_size_index(self, aperture_id: str, index: int) -> None:
+        """Atomic: Select a specific hole size."""
+        pass
+
+    @abstractmethod
+    def set_aperture_position(self, aperture_id: str, x: float, y: float) -> None:
+        """Atomic: Align the aperture mechanism mechanically."""
         pass
 
     # --- Logic Layer ---
-    def get_all_apertures(self) -> Dict[str, ApertureSettings]:
-        return {a_id: self.get_aperture(a_id) for a_id in self.list_apertures()
-                if self.get_aperture(a_id) is not None}
+    def get_aperture(self, aperture_id: str) -> ApertureSettings:
+        """Helper: Aggregates atomic primitives into an object."""
+        return ApertureSettings(
+            aperture_id=aperture_id,
+            inserted=self.get_aperture_inserted(aperture_id),
+            size_index=self.get_aperture_size_index(aperture_id),
+            size_label=self.get_aperture_size_label(aperture_id),
+            position=self.get_aperture_position(aperture_id)
+        )
 
     def execute_aperture_control(self, request: ApertureControlRequest) -> None:
         """
@@ -1378,101 +1525,38 @@ class TemMicroscope(ABC):
             if not check:
                 raise RuntimeError(f"Aperture request rejected: {check.reasons}")
 
-        final_target = request.target
+        target = request.target
+        a_id = request.aperture_id
 
-        # 2. Handle Relative Movement
-        if request.relative and request.target.position:
-            current = self.get_aperture(request.aperture_id)
-            if current is None:
-                raise RuntimeError(f"Relative move failed: State of '{request.aperture_id}' unknown")
+        # 2. Handle Relative Position Logic
+        target_pos = target.position
 
-            if current.position:
-                new_pos = replace(request.target.position)  # Start with delta structure
+        if request.relative and target.position:
+            # We need the current position to calculate the delta
+            current_pos = self.get_aperture_position(a_id)
+            if current_pos is None:
+                raise RuntimeError(f"Relative move failed: Current position of '{a_id}' is unknown")
 
-                # Perform vector addition (Manual because Point doesn't have __add__)
-                cur_x = current.position.x if current.position.x is not None else 0.0
-                cur_y = current.position.y if current.position.y is not None else 0.0
+            # Calculate new absolute position (manual vector addition)
+            cur_x = current_pos.x if current_pos.x is not None else 0.0
+            cur_y = current_pos.y if current_pos.y is not None else 0.0
 
-                if request.target.position.x is not None:
-                    new_pos.x = cur_x + request.target.position.x
-                else:
-                    new_pos.x = current.position.x
+            new_x = cur_x + (target.position.x if target.position.x is not None else 0.0)
+            new_y = cur_y + (target.position.y if target.position.y is not None else 0.0)
 
-                if request.target.position.y is not None:
-                    new_pos.y = cur_y + request.target.position.y
-                else:
-                    new_pos.y = current.position.y
+            # Create a new Point for the calculated target
+            target_pos = replace(target.position, x=new_x, y=new_y)
 
-                final_target = replace(final_target, position=new_pos)
+        # 3. Apply changes via Atomic Setters (Granular application)
+        if target.inserted is not None:
+            self.set_aperture_inserted(a_id, target.inserted)
 
-        # 3. Execute
-        self.set_aperture(request.aperture_id, final_target)
+        if target.size_index is not None:
+            self.set_aperture_size_index(a_id, target.size_index)
 
-    # =========================================================================
-    # 10. Safety Helpers
-    # =========================================================================
-
-    def safe_move_stage(self, target: StagePosition,
-                        drive_type: str = "default",
-                        wait: bool = True) -> None:
-        """
-        Safety Helper: Executes a stage move in smaller steps if required.
-
-        Checks `SystemSettings.stage_system.max_step_distance`. If the move
-        exceeds this limit, it breaks the trajectory into linear segments
-        and moves sequentially.
-
-        Args:
-            target: Absolute destination.
-            drive_type: 'mechanical', 'piezo', or 'default'.
-            wait: Block until complete.
-        """
-        sys = self.system_settings.stage_system
-        if not sys or not sys.max_step_distance:
-            self.move_stage_absolute(target, drive_type, wait)
-            return
-
-        current = self.get_stage_position()
-        if current is None:
-            raise RuntimeError("Safe Move Failed: Cannot read current stage position to calculate steps.")
-
-        max_step_nm = sys.max_step_distance.to(Units.NM).magnitude
-
-        # Calculate max delta in NM
-        def dist(c: Optional[Quantity], t: Optional[Quantity]) -> float:
-            if c is None or t is None: return 0.0
-            return abs(t.to(Units.NM).magnitude - c.to(Units.NM).magnitude)
-
-        d_x = dist(current.x, target.x)
-        d_y = dist(current.y, target.y)
-        d_z = dist(current.z, target.z)
-        max_dist = max(d_x, d_y, d_z)
-
-        if max_dist <= max_step_nm:
-            self.move_stage_absolute(target, drive_type, wait)
-            return
-
-        # Linear Interpolation
-        steps = int(max_dist // max_step_nm) + 1
-        logger.info(f"[STAGE] Step Limit: {max_dist:.1f}nm > {max_step_nm:.1f}nm. Breaking into {steps} segments.")
-
-        for i in range(1, steps + 1):
-            frac = i / steps
-            interim = replace(current)  # Copy structure
-
-            # Interpolate known axes
-            def interp(c, t):
-                if c is None or t is None: return c
-                return c + (t - c) * frac
-
-            if target.x is not None: interim.x = interp(current.x, target.x)
-            if target.y is not None: interim.y = interp(current.y, target.y)
-            if target.z is not None: interim.z = interp(current.z, target.z)
-
-            # Rotation/Tilt usually not interpolated by distance logic, passed through on final step
-            if i == steps:
-                interim.r = target.r
-                interim.tilt_x = target.tilt_x
-                interim.tilt_y = target.tilt_y
-
-            self.move_stage_absolute(interim, drive_type, wait=True)
+        if target_pos is not None:
+            # We enforce that if position is provided, it must be complete (X and Y)
+            # or the driver handles partials. Here we pass what we have.
+            x_val = target_pos.x if target_pos.x is not None else 0.0
+            y_val = target_pos.y if target_pos.y is not None else 0.0
+            self.set_aperture_position(a_id, x_val, y_val)
