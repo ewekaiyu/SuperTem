@@ -2253,6 +2253,7 @@ class ProjectionSystemSettings:
     """
     enabled: Optional[bool] = None
     default_projection: Optional[ProjectionSettings] = None
+    available_optical_modes: Optional[List[str]] = None
 
     # Limits
     camera_length_limits: Optional[Tuple["Quantity", "Quantity"]] = None
@@ -2272,12 +2273,18 @@ class ProjectionSystemSettings:
         self.enabled = p.bool(self.enabled, "enabled", default=True)
         self.default_projection = p.model(ProjectionSettings, self.default_projection, "default_projection",
                                           default=ProjectionSettings(_mode=p.mode))
+        self.available_optical_modes = p.list_str(self.available_optical_modes, "available_optical_modes")
         self.camera_length_limits = p.pair_qty(self.camera_length_limits, "camera_length_limits", Units.MM)
         self.magnification_limits = p.pair_int(self.magnification_limits, "magnification_limits")
         self.defocus_limits = p.pair_qty(self.defocus_limits, "defocus_limits", Units.NM)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
+        if self.default_projection and self.default_projection.optical_mode:
+            if self.available_optical_modes:
+                v.check(self.default_projection.optical_mode in self.available_optical_modes,
+                        "default_projection.optical_mode",
+                        f"Default mode '{self.default_projection.optical_mode}' not in {self.available_optical_modes}")
         # Standard range logic (simplified for brevity)
         if self.camera_length_limits:
             mn, mx = self.camera_length_limits
@@ -2286,6 +2293,11 @@ class ProjectionSystemSettings:
 
     def is_safe_projection(self, target: ProjectionSettings) -> SafetyCheck:
         reasons = []
+
+        if target.optical_mode and self.available_optical_modes:
+            if target.optical_mode not in self.available_optical_modes:
+                reasons.append(
+                    f"Optical mode '{target.optical_mode}' not supported. Available: {self.available_optical_modes}")
 
         # Check Diffraction Limits
         if target.optical_mode == "DIFFRACTION" and target.camera_length is not None:
@@ -3104,6 +3116,132 @@ class Aperture:
         })
 
 @dataclass
+class ApertureCapabilities:
+    """
+    Hardware limits and features for a specific aperture mechanism.
+    """
+    aperture_id: Optional[str] = None
+
+    # --- Mechanical Features ---
+    can_insert: Optional[bool] = None  # False = Permanently in/out (no motor)
+    can_align: Optional[bool] = None  # False = Fixed position (no XY motors)
+    can_select_size: Optional[bool] = None  # False = Fixed hole size
+
+    # --- Configuration ---
+    # List of human-readable labels for the holes (e.g. ["10 um", "50 um"])
+    # The valid size_index range is [0, len(available_sizes) - 1]
+    available_sizes: Optional[List[str]] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ApertureCapabilities")
+        self.aperture_id = p.id(self.aperture_id, "aperture_id")
+
+        # Default features to True unless explicitly disabled
+        self.can_insert = p.bool(self.can_insert, "can_insert", default=True)
+        self.can_align = p.bool(self.can_align, "can_align", default=True)
+        self.can_select_size = p.bool(self.can_select_size, "can_select_size", default=True)
+
+        self.available_sizes = p.list_str(self.available_sizes, "available_sizes")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        return True  # Basic typing handled by parser
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureCapabilities":
+        return _auto_from_dict(ApertureCapabilities, d, mode)
+
+
+@dataclass
+class ApertureSystemSettings:
+    """
+    Registry of installed apertures and their capabilities.
+    """
+    enabled: Optional[bool] = None
+
+    # Registry: Mapps ID -> Capabilities (Parallel to detector_system.capabilities_by_id)
+    capabilities_by_id: Optional[Dict[str, ApertureCapabilities]] = None
+
+    # Helper list for quick lookups (Parallel to detector_system.available_detector_ids)
+    available_aperture_ids: Optional[List[str]] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "ApertureSystemSettings")
+        self.enabled = p.bool(self.enabled, "enabled", default=True)
+
+        # Consistent Map Parsing
+        self.capabilities_by_id = p.map_model(ApertureCapabilities, self.capabilities_by_id,
+                                              "capabilities_by_id", id_field="aperture_id")
+
+        self.available_aperture_ids = p.list_str(self.available_aperture_ids, "available_aperture_ids")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        v.check_nested_map(self.capabilities_by_id)
+
+        # Consistency Check: Ensure available_ids match the map keys
+        if self.available_aperture_ids and self.capabilities_by_id:
+            known_keys = set(self.capabilities_by_id.keys())
+            for aid in self.available_aperture_ids:
+                if aid not in known_keys:
+                    v.check(False, f"available_aperture_ids.{aid}",
+                            f"ID '{aid}' listed in available_ids but missing from capabilities_by_id")
+
+        return v.valid
+
+    def is_supported(self, target: Aperture) -> SafetyCheck:
+        """
+        Validates if the target aperture state is supported by the hardware.
+        """
+        reasons = []
+
+        # 1. ID Check
+        if not target.aperture_id:
+            return SafetyCheck.failure("Target aperture has no ID")
+
+        if not self.capabilities_by_id or target.aperture_id not in self.capabilities_by_id:
+            if self.capabilities_by_id is not None:
+                reasons.append(
+                    f"Aperture ID '{target.aperture_id}' unknown. Available: {list(self.capabilities_by_id.keys())}")
+            return SafetyCheck(allowed=False, reasons=reasons)
+
+        caps = self.capabilities_by_id[target.aperture_id]
+
+        # 2. Capability Checks
+        if target.inserted is not None and caps.can_insert is False:
+            reasons.append(f"Aperture '{target.aperture_id}' does not support insertion/retraction.")
+
+        if target.position is not None and caps.can_align is False:
+            reasons.append(f"Aperture '{target.aperture_id}' does not support alignment (fixed position).")
+
+        if target.size_index is not None:
+            if caps.can_select_size is False:
+                reasons.append(f"Aperture '{target.aperture_id}' has fixed size.")
+            elif caps.available_sizes:
+                max_idx = len(caps.available_sizes) - 1
+                if target.size_index < 0 or target.size_index > max_idx:
+                    reasons.append(
+                        f"Size index {target.size_index} out of range for '{target.aperture_id}' (Max: {max_idx})")
+
+        return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "ApertureSystemSettings":
+        return _auto_from_dict(ApertureSystemSettings, d, mode)
+
+
+@dataclass
 class MicroscopeState:
     """
     Comprehensive snapshot of the microscope telemetry at a specific timestamp.
@@ -3509,6 +3647,7 @@ class SystemSettings:
     projection_system: Optional[ProjectionSystemSettings] = None
     scan_system: Optional[ScanSystemSettings] = None  # <--- NEW
     detector_system: Optional[DetectorSystemSettings] = None
+    aperture_system: Optional[ApertureSystemSettings] = None
     info: Optional[SystemInfo] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
@@ -3525,6 +3664,8 @@ class SystemSettings:
                                    default=ScanSystemSettings(_mode=p.mode))
         self.detector_system = p.model(DetectorSystemSettings, self.detector_system, "detector_system",
                                        default=DetectorSystemSettings(_mode=p.mode))
+        self.aperture_system = p.model(ApertureSystemSettings, self.aperture_system, "aperture_system",
+                                       default=ApertureSystemSettings(_mode=p.mode))
         self.info = p.model(SystemInfo, self.info, "info", default=SystemInfo(_mode=p.mode))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
