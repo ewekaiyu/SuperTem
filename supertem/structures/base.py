@@ -1648,7 +1648,7 @@ class HolderCapabilities:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "HolderCapabilities")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.holder_id = p.id(self.holder_id, "holder_id")
         self.model = p.str(self.model, "model")
 
@@ -1679,6 +1679,7 @@ class StageSystemSettings:
     Configuration for the Stage Subsystem (Goniometer).
     """
     enabled: Optional[bool] = None
+    default_position: Optional[StagePosition] = None
 
     # --- System Capabilities ---
     can_x: Optional[bool] = None
@@ -1725,9 +1726,10 @@ class StageSystemSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "StageSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
-
+        self.default_position = p.model(StagePosition, self.default_position, "default_position",
+                                        default=StagePosition(_mode=p.mode))
         self.can_x = p.bool(self.can_x, "can_x", default=True)
         self.can_y = p.bool(self.can_y, "can_y", default=True)
         self.can_z = p.bool(self.can_z, "can_z", default=True)
@@ -2858,6 +2860,7 @@ class ScanSystemSettings:
             None Behavior: Preserved as None (Unlimited).
     """
     enabled: Optional[bool] = None
+    default_scan: Optional[ScanSettings] = None
 
     # --- Capabilities ---
     available_scan_modes: Optional[List[str]] = None  # e.g. ["SPOT", "FULL_FRAME"]
@@ -2879,6 +2882,8 @@ class ScanSystemSettings:
     def __post_init__(self):
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
+        self.default_scan = p.model(ScanSettings, self.default_scan, "default_scan",
+                                    default=ScanSettings(_mode=p.mode))
         self.available_scan_modes = p.list_str(self.available_scan_modes, "available_scan_modes")
         self.pixel_dwell_time_limits = p.pair_qty(self.pixel_dwell_time_limits, "pixel_dwell_time_limits", Units.US)
         self.flyback_time_limits = p.pair_qty(self.flyback_time_limits, "flyback_time_limits", Units.US)
