@@ -1941,6 +1941,8 @@ class BeamSettings:
            leaving voltage and alignments untouched.
     """
     voltage: Optional["Quantity"] = None
+    mode: Optional[str] = None  # "TEM", "STEM"
+    probe_mode: Optional[str] = None  # "Microprobe", "Nanoprobe"
     beam_current: Optional["Quantity"] = None
     emission_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
@@ -1965,6 +1967,8 @@ class BeamSettings:
     def __post_init__(self):
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.voltage = p.qty(self.voltage, "voltage", Units.KV)
+        self.mode = p.str(self.mode, "mode")
+        self.probe_mode = p.str(self.probe_mode, "probe_mode")
         self.beam_current = p.qty(self.beam_current, "beam_current", Units.NA)
         self.emission_current = p.qty(self.emission_current, "emission_current", Units.UA)
         self.spot_size = p.int(self.spot_size, "spot_size")
@@ -2025,6 +2029,8 @@ class BeamSystemSettings:
     beam_current_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     spot_size_limits: Optional[Tuple[int, int]] = None
     convergence_angle_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    available_modes: Optional[List[str]] = None
+    available_probe_modes: Optional[List[str]] = None
 
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
@@ -2044,10 +2050,24 @@ class BeamSystemSettings:
         self.convergence_angle_limits = p.pair_qty(self.convergence_angle_limits, "convergence_angle_limits",
                                                    Units.MRAD)
         self.default_beam = p.model(BeamSettings, self.default_beam, "default_beam", default=BeamSettings(_mode=p.mode))
+        self.available_modes = p.list_str(self.available_modes, "available_modes")
+        self.available_probe_modes = p.list_str(self.available_probe_modes, "available_probe_modes")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_nested(self.default_beam)
+        if self.default_beam:
+            if self.available_modes and self.default_beam.mode:
+                v.check(self.default_beam.mode in self.available_modes,
+                        "default_beam.mode",
+                        f"Default mode '{self.default_beam.mode}' not in {self.available_modes}",
+                        heal=lambda: setattr(self.default_beam, 'mode', self.available_modes[0]))
+
+            if self.available_probe_modes and self.default_beam.probe_mode:
+                v.check(self.default_beam.probe_mode in self.available_probe_modes,
+                        "default_beam.probe_mode",
+                        f"Default probe '{self.default_beam.probe_mode}' not in {self.available_probe_modes}",
+                        heal=lambda: setattr(self.default_beam, 'probe_mode', self.available_probe_modes[0]))
 
         def _check_range(rng, name):
             if not rng: return
@@ -2079,6 +2099,13 @@ class BeamSystemSettings:
         Runtime Gatekeeper: Checks if a target beam configuration respects system limits.
         """
         reasons = []
+        if target.mode and self.available_modes:
+            if target.mode not in self.available_modes:
+                reasons.append(f"Mode '{target.mode}' not supported {self.available_modes}")
+
+        if target.probe_mode and self.available_probe_modes:
+            if target.probe_mode not in self.available_probe_modes:
+                reasons.append(f"Probe mode '{target.probe_mode}' not supported {self.available_probe_modes}")
 
         def _check(val, limit_tuple, name):
             if val is not None and limit_tuple is not None:
