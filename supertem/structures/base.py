@@ -3054,7 +3054,7 @@ class VacuumSettings:
         })
 
 @dataclass
-class Aperture:
+class ApertureSettings:
     """
     Physical aperture status or a request to modify insertion/size.
 
@@ -3110,8 +3110,8 @@ class Aperture:
         return _auto_to_dict(self)
 
     @staticmethod
-    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Aperture":
-        return _auto_from_dict(Aperture, d, mode, alias_map={
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "ApertureSettings":
+        return _auto_from_dict(ApertureSettings, d, mode, alias_map={
             "aperture_id": "id"
         })
 
@@ -3136,7 +3136,7 @@ class ApertureCapabilities:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ApertureCapabilities")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.aperture_id = p.id(self.aperture_id, "aperture_id")
 
         # Default features to True unless explicitly disabled
@@ -3164,22 +3164,30 @@ class ApertureSystemSettings:
     """
     enabled: Optional[bool] = None
 
-    # Registry: Mapps ID -> Capabilities (Parallel to detector_system.capabilities_by_id)
+    # Registry: Map ID -> Capabilities (Hardware limits)
     capabilities_by_id: Optional[Dict[str, ApertureCapabilities]] = None
 
-    # Helper list for quick lookups (Parallel to detector_system.available_detector_ids)
+    # --- NEW: Registry of Default States ---
+    # Map ID -> Default State (e.g. {"condenser": Aperture(size_index=2)})
+    defaults_by_id: Optional[Dict[str, ApertureSettings]] = None
+
+    # Helper list for quick lookups
     available_aperture_ids: Optional[List[str]] = None
 
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ApertureSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
 
-        # Consistent Map Parsing
+        # Parse Capabilities Map
         self.capabilities_by_id = p.map_model(ApertureCapabilities, self.capabilities_by_id,
                                               "capabilities_by_id", id_field="aperture_id")
+
+        # --- NEW: Parse Defaults Map ---
+        self.defaults_by_id = p.map_model(ApertureSettings, self.defaults_by_id,
+                                          "defaults_by_id", id_field="aperture_id")
 
         self.available_aperture_ids = p.list_str(self.available_aperture_ids, "available_aperture_ids")
 
@@ -3187,17 +3195,29 @@ class ApertureSystemSettings:
         v = Validator(self, mode)
         v.check_nested_map(self.capabilities_by_id)
 
-        # Consistency Check: Ensure available_ids match the map keys
-        if self.available_aperture_ids and self.capabilities_by_id:
-            known_keys = set(self.capabilities_by_id.keys())
+        # --- NEW: Validate Defaults Integrity ---
+        v.check_nested_map(self.defaults_by_id)
+
+        # Consistency Check: Ensure everything mentioned exists in capabilities
+        if self.available_aperture_ids:
+            known = set(self.capabilities_by_id.keys()) if self.capabilities_by_id else set()
+
+            # 1. Check Availability List
             for aid in self.available_aperture_ids:
-                if aid not in known_keys:
+                if aid not in known:
                     v.check(False, f"available_aperture_ids.{aid}",
-                            f"ID '{aid}' listed in available_ids but missing from capabilities_by_id")
+                            f"ID '{aid}' listed in available_ids but missing from capabilities")
+
+            # 2. Check Defaults (NEW)
+            if self.defaults_by_id:
+                for aid in self.defaults_by_id.keys():
+                    if aid not in known:
+                        v.check(False, f"defaults_by_id.{aid}",
+                                f"Default settings defined for unknown aperture ID '{aid}'")
 
         return v.valid
 
-    def is_supported(self, target: Aperture) -> SafetyCheck:
+    def is_supported(self, target: ApertureSettings) -> SafetyCheck:
         """
         Validates if the target aperture state is supported by the hardware.
         """
@@ -3208,6 +3228,7 @@ class ApertureSystemSettings:
             return SafetyCheck.failure("Target aperture has no ID")
 
         if not self.capabilities_by_id or target.aperture_id not in self.capabilities_by_id:
+            # If we have a registry, and this ID isn't in it:
             if self.capabilities_by_id is not None:
                 reasons.append(
                     f"Aperture ID '{target.aperture_id}' unknown. Available: {list(self.capabilities_by_id.keys())}")
@@ -3260,7 +3281,7 @@ class MicroscopeState:
         projection (Optional[ProjectionSettings]): Current imaging state.
         scan (Optional[ScanSettings]): Current raster state.
         vacuum (Optional[VacuumSettings]): Current vacuum state.
-        apertures (Optional[Dict[str, Aperture]]): State of all apertures.
+        apertures (Optional[Dict[str, ApertureSettings]]): State of all apertures.
         detectors (Optional[Dict[str, DetectorSettings]]): State of all cameras.
         active_detector_ids (Optional[List[str]]): List of currently active cameras.
         primary_detector_id (Optional[str]): The main camera in use.
@@ -3272,7 +3293,7 @@ class MicroscopeState:
     projection: Optional[ProjectionSettings] = None  # --- ADDED ---
     scan: Optional[ScanSettings] = None
     vacuum: Optional[VacuumSettings] = None
-    apertures: Optional[Dict[str, Aperture]] = None
+    apertures: Optional[Dict[str, ApertureSettings]] = None
     detectors: Optional[Dict[str, DetectorSettings]] = None
     active_detector_ids: Optional[List[str]] = None
     primary_detector_id: Optional[str] = None
@@ -3291,7 +3312,7 @@ class MicroscopeState:
                                   default=ProjectionSettings(_mode=p.mode))
         self.scan = p.model(ScanSettings, self.scan, "scan", default=ScanSettings(_mode=p.mode))
         self.vacuum = p.model(VacuumSettings, self.vacuum, "vacuum", default=VacuumSettings(_mode=p.mode))
-        self.apertures = p.map_model(Aperture, self.apertures, "apertures", "aperture_id")
+        self.apertures = p.map_model(ApertureSettings, self.apertures, "apertures", "aperture_id")
         self.detectors = p.map_model(DetectorSettings, self.detectors, "detectors", "detector_id")
         self.active_detector_ids = p.list_str(self.active_detector_ids, "active_detector_ids")
         self.primary_detector_id = p.id(self.primary_detector_id, "primary_detector_id")
@@ -4090,7 +4111,7 @@ class ApertureControlRequest:
             None Behavior: Defaulted to False.
     """
     aperture_id: Optional[str] = None
-    target: Optional[Aperture] = None
+    target: Optional[ApertureSettings] = None
     relative: Optional[bool] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
@@ -4099,7 +4120,7 @@ class ApertureControlRequest:
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.aperture_id = p.id(self.aperture_id, "aperture_id")
         self.relative = p.bool(self.relative, "relative", default=False)
-        self.target = p.model(Aperture, self.target, "target", default=Aperture(_mode=p.mode))
+        self.target = p.model(ApertureSettings, self.target, "target", default=ApertureSettings(_mode=p.mode))
         if self.aperture_id is None and self.target.aperture_id is not None:
             self.aperture_id = self.target.aperture_id
         elif self.target.aperture_id is None and self.aperture_id is not None:
