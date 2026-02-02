@@ -1415,9 +1415,7 @@ class Point:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "Point")
-        # Category C/D: Preserve None (Intent/State pattern)
-        # We REMOVED default=0.0 to prevent accidental zeroing of axes
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.x = p.float(self.x, "x", default=None)
         self.y = p.float(self.y, "y", default=None)
         self.z = p.float(self.z, "z", default=None)
@@ -1425,7 +1423,6 @@ class Point:
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        # Only validate finite-ness if a value is actually present
         if self.x is not None:
             v.check_finite(self.x, "coordinates.x", reset_to=0.0)
         if self.y is not None:
@@ -1440,7 +1437,6 @@ class Point:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.LENIENT) -> "Point":
         if isinstance(d, (list, tuple)) and len(d) in (2, 3):
-            # Map list input to x, y, (z)
             return Point(
                 x=d[0],
                 y=d[1],
@@ -1472,8 +1468,7 @@ class ROI:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ROI")
-        # Category A: Apply Defaults
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.x = p.int(self.x, "x", default=0)
         self.y = p.int(self.y, "y", default=0)
         self.width = p.int(self.width, "width", default=512)
@@ -1550,8 +1545,7 @@ class StagePosition:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "StagePosition")
-        # Category C: Preserve None
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.name = p.str(self.name, "name")
         self.coordinate_system = p.str(self.coordinate_system, "coordinate_system")
         self.x = p.qty(self.x, "x", Units.NM)
@@ -1564,7 +1558,7 @@ class StagePosition:
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
-            v.check_finite(getattr(self, axis), axis)  # Default heal is no-op (preserved as None)
+            v.check_finite(getattr(self, axis), axis)
         return v.valid
 
     def __add__(self, other: 'StagePosition') -> 'StagePosition':
@@ -1689,8 +1683,7 @@ class StageSystemSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "StageSystemSettings")
-        # Category A: Apply Defaults (Booleans)
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
         self.can_x = p.bool(self.can_x, "can_x", default=False)
         self.can_y = p.bool(self.can_y, "can_y", default=False)
@@ -1698,16 +1691,12 @@ class StageSystemSettings:
         self.can_r = p.bool(self.can_r, "can_r", default=False)
         self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=False)
         self.can_tilt_y = p.bool(self.can_tilt_y, "can_tilt_y", default=False)
-
-        # Category C: Limits (If None, axis will be disabled during validation)
         self.x_limits = p.pair_qty(self.x_limits, "x_limits", Units.NM)
         self.y_limits = p.pair_qty(self.y_limits, "y_limits", Units.NM)
         self.z_limits = p.pair_qty(self.z_limits, "z_limits", Units.NM)
         self.r_limits = p.pair_qty(self.r_limits, "r_limits", Units.DEG)
         self.tilt_x_limits = p.pair_qty(self.tilt_x_limits, "tilt_x_limits", Units.DEG)
         self.tilt_y_limits = p.pair_qty(self.tilt_y_limits, "tilt_y_limits", Units.DEG)
-
-        # Category A: Apply Defaults (Safety Settings)
         self.max_step_distance = p.qty(self.max_step_distance, "max_step_distance", Units.NM,
                                        default=Q_(50000.0, Units.NM))
         self.max_step_deg = p.qty(self.max_step_deg, "max_step_deg", Units.DEG, default=Q_(1.0, Units.DEG))
@@ -1894,8 +1883,10 @@ class BeamSettings:
     """
     voltage: Optional["Quantity"] = None
     beam_current: Optional["Quantity"] = None
+    emission_current: Optional["Quantity"] = None
     spot_size: Optional[int] = None
     convergence_angle: Optional["Quantity"] = None
+    is_blanked: Optional[bool] = None
 
     # Gun/Condenser alignments
     beam_shift: Optional[Point] = None
@@ -1908,16 +1899,18 @@ class BeamSettings:
     _UNITS = {
         "voltage": Units.KV,
         "beam_current": Units.NA,
+        "emission_current": Units.UA,
         "convergence_angle": Units.MRAD
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "BeamSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.voltage = p.qty(self.voltage, "voltage", Units.KV)
         self.beam_current = p.qty(self.beam_current, "beam_current", Units.NA)
+        self.emission_current = p.qty(self.emission_current, "emission_current", Units.UA)
         self.spot_size = p.int(self.spot_size, "spot_size")
         self.convergence_angle = p.qty(self.convergence_angle, "convergence_angle", Units.MRAD)
-
+        self.is_blanked = p.bool(self.is_blanked, "is_blanked")
         self.beam_shift = p.model(Point, self.beam_shift, "beam_shift")
         self.condenser_stigmation = p.model(Point, self.condenser_stigmation, "condenser_stigmation")
         self.gun_tilt = p.model(Point, self.gun_tilt, "gun_tilt")
@@ -1929,6 +1922,7 @@ class BeamSettings:
         v.check_ge_zero(self.convergence_angle, "convergence_angle", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.voltage, "voltage", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.beam_current, "beam_current", unit_aware=True, reset_to=None)
+        v.check_ge_zero(self.emission_current, "emission_current", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.spot_size, "spot_size", reset_to=None)
 
         return v.valid
@@ -1939,7 +1933,7 @@ class BeamSettings:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "BeamSettings":
         return _auto_from_dict(BeamSettings, d, mode, alias_map={
-            "voltage": "voltage_kv", "beam_current": "beam_current_na",
+            "voltage": "voltage_kv", "beam_current": "beam_current_na", "emission_current": "emission_current_ua",
             "convergence_angle": "convergence_angle_mrad"
         })
 
@@ -1983,14 +1977,13 @@ class BeamSystemSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "BeamSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
         self.spot_size_limits = p.pair_int(self.spot_size_limits, "spot_size_limits")
         self.voltage_limits = p.pair_qty(self.voltage_limits, "voltage_limits", Units.KV)
         self.beam_current_limits = p.pair_qty(self.beam_current_limits, "beam_current_limits", Units.NA)
         self.convergence_angle_limits = p.pair_qty(self.convergence_angle_limits, "convergence_angle_limits",
                                                    Units.MRAD)
-        # Category B: Structural Default
         self.default_beam = p.model(BeamSettings, self.default_beam, "default_beam", default=BeamSettings(_mode=p.mode))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -2111,13 +2104,12 @@ class ProjectionSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ProjectionSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.optical_mode = p.str(self.optical_mode, "optical_mode")
         self.magnification = p.int(self.magnification, "magnification")
         self.defocus = p.qty(self.defocus, "defocus", Units.NM)
         self.camera_length = p.qty(self.camera_length, "camera_length", Units.MM)
         self.screen_position = p.str(self.screen_position, "screen_position")
-
         self.objective_stigmation = p.model(Point, self.objective_stigmation, "objective_stigmation")
         self.image_shift = p.model(Point, self.image_shift, "image_shift")
         self.diffraction_shift = p.model(Point, self.diffraction_shift, "diffraction_shift")
@@ -2190,11 +2182,10 @@ class ProjectionSystemSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ProjectionSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
         self.default_projection = p.model(ProjectionSettings, self.default_projection, "default_projection",
                                           default=ProjectionSettings(_mode=p.mode))
-
         self.camera_length_limits = p.pair_qty(self.camera_length_limits, "camera_length_limits", Units.MM)
         self.magnification_limits = p.pair_int(self.magnification_limits, "magnification_limits")
         self.defocus_limits = p.pair_qty(self.defocus_limits, "defocus_limits", Units.NM)
@@ -2311,7 +2302,7 @@ class DetectorSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "DetectorSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.detector_id = p.id(self.detector_id, "detector_id")
         self.binning_index = p.int(self.binning_index, "binning_index")
         self.binning_xy = p.pair_int(self.binning_xy, "binning_xy")
@@ -2322,10 +2313,7 @@ class DetectorSettings:
         self.offset_index = p.int(self.offset_index, "offset_index")
         self.digital_rotation = p.qty(self.digital_rotation, "digital_rotation", Units.DEG)
         self.exposure = p.qty(self.exposure, "exposure", Units.MS)
-        # ROI is preserved as None if missing (tristate)
         self.roi = p.model(ROI, self.roi, "roi", default=None)
-
-        # --- NEW PARSERS ---
         self.readout_mode = p.str(self.readout_mode, "readout_mode")
         self.shutter_mode = p.str(self.shutter_mode, "shutter_mode")
         self.save_frames = p.bool(self.save_frames, "save_frames")
@@ -2432,7 +2420,7 @@ class DetectorCapabilities:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "DetectorCapabilities")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.can_binning = p.bool(self.can_binning, "can_binning")
         self.can_gain = p.bool(self.can_gain, "can_gain")
         self.can_offset = p.bool(self.can_offset, "can_offset")
@@ -2641,7 +2629,7 @@ class DetectorSystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "DetectorSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
         self.default_detector_id = p.id(self.default_detector_id, "default_detector_id")
         self.available_detector_ids = list(
@@ -2749,13 +2737,10 @@ class ScanSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ScanSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.scan_mode = p.str(self.scan_mode, "scan_mode")
-
-        # --- ADDED: Parsers ---
         self.width_px = p.int(self.width_px, "width_px")
         self.height_px = p.int(self.height_px, "height_px")
-
         self.pixel_dwell_time = p.qty(self.pixel_dwell_time, "pixel_dwell_time", Units.US)
         self.flyback_time = p.qty(self.flyback_time, "flyback_time", Units.US)
         self.scan_rotation = p.qty(self.scan_rotation, "scan_rotation", Units.DEG)
@@ -2835,10 +2820,9 @@ class ScanSystemSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ScanSystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.enabled = p.bool(self.enabled, "enabled", default=True)
         self.available_scan_modes = p.list_str(self.available_scan_modes, "available_scan_modes")
-
         self.pixel_dwell_time_limits = p.pair_qty(self.pixel_dwell_time_limits, "pixel_dwell_time_limits", Units.US)
         self.flyback_time_limits = p.pair_qty(self.flyback_time_limits, "flyback_time_limits", Units.US)
         self.scan_rotation_limits = p.pair_qty(self.scan_rotation_limits, "scan_rotation_limits", Units.DEG)
@@ -2941,11 +2925,10 @@ class VacuumSettings:
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "VacuumSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.column_valve_state = p.str(self.column_valve_state, "column_valve_state")
         self.gun_valve_state = p.str(self.gun_valve_state, "gun_valve_state")
         self.turbo_pump_state = p.str(self.turbo_pump_state, "turbo_pump_state")
-
         self.column_pressure = p.qty(self.column_pressure, "column_pressure", Units.PA)
         self.gun_pressure = p.qty(self.gun_pressure, "gun_pressure", Units.PA)
         self.buffer_tank_pressure = p.qty(self.buffer_tank_pressure, "buffer_tank_pressure", Units.PA)
@@ -2998,15 +2981,17 @@ class Aperture:
     aperture_id: Optional[str] = None
     inserted: Optional[bool] = None
     size_index: Optional[int] = None
+    size_label: Optional[str] = None
     position: Optional[Point] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "Aperture")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.aperture_id = p.id(self.aperture_id, "aperture_id")
         self.inserted = p.bool(self.inserted, "inserted")
         self.size_index = p.int(self.size_index, "size_index")
+        self.size_label = p.str(self.size_label, "size_label")
         self.position = p.model(Point, self.position, "position")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -3068,23 +3053,21 @@ class MicroscopeState:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "MicroscopeState")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.timestamp = p.str(self.timestamp, "timestamp",
                                default=datetime.datetime.now(datetime.timezone.utc).isoformat())
         self.mode = p.str(self.mode, "mode")
-        self.primary_detector_id = p.id(self.primary_detector_id, "primary_detector_id")
-        self.active_detector_ids = p.list_str(self.active_detector_ids, "active_detector_ids")
-        # Category B: Structural Defaults
         self.stage_position = p.model(StagePosition, self.stage_position, "stage_position",
                                       default=StagePosition(_mode=p.mode))
         self.beam = p.model(BeamSettings, self.beam, "beam", default=BeamSettings(_mode=p.mode))
         self.projection = p.model(ProjectionSettings, self.projection, "projection",
                                   default=ProjectionSettings(_mode=p.mode))
         self.scan = p.model(ScanSettings, self.scan, "scan", default=ScanSettings(_mode=p.mode))
-        self.vacuum = p.model(VacuumSettings, self.vacuum, "vacuum", default=VacuumSettings(_mode=p.mode))  # <--- NEW
-
+        self.vacuum = p.model(VacuumSettings, self.vacuum, "vacuum", default=VacuumSettings(_mode=p.mode))
         self.apertures = p.map_model(Aperture, self.apertures, "apertures", "aperture_id")
         self.detectors = p.map_model(DetectorSettings, self.detectors, "detectors", "detector_id")
+        self.active_detector_ids = p.list_str(self.active_detector_ids, "active_detector_ids")
+        self.primary_detector_id = p.id(self.primary_detector_id, "primary_detector_id")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
@@ -3092,7 +3075,7 @@ class MicroscopeState:
         v.check_nested(self.beam)
         v.check_nested(self.projection)
         v.check_nested(self.scan)
-        v.check_nested(self.vacuum)  # <--- NEW
+        v.check_nested(self.vacuum)
         v.check_nested_map(self.apertures)
         v.check_nested_map(self.detectors)
 
@@ -3148,7 +3131,7 @@ class MicroscopeImageMetadata:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "MicroscopeImageMetadata")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.version = p.str(self.version, "version", default=SCHEMA_VERSION)
         self.created_at = p.str(self.created_at, "created_at",
                                 default=datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -3336,7 +3319,7 @@ class ImageOutputSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ImageOutputSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         _fmt = p.str(self.file_format, "file_format")
         self.file_format = (_fmt.lower() if _fmt else "tiff")
         self.path = p.str(self.path, "path")
@@ -3386,7 +3369,7 @@ class SystemInfo:
     _mode: ParseMode = field(default=ParseMode.LENIENT, repr=False, compare=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "SystemInfo")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.name = p.str(self.name, "name", default="Unknown")
         self.ip_address = p.str(self.ip_address, "ip_address", default="Unknown")
         self.manufacturer = p.str(self.manufacturer, "manufacturer", default="Unknown")
@@ -3442,18 +3425,15 @@ class SystemSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "SystemSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.stage_system = p.model(StageSystemSettings, self.stage_system, "stage_system",
                                     default=StageSystemSettings(_mode=p.mode))
         self.beam_system = p.model(BeamSystemSettings, self.beam_system, "beam_system",
                                    default=BeamSystemSettings(_mode=p.mode))
         self.projection_system = p.model(ProjectionSystemSettings, self.projection_system, "projection_system",
                                          default=ProjectionSystemSettings(_mode=p.mode))
-
-        # --- NEW PARSER ---
         self.scan_system = p.model(ScanSystemSettings, self.scan_system, "scan_system",
                                    default=ScanSystemSettings(_mode=p.mode))
-
         self.detector_system = p.model(DetectorSystemSettings, self.detector_system, "detector_system",
                                        default=DetectorSystemSettings(_mode=p.mode))
         self.info = p.model(SystemInfo, self.info, "info", default=SystemInfo(_mode=p.mode))
@@ -3498,7 +3478,7 @@ class MicroscopeSettings:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "MicroscopeSettings")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.system = p.model(SystemSettings, self.system, "system", default=SystemSettings(_mode=p.mode))
         self.image = p.model(ImageOutputSettings, self.image, "image", default=ImageOutputSettings(_mode=p.mode))
         self.protocol = p.dict(self.protocol, "protocol", default={"name": "demo"})
@@ -3555,7 +3535,7 @@ class StageMoveRequest:
     _UNITS = {"settle_time": Units.SEC}
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "StageMoveRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.relative = p.bool(self.relative, "relative", default=False)
         self.drive_type = p.str(self.drive_type, "drive_type", default=StageDriveType.DEFAULT.value)
         self.backlash_correction = p.bool(self.backlash_correction, "backlash_correction", default=True)
@@ -3618,7 +3598,7 @@ class StageControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "StageControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.action = p.str(self.action, "action")
         self.axes = p.list_str(self.axes, "axes")
 
@@ -3669,15 +3649,12 @@ class DetectorControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "DetectorControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.detector_id = p.id(self.detector_id, "detector_id")
         self.target = p.model(DetectorSettings, self.target, "target", default=DetectorSettings(_mode=p.mode))
         self.action = p.str(self.action, "action")
-
-        # Sync: If settings has an ID but request doesn't, bubble it up
         if self.target.detector_id and not self.detector_id:
             self.detector_id = self.target.detector_id
-        # Sync: If request has ID, push it down to settings for consistency
         elif self.detector_id and not self.target.detector_id:
             self.target.detector_id = self.detector_id
 
@@ -3723,7 +3700,7 @@ class BeamControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "BeamControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.target = p.model(BeamSettings, self.target, "target", default=BeamSettings(_mode=p.mode))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -3757,7 +3734,7 @@ class ProjectionControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ProjectionControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.target = p.model(ProjectionSettings, self.target, "target", default=ProjectionSettings(_mode=p.mode))
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
@@ -3800,8 +3777,7 @@ class ScanControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        # Renamed from ScanRequest to ScanControlRequest
-        p = FieldParser(self, self._mode, "ScanControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.action = p.str(self.action, "action")
         self.target = p.model(ScanSettings, self.target, "target", default=ScanSettings(_mode=p.mode))
 
@@ -3847,7 +3823,7 @@ class VacuumControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "VacuumControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.target = p.model(VacuumSettings, self.target, "target", default=VacuumSettings(_mode=p.mode))
         self.force = p.bool(self.force, "force", default=False)
 
@@ -3890,7 +3866,7 @@ class ApertureControlRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "ApertureControlRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.aperture_id = p.id(self.aperture_id, "aperture_id")
         self.relative = p.bool(self.relative, "relative", default=False)
         self.target = p.model(Aperture, self.target, "target", default=Aperture(_mode=p.mode))
@@ -3957,11 +3933,10 @@ class AcquisitionRequest:
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, "AcquisitionRequest")
+        p = FieldParser(self, self._mode, self.__class__.__name__)
         self.detector_id = p.id(self.detector_id, "detector_id")
         self.detector = p.model(DetectorSettings, self.detector, "detector", default=DetectorSettings(_mode=p.mode))
         self.image = p.model(ImageOutputSettings, self.image, "image", default=ImageOutputSettings(_mode=p.mode))
-        # Sync Logic
         if self.detector_id is None and self.detector.detector_id is not None:
             self.detector_id = self.detector.detector_id
         elif self.detector.detector_id is None and self.detector_id is not None:
