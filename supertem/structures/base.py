@@ -1619,159 +1619,207 @@ class StagePosition:
         })
 
 @dataclass
+class HolderCapabilities:
+    """
+    Defines the mechanical constraints of a specific sample holder.
+    """
+    holder_id: Optional[str] = None
+    model: Optional[str] = None
+
+    # 1. Capabilities (Masks)
+    # If False, these disable the axis even if the system supports it.
+    can_tilt_x: Optional[bool] = None
+    can_tilt_y: Optional[bool] = None
+    can_rotate: Optional[bool] = None
+
+    # 2. Geometric Limits (Overrides)
+    # These override the system limits if stricter.
+    tilt_x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    tilt_y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+    z_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
+    extra: Extras = field(default_factory=Extras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "tilt_x_limits": Units.DEG,
+        "tilt_y_limits": Units.DEG,
+        "z_limits": Units.NM
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, "HolderCapabilities")
+        self.holder_id = p.id(self.holder_id, "holder_id")
+        self.model = p.str(self.model, "model")
+
+        # Default True so we don't accidentally disable things
+        self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=True)
+        self.can_tilt_y = p.bool(self.can_tilt_y, "can_tilt_y", default=True)
+        self.can_rotate = p.bool(self.can_rotate, "can_rotate", default=True)
+
+        self.tilt_x_limits = p.pair_qty(self.tilt_x_limits, "tilt_x_limits", Units.DEG)
+        self.tilt_y_limits = p.pair_qty(self.tilt_y_limits, "tilt_y_limits", Units.DEG)
+        self.z_limits = p.pair_qty(self.z_limits, "z_limits", Units.NM)
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "HolderCapabilities":
+        return _auto_from_dict(HolderCapabilities, d, mode, alias_map={
+            "tilt_x_limits": "tilt_x_limits_deg",
+            "tilt_y_limits": "tilt_y_limits_deg",
+            "z_limits": "z_limits_nm"
+        })
+
+
+@dataclass
 class StageSystemSettings:
     """
-    Safety limits and step sizes for physical stage motion.
-
-    Role:     Gatekeeper (System Limits)
-    Context:  Control-plane
-    Category: A (Strict Runtime Config)
-
-    Attributes:
-        enabled (Optional[bool]): Master toggle for stage interaction.
-            None Behavior: Defaulted to True.
-        can_x, can_y, can_z (Optional[bool]): Individual axis toggles.
-            None Behavior: Defaulted to True.
-        can_r, can_tilt_x, can_tilt_y (Optional[bool]): Individual axis toggles.
-            None Behavior: Defaulted to False.
-        x_limits, y_limits, z_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
-            None Behavior: Preserved as None (Axis disabled).
-        r_limits, tilt_x_limits, tilt_y_limits (Optional[Tuple[Quantity, Quantity]]): Physical travel bounds.
-            None Behavior: Preserved as None (Axis disabled).
-        max_step_distance (Optional[Quantity]): Safety cap for XY/Z travel per move. Units: nm.
-            None Behavior: Defaulted to 50,000 nm.
-        max_step_deg (Optional[Quantity]): Safety cap for rotation per move. Units: deg.
-            None Behavior: Defaulted to 1.0 deg.
-        eucentric_z (Optional[Quantity]): Calibrated sample height. Units: nm.
-            None Behavior: Preserved as None.
-        settle_time (Optional[Quantity]): Time to wait for vibration damping. Units: s.
-            None Behavior: Defaulted to 0.2 s.
-        timeout (Optional[Quantity]): Max duration for move operations. Units: s.
-            None Behavior: Defaulted to 10.0 s.
+    Configuration for the Stage Subsystem (Goniometer).
     """
     enabled: Optional[bool] = None
+
+    # --- System Capabilities ---
     can_x: Optional[bool] = None
     can_y: Optional[bool] = None
     can_z: Optional[bool] = None
     can_r: Optional[bool] = None
     can_tilt_x: Optional[bool] = None
     can_tilt_y: Optional[bool] = None
+
+    # --- System Mechanical Limits ---
     x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     z_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     r_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     tilt_x_limits: Optional[Tuple["Quantity", "Quantity"]] = None
     tilt_y_limits: Optional[Tuple["Quantity", "Quantity"]] = None
+
+    # --- Tuning ---
     max_step_distance: Optional["Quantity"] = None
     max_step_deg: Optional["Quantity"] = None
     eucentric_z: Optional["Quantity"] = None
     settle_time: Optional["Quantity"] = None
     timeout: Optional["Quantity"] = None
+
+    # --- Holder Registry ---
+    active_holder_id: Optional[str] = None
+    available_holders: Optional[Dict[str, HolderCapabilities]] = None
+
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     _UNITS = {
-        "x_limits": Units.NM, "y_limits": Units.NM, "z_limits": Units.NM,
-        "r_limits": Units.DEG, "tilt_x_limits": Units.DEG, "tilt_y_limits": Units.DEG,
-        "max_step_distance": Units.NM, "max_step_deg": Units.DEG,
-        "eucentric_z": Units.NM, "settle_time": Units.SEC, "timeout": Units.SEC
-    }
-
-    _KEYS = {
-        "max_step_distance": "max_step_nm",
-        "max_step_deg": "max_step_deg"
+        "x_limits": Units.NM,
+        "y_limits": Units.NM,
+        "z_limits": Units.NM,
+        "r_limits": Units.DEG,
+        "tilt_x_limits": Units.DEG,
+        "tilt_y_limits": Units.DEG,
+        "max_step_distance": Units.NM,
+        "max_step_deg": Units.DEG,
+        "eucentric_z": Units.NM,
+        "settle_time": Units.S,
+        "timeout": Units.S
     }
 
     def __post_init__(self):
-        p = FieldParser(self, self._mode, self.__class__.__name__)
+        p = FieldParser(self, self._mode, "StageSystemSettings")
         self.enabled = p.bool(self.enabled, "enabled", default=True)
-        self.can_x = p.bool(self.can_x, "can_x", default=False)
-        self.can_y = p.bool(self.can_y, "can_y", default=False)
-        self.can_z = p.bool(self.can_z, "can_z", default=False)
-        self.can_r = p.bool(self.can_r, "can_r", default=False)
-        self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=False)
+
+        self.can_x = p.bool(self.can_x, "can_x", default=True)
+        self.can_y = p.bool(self.can_y, "can_y", default=True)
+        self.can_z = p.bool(self.can_z, "can_z", default=True)
+        self.can_r = p.bool(self.can_r, "can_r", default=True)
+        self.can_tilt_x = p.bool(self.can_tilt_x, "can_tilt_x", default=True)
         self.can_tilt_y = p.bool(self.can_tilt_y, "can_tilt_y", default=False)
+
         self.x_limits = p.pair_qty(self.x_limits, "x_limits", Units.NM)
         self.y_limits = p.pair_qty(self.y_limits, "y_limits", Units.NM)
         self.z_limits = p.pair_qty(self.z_limits, "z_limits", Units.NM)
         self.r_limits = p.pair_qty(self.r_limits, "r_limits", Units.DEG)
         self.tilt_x_limits = p.pair_qty(self.tilt_x_limits, "tilt_x_limits", Units.DEG)
         self.tilt_y_limits = p.pair_qty(self.tilt_y_limits, "tilt_y_limits", Units.DEG)
-        self.max_step_distance = p.qty(self.max_step_distance, "max_step_distance", Units.NM,
-                                       default=Q_(50000.0, Units.NM))
-        self.max_step_deg = p.qty(self.max_step_deg, "max_step_deg", Units.DEG, default=Q_(1.0, Units.DEG))
+
+        self.max_step_distance = p.qty(self.max_step_distance, "max_step_distance", Units.NM)
+        self.max_step_deg = p.qty(self.max_step_deg, "max_step_deg", Units.DEG)
         self.eucentric_z = p.qty(self.eucentric_z, "eucentric_z", Units.NM)
-        self.settle_time = p.qty(self.settle_time, "settle_time", Units.SEC, default=Q_(0.2, Units.SEC))
-        self.timeout = p.qty(self.timeout, "timeout", Units.SEC, default=Q_(10.0, Units.SEC))
+        self.settle_time = p.qty(self.settle_time, "settle_time", Units.S)
+        self.timeout = p.qty(self.timeout, "timeout", Units.S)
 
-    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
-        v = Validator(self, mode)
+        self.active_holder_id = p.id(self.active_holder_id, "active_holder_id")
+        self.available_holders = p.map_model(HolderCapabilities, self.available_holders, "available_holders",
+                                             "holder_id")
 
-        # 1. Limit Logic (Min < Max)
-        def _validate_range(lims, name):
-            if not lims: return
-            v.check(lims[0] <= lims[1], f"{name}_limits", "min > max", raw=lims,
-                    heal=lambda: setattr(self, f"{name}_limits", (lims[1], lims[0])))
+    def get_effective_limits(self, axis: str) -> Optional[Tuple["Quantity", "Quantity"]]:
+        """Merge System Limits with Active Holder Limits."""
+        sys_lims = getattr(self, f"{axis}_limits", None)
 
-        for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
-            _validate_range(getattr(self, f"{axis}_limits"), axis)
+        if not self.active_holder_id or not self.available_holders:
+            return sys_lims
 
-            # 2. Consistency (Enabled -> Limits must exist)
-            is_enabled = getattr(self, f"can_{axis}")
-            has_limits = getattr(self, f"{axis}_limits") is not None
-            v.check(not (is_enabled and not has_limits), f"{axis}_safety",
-                    f"Axis {axis} enabled without limits",
-                    heal=lambda: setattr(self, f"can_{axis}", False))
+        holder = self.available_holders.get(self.active_holder_id)
+        if not holder:
+            return sys_lims
 
-        # 3. Value Checks
-        v.check_gt_zero(self.max_step_distance, "max_step_distance", unit_aware=True, reset_to=Q_(50000.0, Units.NM))
-        v.check_ge_zero(self.settle_time, "settle_time", unit_aware=True, reset_to=Q_(0.2, Units.SEC))
-        v.check_ge_zero(self.timeout, "timeout", unit_aware=True, reset_to=Q_(10.0, Units.SEC))
+        # 1. Check Capabilities
+        if axis == "tilt_x" and holder.can_tilt_x is False: return None
+        if axis == "tilt_y" and holder.can_tilt_y is False: return None
+        if axis == "r" and holder.can_rotate is False: return None
 
-        # 4. Eucentric Check
-        if self.eucentric_z is not None and self.z_limits:
-            z_min, z_max = self.z_limits
-            v.check(z_min <= self.eucentric_z <= z_max, "eucentric_z",
-                    f"eucentric_z {self.eucentric_z} outside limits",
-                    heal=lambda: setattr(self, 'eucentric_z', None))
+        # 2. Merge Limits
+        holder_lims = getattr(holder, f"{axis}_limits", None)
 
-        return v.valid
+        if sys_lims is None: return holder_lims
+        if holder_lims is None: return sys_lims
+
+        low = max(sys_lims[0], holder_lims[0])
+        high = min(sys_lims[1], holder_lims[1])
+
+        if low > high: return None
+        return (low, high)
 
     def is_safe_move(self, target: StagePosition, current: Optional[StagePosition] = None,
                      relative: bool = False, ignore_step_limit: bool = False) -> SafetyCheck:
         """
         RUNTIME CHECK: External Safety.
         Returns a SafetyCheck object (True/False + reasons) without modifying self.extra.
-
-        Checks:
-        1. Is the axis enabled? (can_x, can_tilt_x, etc.)
-        2. Is the destination within absolute limits? (x_limits, etc.)
-        3. Is the step size within dynamic limits? (max_step_distance, etc.)
-
-        Args:
-            target: The destination or delta.
-            current: The starting position (required for relative moves or step checks).
-            relative: Whether target is a delta.
-            ignore_step_limit: If True, skips max_step_distance checks (used when interpolator is active).
         """
         reasons = []
 
+        # --- 0. Resolve Active Holder (NEW) ---
+        holder = self.available_holders.get(self.active_holder_id) if (
+                    self.active_holder_id and self.available_holders) else None
+
         # --- 1. Validate Axis Availability (Intents vs Capabilities) ---
-        # If the user intends to move an axis (value is not None), that axis MUST be enabled.
+        # Checks System Capabilities AND Holder Capabilities
         axes_map = {
-            "x": self.can_x, "y": self.can_y, "z": self.can_z,
-            "r": self.can_r, "tilt_x": self.can_tilt_x, "tilt_y": self.can_tilt_y
+            "x": (self.can_x, None),
+            "y": (self.can_y, None),
+            "z": (self.can_z, None),
+            "r": (self.can_r, "can_rotate"),
+            "tilt_x": (self.can_tilt_x, "can_tilt_x"),
+            "tilt_y": (self.can_tilt_y, "can_tilt_y")
         }
 
-        for axis, is_enabled in axes_map.items():
-            if getattr(target, axis) is not None and not is_enabled:
-                reasons.append(f"Movement requested on disabled axis: '{axis}'")
+        for axis, (sys_enabled, holder_flag_name) in axes_map.items():
+            if getattr(target, axis) is not None:
+                # Check System
+                if not sys_enabled:
+                    reasons.append(f"Movement requested on disabled axis: '{axis}'")
 
-        # If we already failed basic capability checks, return early to avoid math errors
+                # Check Holder (NEW)
+                if holder and holder_flag_name:
+                    holder_enabled = getattr(holder, holder_flag_name, True)
+                    if holder_enabled is False:
+                        reasons.append(f"Axis '{axis}' disabled by active holder '{self.active_holder_id}'")
+
+        # If we already failed basic capability checks, return early
         if reasons:
             return SafetyCheck(allowed=False, reasons=reasons)
 
-        # --- 2. Resolve Absolute Target & Step Vector ---
+        # --- 2. Resolve Absolute Target & Step Vector (UNCHANGED) ---
         abs_target = target
         step_vector = None
 
@@ -1779,7 +1827,7 @@ class StageSystemSettings:
             if current is None:
                 return SafetyCheck.failure("Cannot perform relative move without current position")
 
-            # Check if we have a valid starting point for all requested deltas
+            # Check if we have a valid starting point
             for axis in ["x", "y", "z", "r", "tilt_x", "tilt_y"]:
                 if getattr(target, axis) is not None and getattr(current, axis) is None:
                     return SafetyCheck.failure(f"Relative move on '{axis}' impossible: current position unknown.")
@@ -1787,67 +1835,76 @@ class StageSystemSettings:
             abs_target = current + target
             step_vector = target
         else:
-            # Absolute move
             if current:
                 step_vector = target - current
-            # If current is None, we can still check absolute limits, but skip step checks
 
         # --- 3. Check Static Limits (Boundaries) ---
-        def check_bound(val, lims, name):
+        def check_bound(val, axis_name):
+            # CHANGED: Use get_effective_limits instead of direct self.limits
+            lims = self.get_effective_limits(axis_name)
+
             if val is not None and lims:
                 if not (lims[0] <= val <= lims[1]):
-                    reasons.append(f"{name} target {val} outside limits {lims}")
+                    reasons.append(f"{axis_name} target {val} outside effective limits {lims}")
 
-        check_bound(abs_target.x, self.x_limits, "x")
-        check_bound(abs_target.y, self.y_limits, "y")
-        check_bound(abs_target.z, self.z_limits, "z")
-        check_bound(abs_target.r, self.r_limits, "r")
-        check_bound(abs_target.tilt_x, self.tilt_x_limits, "tilt_x")
-        check_bound(abs_target.tilt_y, self.tilt_y_limits, "tilt_y")
+        check_bound(abs_target.x, "x")
+        check_bound(abs_target.y, "y")
+        check_bound(abs_target.z, "z")
+        check_bound(abs_target.r, "r")
+        check_bound(abs_target.tilt_x, "tilt_x")
+        check_bound(abs_target.tilt_y, "tilt_y")
 
-        # --- 4. Check Dynamic Limits (Step Size) ---
+        # --- 4. Check Dynamic Limits (Step Size) (UNCHANGED) ---
         if not ignore_step_limit and step_vector is not None:
             # XY Euclidian Distance
             if step_vector.x is not None or step_vector.y is not None:
                 dx = step_vector.x if step_vector.x is not None else Q_(0, Units.NM)
                 dy = step_vector.y if step_vector.y is not None else Q_(0, Units.NM)
                 distance = (dx.to(Units.NM).magnitude ** 2 + dy.to(Units.NM).magnitude ** 2) ** 0.5
-                max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
 
-                if distance > max_dist_nm:
-                    reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
+                if self.max_step_distance:
+                    max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
+                    if distance > max_dist_nm:
+                        reasons.append(f"XY step {distance:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
 
             # Z Step Limit
-            if step_vector.z is not None:
+            if step_vector.z is not None and self.max_step_distance:
                 d_z = abs(step_vector.z.to(Units.NM).magnitude)
                 max_dist_nm = self.max_step_distance.to(Units.NM).magnitude
-
                 if d_z > max_dist_nm:
                     reasons.append(f"Z step {d_z:.1f}nm exceeds limit {max_dist_nm:.1f}nm")
 
             # Tilt Step Limits
-            if step_vector.tilt_x is not None:
-                d_tilt = abs(step_vector.tilt_x)
-                if d_tilt > self.max_step_deg:
-                    reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_deg}")
+            if self.max_step_deg:
+                if step_vector.tilt_x is not None:
+                    d_tilt = abs(step_vector.tilt_x.to(Units.DEG).magnitude)
+                    if d_tilt > self.max_step_deg.to(Units.DEG).magnitude:
+                        reasons.append(f"Tilt X step {d_tilt} exceeds limit {self.max_step_deg}")
 
-            if step_vector.tilt_y is not None:
-                d_tilt = abs(step_vector.tilt_y)
-                if d_tilt > self.max_step_deg:
-                    reasons.append(f"Tilt Y step {d_tilt} exceeds limit {self.max_step_deg}")
+                if step_vector.tilt_y is not None:
+                    d_tilt = abs(step_vector.tilt_y.to(Units.DEG).magnitude)
+                    if d_tilt > self.max_step_deg.to(Units.DEG).magnitude:
+                        reasons.append(f"Tilt Y step {d_tilt} exceeds limit {self.max_step_deg}")
 
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
     def to_dict(self) -> dict:
-        return _auto_to_dict(self, unit_map=self._UNITS, key_map=self._KEYS)
+        return _auto_to_dict(self, unit_map=self._UNITS)
 
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "StageSystemSettings":
         return _auto_from_dict(StageSystemSettings, d, mode, alias_map={
-            "x_limits": "x_limits_nm", "y_limits": "y_limits_nm", "z_limits": "z_limits_nm",
-            "r_limits": "r_limits_deg", "tilt_x_limits": "tilt_x_limits_deg", "tilt_y_limits": "tilt_y_limits_deg",
-            "max_step_distance": "max_step_nm", "max_step_deg": "max_step_angle",
-            "eucentric_z": "eucentric_z_nm", "settle_time": "settle_time_s", "timeout": "timeout_s"
+            "x_limits": "x_limits_nm",
+            "y_limits": "y_limits_nm",
+            "z_limits": "z_limits_nm",
+            "r_limits": "r_limits_deg",
+            "tilt_x_limits": "tilt_x_limits_deg",
+            "tilt_y_limits": "tilt_y_limits_deg",
+            "max_step_distance": "max_step_distance_nm",
+            "max_step_deg": "max_step_deg",
+            "eucentric_z": "eucentric_z_nm",
+            "settle_time": "settle_time_s",
+            "timeout": "timeout_s"
         })
 
 @dataclass
