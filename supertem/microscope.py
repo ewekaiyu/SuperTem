@@ -166,7 +166,9 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 import logging
 from dataclasses import replace
-import time
+import datetime
+import os
+from pathlib import Path
 
 # Import strictly typed structures from base.py
 from supertem.structures.base import (
@@ -184,10 +186,12 @@ from supertem.structures.base import (
     DetectorSettings,
     ScanSettings,
     VacuumSettings,
-    Aperture,
+    ApertureSettings,  # CORRECTED: Was Aperture
     MicroscopeImage,
+    MicroscopeImageMetadata,
     Point,
     ROI,
+    ImageOutputSettings,
 
     # Request Objects (Intents)
     StageMoveRequest,
@@ -204,7 +208,8 @@ from supertem.structures.base import (
     Units,
     Q_,         # For Instantiation (Values)
     Quantity,   # For Type Hinting (Annotations)
-    StageDriveType
+    StageDriveType,
+    ParseMode
 )
 
 logger = logging.getLogger(__name__)
@@ -225,10 +230,9 @@ class TemMicroscope(ABC):
                       and safety policies. If None, safe defaults are used.
         """
         if settings is None:
-            # Fallback for bare initialization (not recommended for production)
             self._settings = MicroscopeSettings(
                 system=SystemSettings(),
-                _mode="lenient"
+                _mode=ParseMode.LENIENT
             )
         else:
             self._settings = settings
@@ -237,7 +241,6 @@ class TemMicroscope(ABC):
     def system_settings(self) -> SystemSettings:
         """Access the system limits and capabilities configuration."""
         return self._settings.system
-
 
     # ---------------------------------------------------------------------
     # Internal helpers (Intent summaries & Extras)
@@ -286,7 +289,7 @@ class TemMicroscope(ABC):
         return ", ".join(fields) if fields else "<empty>"
 
     @staticmethod
-    def _require_point_complete(p, name: str) -> None:
+    def _require_point_complete(p: Optional[Point], name: str) -> None:
         """Reject partially-specified Point values.
 
         For 2D coil fields (Point), we require both x and y if either is provided.
@@ -366,6 +369,7 @@ class TemMicroscope(ABC):
         a single timestamped structure matching base.py definition.
         """
         return MicroscopeState(
+            timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
             mode=self.get_mode(),
             stage_position=self.get_stage_position(),
             beam=self.get_beam_settings(),
@@ -383,17 +387,15 @@ class TemMicroscope(ABC):
     # 3. Stage Control (Motion)
     # =========================================================================
 
-    # --- Atomic Layer (Abstract) ---
-
+    # --- Atomic Layer ---
     @abstractmethod
     def get_stage_position(self) -> Optional[StagePosition]:
-        """
-        Atomic: Read current physical stage coordinates.
+        """Atomic: Read current physical stage coordinates. Returns None if unknown."""
+        pass
 
-        Returns:
-            StagePosition: Objects with x, y, z, r, tilt_x, tilt_y.
-            None: If hardware read fails.
-        """
+    @abstractmethod
+    def get_stage_coordinate_system(self) -> Optional[str]:
+        """Get the current reference frame name."""
         pass
 
     @abstractmethod
@@ -406,14 +408,12 @@ class TemMicroscope(ABC):
             tolerance_deg: float = 0.1,
             max_retries: int = 3
     ) -> None:
-        """
-        Atomic: Move stage to a specific absolute coordinate.
+        """Atomic: Move stage to a specific absolute coordinate."""
+        pass
 
-        Args:
-            target: Destination. Axes set to None (e.g., target.x=None) MUST be ignored.
-            drive_type: Hint mechanism ('piezo', 'mechanical').
-            wait: If True, block until motion completes.
-        """
+    @abstractmethod
+    def set_stage_coordinate_system(self, system_id: str) -> None:
+        """Atomic: Set the reference frame."""
         pass
 
     @abstractmethod
@@ -426,39 +426,19 @@ class TemMicroscope(ABC):
         """Atomic: Return stage to its mechanical origin/zero position."""
         pass
 
-    # --- Logic Layer (Concrete) ---
-
-    def move_stage_relative(self, delta: StagePosition,
-                            drive_type: str = "default",
-                            wait: bool = True) -> None:
-        """
-        Helper: Calculate absolute target from delta and execute move.
-        """
-        current = self.get_stage_position()
-        if current is None:
-            raise RuntimeError("Cannot perform relative move: Stage position is unknown.")
-        target = current + delta  # Vector addition handled by StagePosition
-        # We delegate to the safe mover to ensure step sizes are respected even for relative moves
-        self.safe_move_stage(target, drive_type=drive_type, wait=wait)
-
+    # --- Logic Layer ---
     def execute_stage_move(self, request: StageMoveRequest) -> None:
         """
         Orchestrator: Handle StageMoveRequest.
-
-        Features:
-        - Validates request (structure and types).
-        - Checks `SystemSettings` for safety limits (logic).
-        - Handles Relative vs Absolute logic.
-        - Uses `safe_move_stage` to interpolate large moves if needed.
+        Validates safety, handles relative logic, and interpolates large moves.
         """
         if not request.validate():
             raise ValueError(f"Invalid StageMoveRequest: {request}")
 
-        # LOG INTENT
         tgt_str = f"Target={request.target}" if not request.relative else f"Delta={request.target}"
         logger.info(f"[STAGE] Executing Move: {tgt_str} (Mode: {request.drive_type})")
 
-        # 1. Resolve Target (Absolute)
+        # 1. Resolve Absolute Target
         current = self.get_stage_position()
         target_abs = request.target
 
@@ -466,15 +446,10 @@ class TemMicroscope(ABC):
             if current is None:
                 raise RuntimeError("Relative move failed: Current stage position is unknown.")
             target_abs = current + request.target
-            # If absolute addition resulted in None for some axes, fill them from current
-            # to allow for a complete safety check of the final destination.
-            # (Note: move_stage_absolute typically ignores Nones, but safety check needs context)
 
-        # 2. Safety Check (Destination & Capability)
+        # 2. Safety Check
         sys = self.system_settings.stage_system
         if sys:
-            # We check the move using the resolved absolute target.
-            # We pass 'current' to allow step size calculation in the check.
             check = sys.is_safe_move(
                 target=request.target if request.relative else target_abs,
                 current=current,
@@ -485,17 +460,13 @@ class TemMicroscope(ABC):
                 logger.error(f"[STAGE] Unsafe move rejected. Reasons: {check.reasons}")
                 raise RuntimeError(f"Unsafe move rejected: {check.reasons}")
 
-            # 3. Execution (via Safe Mover)
-            # The safe mover handles "max_step_distance" interpolation.
+            # 3. Safe Execution (interpolates if needed)
             self.safe_move_stage(target_abs, drive_type=request.drive_type, wait=request.wait_for_settle)
         else:
-            # Fallback (No safety system defined)
             self.move_stage_absolute(target_abs, drive_type=request.drive_type, wait=request.wait_for_settle)
 
     def execute_stage_control(self, request: StageControlRequest) -> None:
-        """
-        Orchestrator: Handle StageControlRequest (STOP, HOME).
-        """
+        """Orchestrator: Handle StageControlRequest (STOP, HOME)."""
         if not request.validate():
             raise ValueError(f"Invalid StageControlRequest: {request}")
 
@@ -505,62 +476,82 @@ class TemMicroscope(ABC):
             self.stop_stage()
         elif request.action == "HOME":
             self.home_stage()
-        # "ABORT", "RESET_ERROR" could be implemented if driver supports them
+        # Drivers can extend for RESET_ERROR etc.
 
     # =========================================================================
     # 4. Beam Control (Illumination)
     # =========================================================================
 
-    # --- Atomic Getters (Abstract) ---
+    # --- Atomic Getters ---
     @abstractmethod
     def get_acceleration_voltage(self) -> Optional[Quantity]:
-        """Get High Tension. Units: Electric Potential (kV). Returns None if unknown."""
+        """Get High Tension (kV). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_beam_current(self) -> Optional[Quantity]:
-        """Get Beam Current. Units: Electric Current (nA/pA). Returns None if unknown."""
+        """Get Beam Current (nA/pA). Returns None if unknown."""
+        pass
+
+    @abstractmethod
+    def get_emission_current(self) -> Optional[Quantity]:
+        """Get Gun Emission Current (uA). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_spot_size(self) -> Optional[int]:
-        """Get Spot Size Index (unitless integer). Returns None if unknown."""
+        """Get Spot Size Index. Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_convergence_angle(self) -> Optional[Quantity]:
-        """Get Convergence (Alpha) Angle. Units: Angle (mrad). Returns None if unknown."""
+        """Get Convergence (Alpha) Angle (mrad). Returns None if unknown."""
         pass
 
     @abstractmethod
     def get_beam_shift(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Beam Shift Coils. Units: Logical (-1..1) or Physical (Arb)."""
+        """Get Beam Shift Coils (x, y). Returns (None, None) if unknown."""
+        pass
+
+    @abstractmethod
+    def get_beam_tilt(self) -> Tuple[Optional[float], Optional[float]]:
+        """Get Beam Tilt Coils (x, y). Returns (None, None) if unknown."""
         pass
 
     @abstractmethod
     def get_condenser_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Condenser Stigmator Coils. Units: Logical or Physical."""
+        """Get Condenser Stigmator Coils (x, y). Returns (None, None) if unknown."""
         pass
 
     @abstractmethod
     def get_gun_tilt(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Gun Tilt Alignment. Units: Logical or Physical."""
+        """Get Gun Tilt Alignment (x, y). Returns (None, None) if unknown."""
         pass
 
     @abstractmethod
     def get_beam_blank(self) -> bool:
-        """Get Beam Blank Status. True = Blanked (Beam OFF). (Strict Primitive)"""
+        """Get Beam Blank Status. True=Blanked."""
         pass
 
-    # --- Atomic Setters (Abstract) ---
+    @abstractmethod
+    def get_probe_mode(self) -> Optional[str]:
+        """Get probe mode (e.g. 'Microprobe', 'Nanoprobe'). Returns None if unknown."""
+        pass
+
+    # --- Atomic Setters ---
     @abstractmethod
     def set_acceleration_voltage(self, voltage: Quantity) -> None:
-        """Set High Tension. Expected Units: Volts/kV."""
+        """Set High Tension (kV)."""
         pass
 
     @abstractmethod
     def set_beam_current(self, current: Quantity) -> None:
-        """Set Beam Current. Expected Units: Amperes/nA."""
+        """Set Beam Current (nA)."""
+        pass
+
+    @abstractmethod
+    def set_emission_current(self, current: Quantity) -> None:
+        """Set Gun Emission Current (uA)."""
         pass
 
     @abstractmethod
@@ -570,43 +561,57 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def set_convergence_angle(self, angle: Quantity) -> None:
-        """Set Convergence Angle. Expected Units: Radians/mrad."""
+        """Set Convergence Angle (mrad)."""
         pass
 
     @abstractmethod
     def set_beam_shift(self, x: float, y: float) -> None:
-        """Set Beam Shift Coils (x, y)."""
+        """Set Beam Shift Coils."""
+        pass
+
+    @abstractmethod
+    def set_beam_tilt(self, x: float, y: float) -> None:
+        """Set Beam Tilt Coils."""
         pass
 
     @abstractmethod
     def set_condenser_stigmation(self, x: float, y: float) -> None:
-        """Set Condenser Stigmator Coils (x, y)."""
+        """Set Condenser Stigmator Coils."""
         pass
 
     @abstractmethod
     def set_gun_tilt(self, x: float, y: float) -> None:
-        """Set Gun Tilt Alignment (x, y)."""
+        """Set Gun Tilt Alignment."""
         pass
 
     @abstractmethod
     def set_beam_blank(self, blank: bool) -> None:
-        """Set Beam Blanker. True = Blank Beam (Block)."""
+        """Set Beam Blanker. True = Blank (Block)."""
         pass
 
-    # --- Logic Layer (Concrete) ---
+    @abstractmethod
+    def set_probe_mode(self, mode: str) -> None:
+        """Set probe mode."""
+        pass
 
+    # --- Logic Layer ---
     def get_beam_settings(self) -> BeamSettings:
         """Aggregator: returns full BeamSettings snapshot."""
         bs = self.get_beam_shift()
+        bt = self.get_beam_tilt()
         cs = self.get_condenser_stigmation()
         gt = self.get_gun_tilt()
-
         return BeamSettings(
+            mode=self.get_mode(),
             voltage=self.get_acceleration_voltage(),
             beam_current=self.get_beam_current(),
+            emission_current=self.get_emission_current(),
             spot_size=self.get_spot_size(),
             convergence_angle=self.get_convergence_angle(),
+            probe_mode=self.get_probe_mode(),
+            is_blanked=self.get_beam_blank(),
             beam_shift=Point(x=bs[0], y=bs[1]),
+            beam_tilt=Point(x=bt[0], y=bt[1]),
             condenser_stigmation=Point(x=cs[0], y=cs[1]),
             gun_tilt=Point(x=gt[0], y=gt[1])
         )
@@ -620,30 +625,42 @@ class TemMicroscope(ABC):
         - For 2D coil fields (Point), partial specification is rejected (strict).
         - Vendor-specific extras are validated/applied by vendor overrides.
         """
+        if settings.mode is not None:
+            self.set_mode(settings.mode)
         if settings.voltage is not None:
             self.set_acceleration_voltage(settings.voltage)
         if settings.beam_current is not None:
             self.set_beam_current(settings.beam_current)
+        if settings.emission_current is not None:
+            self.set_emission_current(settings.emission_current)
         if settings.spot_size is not None:
             self.set_spot_size(settings.spot_size)
         if settings.convergence_angle is not None:
             self.set_convergence_angle(settings.convergence_angle)
+        if settings.probe_mode is not None:
+            self.set_probe_mode(settings.probe_mode)
+        if settings.is_blanked is not None:
+            self.set_beam_blank(settings.is_blanked)
 
-        # 2D coil fields
-        if settings.beam_shift is not None:
+        if settings.beam_shift:
             self._require_point_complete(settings.beam_shift, 'beam_shift')
-            if settings.beam_shift.x is not None and settings.beam_shift.y is not None:
+            if settings.beam_shift.x is not None:
                 self.set_beam_shift(float(settings.beam_shift.x), float(settings.beam_shift.y))
 
-        if settings.condenser_stigmation is not None:
+        if settings.beam_tilt:
+            self._require_point_complete(settings.beam_tilt, 'beam_tilt')
+            if settings.beam_tilt.x is not None:
+                self.set_beam_tilt(float(settings.beam_tilt.x), float(settings.beam_tilt.y))
+
+        if settings.condenser_stigmation:
             self._require_point_complete(settings.condenser_stigmation, 'condenser_stigmation')
-            if settings.condenser_stigmation.x is not None and settings.condenser_stigmation.y is not None:
+            if settings.condenser_stigmation.x is not None:
                 self.set_condenser_stigmation(float(settings.condenser_stigmation.x),
                                               float(settings.condenser_stigmation.y))
 
-        if settings.gun_tilt is not None:
+        if settings.gun_tilt:
             self._require_point_complete(settings.gun_tilt, 'gun_tilt')
-            if settings.gun_tilt.x is not None and settings.gun_tilt.y is not None:
+            if settings.gun_tilt.x is not None:
                 self.set_gun_tilt(float(settings.gun_tilt.x), float(settings.gun_tilt.y))
 
     def execute_beam_control(self, request: BeamControlRequest) -> None:
@@ -669,33 +686,38 @@ class TemMicroscope(ABC):
 
     # --- Atomic Getters ---
     @abstractmethod
-    def get_projection_mode(self) -> str:
-        """Get optical mode (e.g., 'IMAGING', 'DIFFRACTION'). (Strict Primitive)"""
+    def get_optical_mode(self) -> str:
+        """Get optical mode (e.g., 'IMAGING', 'DIFFRACTION')."""
         pass
 
     @abstractmethod
     def get_magnification(self) -> Optional[int]:
-        """Get Magnification (unitless integer). Returns None if unknown."""
+        """Get Magnification index."""
         pass
 
     @abstractmethod
     def get_camera_length(self) -> Optional[Quantity]:
-        """Get Camera Length (Diffraction). Units: Length (mm). Returns None if unknown."""
+        """Get Camera Length (mm)."""
         pass
 
     @abstractmethod
     def get_defocus(self) -> Optional[Quantity]:
-        """Get Defocus. Units: Length (nm). Returns None if unknown."""
+        """Get Defocus (nm)."""
         pass
 
     @abstractmethod
     def get_screen_position(self) -> str:
-        """Get Fluorescent Screen Position ('UP', 'DOWN', or 'UNKNOWN')."""
+        """Get Screen Position ('UP', 'DOWN')."""
         pass
 
     @abstractmethod
     def get_objective_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Objective Stigmator Coils (x, y)."""
+        pass
+
+    @abstractmethod
+    def get_diffraction_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
+        """Get Diffraction Stigmator Coils (x, y)."""
         pass
 
     @abstractmethod
@@ -710,7 +732,7 @@ class TemMicroscope(ABC):
 
     # --- Atomic Setters ---
     @abstractmethod
-    def set_projection_mode(self, mode: str) -> None:
+    def set_optical_mode(self, mode: str) -> None:
         """Set optical mode."""
         pass
 
@@ -721,22 +743,27 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def set_camera_length(self, length: Quantity) -> None:
-        """Set Camera Length. Expected Units: Length (mm/cm)."""
+        """Set Camera Length (mm)."""
         pass
 
     @abstractmethod
     def set_defocus(self, defocus: Quantity) -> None:
-        """Set Defocus. Expected Units: Length (nm/um)."""
+        """Set Defocus (nm)."""
         pass
 
     @abstractmethod
     def set_screen_position(self, position: str) -> None:
-        """Set Screen Position ('UP'/'DOWN')."""
+        """Set Screen Position ('UP', 'DOWN')."""
         pass
 
     @abstractmethod
     def set_objective_stigmation(self, x: float, y: float) -> None:
         """Set Objective Stigmator Coils."""
+        pass
+
+    @abstractmethod
+    def set_diffraction_stigmation(self, x: float, y: float) -> None:
+        """Set Diffraction Stigmator Coils."""
         pass
 
     @abstractmethod
@@ -754,16 +781,17 @@ class TemMicroscope(ABC):
     def get_projection_settings(self) -> ProjectionSettings:
         """Aggregator: returns full ProjectionSettings snapshot."""
         obj_st = self.get_objective_stigmation()
+        dif_st = self.get_diffraction_stigmation()
         img_sh = self.get_image_shift()
         dif_sh = self.get_diffraction_shift()
-
         return ProjectionSettings(
-            optical_mode=self.get_projection_mode(),
+            optical_mode=self.get_optical_mode(),
             magnification=self.get_magnification(),
             defocus=self.get_defocus(),
             camera_length=self.get_camera_length(),
             screen_position=self.get_screen_position(),
             objective_stigmation=Point(x=obj_st[0], y=obj_st[1]),
+            diffraction_stigmation=Point(x=dif_st[0], y=dif_st[1]),
             image_shift=Point(x=img_sh[0], y=img_sh[1]),
             diffraction_shift=Point(x=dif_sh[0], y=dif_sh[1])
         )
@@ -777,7 +805,7 @@ class TemMicroscope(ABC):
         - Vendor-specific extras are validated/applied by vendor overrides.
         """
         if settings.optical_mode is not None:
-            self.set_projection_mode(settings.optical_mode)
+            self.set_optical_mode(settings.optical_mode)
         if settings.magnification is not None:
             self.set_magnification(settings.magnification)
         if settings.camera_length is not None:
@@ -787,23 +815,27 @@ class TemMicroscope(ABC):
         if settings.screen_position is not None:
             self.set_screen_position(settings.screen_position)
 
-        if settings.objective_stigmation is not None:
+        if settings.objective_stigmation:
             self._require_point_complete(settings.objective_stigmation, 'objective_stigmation')
-            if settings.objective_stigmation.x is not None and settings.objective_stigmation.y is not None:
+            if settings.objective_stigmation.x is not None:
                 self.set_objective_stigmation(float(settings.objective_stigmation.x),
                                               float(settings.objective_stigmation.y))
 
-        if settings.image_shift is not None:
+        if settings.diffraction_stigmation:
+            self._require_point_complete(settings.diffraction_stigmation, 'diffraction_stigmation')
+            if settings.diffraction_stigmation.x is not None:
+                self.set_diffraction_stigmation(float(settings.diffraction_stigmation.x),
+                                                float(settings.diffraction_stigmation.y))
+
+        if settings.image_shift:
             self._require_point_complete(settings.image_shift, 'image_shift')
-            if settings.image_shift.x is not None and settings.image_shift.y is not None:
+            if settings.image_shift.x is not None:
                 self.set_image_shift(float(settings.image_shift.x), float(settings.image_shift.y))
 
-        if settings.diffraction_shift is not None:
+        if settings.diffraction_shift:
             self._require_point_complete(settings.diffraction_shift, 'diffraction_shift')
-            if settings.diffraction_shift.x is not None and settings.diffraction_shift.y is not None:
-                self.set_diffraction_shift(float(settings.diffraction_shift.x),
-                                           float(settings.diffraction_shift.y))
-
+            if settings.diffraction_shift.x is not None:
+                self.set_diffraction_shift(float(settings.diffraction_shift.x), float(settings.diffraction_shift.y))
 
     def execute_projection_control(self, request: ProjectionControlRequest) -> None:
         if not request.validate():
@@ -828,7 +860,7 @@ class TemMicroscope(ABC):
     # --- Atomic Getters ---
     @abstractmethod
     def get_scan_mode(self) -> str:
-        """Get scan engine mode. (Strict Primitive)"""
+        """Get scan engine mode."""
         pass
 
     @abstractmethod
@@ -843,22 +875,22 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def get_scan_pixel_dwell(self) -> Optional[Quantity]:
-        """Get pixel dwell time. Units: Time (us/ns). Returns None if unknown."""
+        """Get pixel dwell time (us)."""
         pass
 
     @abstractmethod
     def get_scan_flyback(self) -> Optional[Quantity]:
-        """Get flyback time. Units: Time (us/ns). Returns None if unknown."""
+        """Get flyback time (us)."""
         pass
 
     @abstractmethod
     def get_scan_rotation(self) -> Optional[Quantity]:
-        """Get scan rotation. Units: Angle (deg/rad). Returns None if unknown."""
+        """Get scan rotation (deg)."""
         pass
 
     @abstractmethod
     def get_scan_active(self) -> bool:
-        """Return True if scanning is currently active. (Strict Primitive)"""
+        """Return True if scanning is currently active."""
         pass
 
     # --- Atomic Setters ---
@@ -869,27 +901,27 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def set_scan_width(self, px: int) -> None:
-        """Set width (pixels)."""
+        """Set scan width (px)."""
         pass
 
     @abstractmethod
     def set_scan_height(self, px: int) -> None:
-        """Set height (pixels)."""
+        """Set scan height (px)."""
         pass
 
     @abstractmethod
     def set_scan_pixel_dwell(self, time: Quantity) -> None:
-        """Set dwell time. Expected Units: Time."""
+        """Set dwell time (us)."""
         pass
 
     @abstractmethod
     def set_scan_flyback(self, time: Quantity) -> None:
-        """Set flyback time. Expected Units: Time."""
+        """Set flyback time (us)."""
         pass
 
     @abstractmethod
     def set_scan_rotation(self, angle: Quantity) -> None:
-        """Set scan rotation. Expected Units: Angle."""
+        """Set scan rotation (deg)."""
         pass
 
     @abstractmethod
@@ -943,62 +975,109 @@ class TemMicroscope(ABC):
             self.set_scan_active(True)
 
     # =========================================================================
-    # 7. Detector Control
+    # 7. Detector Control & Acquisition
     # =========================================================================
 
     # --- Atomic Getters ---
     @abstractmethod
     def list_detectors(self) -> List[str]:
-        """Return list of available detector IDs."""
+        """List available detector IDs."""
         pass
 
     @abstractmethod
     def get_active_detector_ids(self) -> List[str]:
+        """List currently active detectors."""
         pass
 
     @abstractmethod
     def get_primary_detector_id(self) -> Optional[str]:
+        """Get the ID of the primary detector."""
         pass
 
     @abstractmethod
     def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
-        """Get exposure time. Units: Time (s/ms). Returns None if unknown."""
+        """Get exposure time (ms)."""
         pass
 
     @abstractmethod
     def get_detector_binning(self, detector_id: str) -> Optional[int]:
-        """Get binning index (e.g., 1 for 1x1, 2 for 2x2). Returns None if unknown."""
+        """Get binning index (scalar)."""
+        pass
+
+    @abstractmethod
+    def get_detector_binning_xy(self, detector_id: str) -> Optional[Tuple[int, int]]:
+        """Get binning tuple (x, y)."""
         pass
 
     @abstractmethod
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
-        """Get Region of Interest. Returns None if unknown."""
+        """Get Region of Interest."""
         pass
 
     @abstractmethod
     def get_detector_integration(self, detector_id: str) -> Optional[int]:
-        """Get frame integration count. Returns None if unknown."""
+        """Get frame integration count."""
         pass
 
     @abstractmethod
     def get_detector_inserted(self, detector_id: str) -> bool:
-        """Return True if detector is mechanically inserted. (Strict Primitive)"""
+        """Return True if detector is mechanically inserted."""
         pass
 
     @abstractmethod
     def get_detector_frame_rate(self, detector_id: str) -> Optional[Quantity]:
-        """Get estimated frame rate. Returns None if unknown."""
+        """Get estimated frame rate (Hz)."""
         pass
 
-    # ---Atomic Setters ---
+    @abstractmethod
+    def get_detector_gain_index(self, detector_id: str) -> Optional[int]:
+        """Get gain index."""
+        pass
+
+    @abstractmethod
+    def get_detector_offset_index(self, detector_id: str) -> Optional[int]:
+        """Get offset index."""
+        pass
+
+    @abstractmethod
+    def get_detector_digital_rotation(self, detector_id: str) -> Optional[Quantity]:
+        """Get digital rotation (deg)."""
+        pass
+
+    @abstractmethod
+    def get_detector_total_frames(self, detector_id: str) -> Optional[int]:
+        """Get total frames (movie mode)."""
+        pass
+
+    @abstractmethod
+    def get_detector_readout_mode(self, detector_id: str) -> Optional[str]:
+        """Get readout mode (e.g. 'LINEAR')."""
+        pass
+
+    @abstractmethod
+    def get_detector_shutter_mode(self, detector_id: str) -> Optional[str]:
+        """Get shutter mode (e.g. 'PRE_SPECIMEN')."""
+        pass
+
+    @abstractmethod
+    def get_detector_save_frames(self, detector_id: str) -> Optional[bool]:
+        """Get save frames flag."""
+        pass
+
+    # --- Atomic Setters ---
     @abstractmethod
     def set_detector_exposure(self, detector_id: str, exposure: Quantity) -> None:
-        """Set exposure time."""
+        """Set exposure time (ms)."""
         pass
 
     @abstractmethod
     def set_detector_binning(self, detector_id: str, index: int) -> None:
         """Set binning index."""
+        pass
+
+    @abstractmethod
+    def set_detector_binning_xy(self, detector_id: str, binning: Tuple[int, int]) -> None:
+        """Set binning tuple (x, y)."""
         pass
 
     @abstractmethod
@@ -1013,7 +1092,47 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def set_detector_insertion(self, detector_id: str, inserted: bool) -> None:
-        """Mechanically insert (True) or retract (False) the detector."""
+        """Insert (True) or Retract (False) detector."""
+        pass
+
+    @abstractmethod
+    def set_detector_frame_rate(self, detector_id: str, rate: Quantity) -> None:
+        """Set target frame rate (Hz)."""
+        pass
+
+    @abstractmethod
+    def set_detector_gain_index(self, detector_id: str, index: int) -> None:
+        """Set gain index."""
+        pass
+
+    @abstractmethod
+    def set_detector_offset_index(self, detector_id: str, index: int) -> None:
+        """Set offset index."""
+        pass
+
+    @abstractmethod
+    def set_detector_digital_rotation(self, detector_id: str, angle: Quantity) -> None:
+        """Set digital rotation (deg)."""
+        pass
+
+    @abstractmethod
+    def set_detector_total_frames(self, detector_id: str, count: int) -> None:
+        """Set total frames (movie mode)."""
+        pass
+
+    @abstractmethod
+    def set_detector_readout_mode(self, detector_id: str, mode: str) -> None:
+        """Set readout mode."""
+        pass
+
+    @abstractmethod
+    def set_detector_shutter_mode(self, detector_id: str, mode: str) -> None:
+        """Set shutter mode."""
+        pass
+
+    @abstractmethod
+    def set_detector_save_frames(self, detector_id: str, save: bool) -> None:
+        """Set save frames flag."""
         pass
 
     @abstractmethod
@@ -1034,9 +1153,18 @@ class TemMicroscope(ABC):
             detector_id=detector_id,
             exposure=self.get_detector_exposure(detector_id),
             binning_index=self.get_detector_binning(detector_id),
+            binning_xy=self.get_detector_binning_xy(detector_id),
             roi=self.get_detector_roi(detector_id),
             frame_integration=self.get_detector_integration(detector_id),
-            frame_rate=self.get_detector_frame_rate(detector_id)
+            frame_rate=self.get_detector_frame_rate(detector_id),
+            inserted=self.get_detector_inserted(detector_id),
+            gain_index=self.get_detector_gain_index(detector_id),
+            offset_index=self.get_detector_offset_index(detector_id),
+            digital_rotation=self.get_detector_digital_rotation(detector_id),
+            total_frames=self.get_detector_total_frames(detector_id),
+            readout_mode=self.get_detector_readout_mode(detector_id),
+            shutter_mode=self.get_detector_shutter_mode(detector_id),
+            save_frames=self.get_detector_save_frames(detector_id)
         )
 
     def apply_detector_settings(self, detector_id: str, settings: DetectorSettings) -> None:
@@ -1045,10 +1173,30 @@ class TemMicroscope(ABC):
             self.set_detector_exposure(detector_id, settings.exposure)
         if settings.binning_index is not None:
             self.set_detector_binning(detector_id, settings.binning_index)
+        if settings.binning_xy is not None:
+            self.set_detector_binning_xy(detector_id, settings.binning_xy)
         if settings.frame_integration is not None:
             self.set_detector_integration(detector_id, settings.frame_integration)
         if settings.roi is not None:
             self.set_detector_roi(detector_id, settings.roi)
+        if settings.frame_rate is not None:
+            self.set_detector_frame_rate(detector_id, settings.frame_rate)
+        if settings.inserted is not None:
+            self.set_detector_insertion(detector_id, settings.inserted)
+        if settings.gain_index is not None:
+            self.set_detector_gain_index(detector_id, settings.gain_index)
+        if settings.offset_index is not None:
+            self.set_detector_offset_index(detector_id, settings.offset_index)
+        if settings.digital_rotation is not None:
+            self.set_detector_digital_rotation(detector_id, settings.digital_rotation)
+        if settings.total_frames is not None:
+            self.set_detector_total_frames(detector_id, settings.total_frames)
+        if settings.readout_mode is not None:
+            self.set_detector_readout_mode(detector_id, settings.readout_mode)
+        if settings.shutter_mode is not None:
+            self.set_detector_shutter_mode(detector_id, settings.shutter_mode)
+        if settings.save_frames is not None:
+            self.set_detector_save_frames(detector_id, settings.save_frames)
 
     def execute_detector_control(self, request: DetectorControlRequest) -> None:
         """
@@ -1062,7 +1210,6 @@ class TemMicroscope(ABC):
 
         sys = self.system_settings.detector_system
         if sys and request.target:
-            # Check if capabilities support the request
             check = sys.is_supported(request.target)
             if not check:
                 logger.error(f"[DET] Unsupported settings: {check.reasons}")
@@ -1076,6 +1223,63 @@ class TemMicroscope(ABC):
         if request.target:
             self.apply_detector_settings(request.detector_id, request.target)
 
+    def execute_acquisition(self, request: AcquisitionRequest) -> MicroscopeImage:
+        """
+        Orchestrator: Handle AcquisitionRequest.
+        1. Validate
+        2. Apply Settings
+        3. Capture
+        4. Save (Optional)
+        """
+        if not request.validate():
+            raise ValueError(f"Invalid AcquisitionRequest: {request}")
+
+        det_id = request.detector_id
+        logger.info(f"[ACQ] Starting acquisition on '{det_id}'")
+
+        # 1. Check Capabilities
+        sys = self.system_settings.detector_system
+        if sys and request.detector:
+            # We merge defaults here conceptually, but validation checks pure intent
+            check = sys.is_supported(request.detector)
+            if not check:
+                raise RuntimeError(f"Acquisition settings not supported: {check.reasons}")
+
+        # 2. Apply Settings
+        if request.detector:
+            self.apply_detector_settings(det_id, request.detector)
+
+        # 3. Capture (Atomic)
+        image = self.acquire_image(request)
+
+        # 4. Enhance Metadata (Inject System State if driver didn't)
+        if image.metadata is None:
+            image.metadata = MicroscopeImageMetadata()
+
+        # Inject full state snapshot if missing
+        if image.metadata.microscope_state is None:
+            try:
+                image.metadata.microscope_state = self.get_full_state()
+            except Exception as e:
+                logger.warning(f"Failed to capture full state for metadata: {e}")
+
+        # 5. Save Logic
+        output_cfg = request.image or self._settings.image
+        if output_cfg and output_cfg.path:
+            try:
+                # Basic filename generation if path is a directory
+                save_path = Path(output_cfg.path)
+                if save_path.is_dir() or (not save_path.suffix):
+                    fname = f"Image_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    save_path = save_path / fname
+
+                final_path = image.save(save_path, file_format=output_cfg.file_format)
+                logger.info(f"[ACQ] Image saved to: {final_path}")
+            except Exception as e:
+                logger.error(f"[ACQ] Failed to save image: {e}")
+
+        return image
+
     # =========================================================================
     # 8. Vacuum Control
     # =========================================================================
@@ -1083,7 +1287,7 @@ class TemMicroscope(ABC):
     # --- Atomic Methods ---
     @abstractmethod
     def get_valve_state(self, valve_name: str) -> str:
-        """Get Valve State ('OPEN', 'CLOSED' or 'UNKNOWN'). (Strict Primitive)"""
+        """Get Valve State ('OPEN', 'CLOSED' or 'UNKNOWN')."""
         pass
 
     @abstractmethod
@@ -1093,7 +1297,7 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def get_pressure(self, gauge_name: str) -> Optional[Quantity]:
-        """Get Pressure. Units: Pressure (Pa/Torr). Name: 'column', 'gun'. Returns None if unknown."""
+        """Get Pressure (Pa). Returns None if unknown."""
         pass
 
     # --- Logic Layer ---
@@ -1143,50 +1347,65 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def get_aperture(self, aperture_id: str) -> Optional[Aperture]:
-        """Get state (inserted, size, position) of an aperture. Returns None if unknown."""
+    def get_aperture(self, aperture_id: str) -> Optional[ApertureSettings]:
+        """Get state of an aperture. Returns None if unknown."""
         pass
 
     @abstractmethod
-    def set_aperture(self, aperture_id: str, target: Aperture) -> None:
+    def set_aperture(self, aperture_id: str, target: ApertureSettings) -> None:
         """Set aperture state."""
         pass
 
     # --- Logic Layer ---
-
-    def get_all_apertures(self) -> Dict[str, Aperture]:
-        """Aggregator: returns state of all apertures."""
-        return {a_id: self.get_aperture(a_id) for a_id in self.list_apertures() if self.get_aperture(a_id) is not None}
+    def get_all_apertures(self) -> Dict[str, ApertureSettings]:
+        return {a_id: self.get_aperture(a_id) for a_id in self.list_apertures()
+                if self.get_aperture(a_id) is not None}
 
     def execute_aperture_control(self, request: ApertureControlRequest) -> None:
         """
         Orchestrator: Handle ApertureControlRequest.
-        Features:
-        - Logic to handle Relative Position moves.
+        Handles ID matching, safety checks, and relative position logic.
         """
         if not request.validate():
             raise ValueError(f"Invalid ApertureControlRequest: {request}")
 
-        logger.info(f"[APT] Executing Control on '{request.aperture_id}': target={request.target}")
+        logger.info(f"[APT] Executing Control on '{request.aperture_id}'")
+
+        # 1. Safety Check
+        sys = self.system_settings.aperture_system
+        if sys:
+            check = sys.is_supported(request.target)
+            if not check:
+                raise RuntimeError(f"Aperture request rejected: {check.reasons}")
 
         final_target = request.target
 
-        # Handle Relative Movement logic
+        # 2. Handle Relative Movement
         if request.relative and request.target.position:
             current = self.get_aperture(request.aperture_id)
             if current is None:
-                raise RuntimeError(
-                    f"Cannot execute relative move: Failed to read current state of '{request.aperture_id}'")
+                raise RuntimeError(f"Relative move failed: State of '{request.aperture_id}' unknown")
 
             if current.position:
-                new_pos = replace(request.target.position)
-                # Apply delta to current position (manual vector addition)
-                if request.target.position.x is not None and current.position.x is not None:
-                    new_pos.x = current.position.x + request.target.position.x
-                if request.target.position.y is not None and current.position.y is not None:
-                    new_pos.y = current.position.y + request.target.position.y
+                new_pos = replace(request.target.position)  # Start with delta structure
+
+                # Perform vector addition (Manual because Point doesn't have __add__)
+                cur_x = current.position.x if current.position.x is not None else 0.0
+                cur_y = current.position.y if current.position.y is not None else 0.0
+
+                if request.target.position.x is not None:
+                    new_pos.x = cur_x + request.target.position.x
+                else:
+                    new_pos.x = current.position.x
+
+                if request.target.position.y is not None:
+                    new_pos.y = cur_y + request.target.position.y
+                else:
+                    new_pos.y = current.position.y
+
                 final_target = replace(final_target, position=new_pos)
 
+        # 3. Execute
         self.set_aperture(request.aperture_id, final_target)
 
     # =========================================================================
@@ -1209,20 +1428,18 @@ class TemMicroscope(ABC):
             wait: Block until complete.
         """
         sys = self.system_settings.stage_system
-        # If no step limit is defined, pass through directly
         if not sys or not sys.max_step_distance:
             self.move_stage_absolute(target, drive_type, wait)
             return
 
         current = self.get_stage_position()
-
         if current is None:
             raise RuntimeError("Safe Move Failed: Cannot read current stage position to calculate steps.")
 
         max_step_nm = sys.max_step_distance.to(Units.NM).magnitude
 
-        # Calculate max delta across active axes
-        def dist(c, t):
+        # Calculate max delta in NM
+        def dist(c: Optional[Quantity], t: Optional[Quantity]) -> float:
             if c is None or t is None: return 0.0
             return abs(t.to(Units.NM).magnitude - c.to(Units.NM).magnitude)
 
@@ -1231,27 +1448,31 @@ class TemMicroscope(ABC):
         d_z = dist(current.z, target.z)
         max_dist = max(d_x, d_y, d_z)
 
-        # If move is within limit, execute directly
         if max_dist <= max_step_nm:
             self.move_stage_absolute(target, drive_type, wait)
             return
 
-        # Otherwise, step it out via Linear Interpolation
+        # Linear Interpolation
         steps = int(max_dist // max_step_nm) + 1
-        logger.info(f"Move exceeds max step ({max_dist:.1f}nm > {max_step_nm:.1f}nm). "
-                    f"Breaking into {steps} segments.")
+        logger.info(f"[STAGE] Step Limit: {max_dist:.1f}nm > {max_step_nm:.1f}nm. Breaking into {steps} segments.")
 
         for i in range(1, steps + 1):
             frac = i / steps
-            interim = replace(current)  # Start with current structure
+            interim = replace(current)  # Copy structure
 
-            # Interpolate only axes that are being moved (not None)
-            if target.x is not None and current.x is not None:
-                interim.x = current.x + (target.x - current.x) * frac
-            if target.y is not None and current.y is not None:
-                interim.y = current.y + (target.y - current.y) * frac
-            if target.z is not None and current.z is not None:
-                interim.z = current.z + (target.z - current.z) * frac
+            # Interpolate known axes
+            def interp(c, t):
+                if c is None or t is None: return c
+                return c + (t - c) * frac
 
-            # Commit the step
+            if target.x is not None: interim.x = interp(current.x, target.x)
+            if target.y is not None: interim.y = interp(current.y, target.y)
+            if target.z is not None: interim.z = interp(current.z, target.z)
+
+            # Rotation/Tilt usually not interpolated by distance logic, passed through on final step
+            if i == steps:
+                interim.r = target.r
+                interim.tilt_x = target.tilt_x
+                interim.tilt_y = target.tilt_y
+
             self.move_stage_absolute(interim, drive_type, wait=True)
