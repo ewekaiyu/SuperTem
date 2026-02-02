@@ -1951,6 +1951,7 @@ class BeamSettings:
 
     # Gun/Condenser alignments
     beam_shift: Optional[Point] = None
+    beam_tilt: Optional[Point] = None
     condenser_stigmation: Optional[Point] = None  # Renamed from 'stigmation'
     gun_tilt: Optional[Point] = None  # Added missing alignment
 
@@ -1975,12 +1976,16 @@ class BeamSettings:
         self.convergence_angle = p.qty(self.convergence_angle, "convergence_angle", Units.MRAD)
         self.is_blanked = p.bool(self.is_blanked, "is_blanked")
         self.beam_shift = p.model(Point, self.beam_shift, "beam_shift")
+        self.beam_tilt = p.model(Point, self.beam_tilt, "beam_tilt")
         self.condenser_stigmation = p.model(Point, self.condenser_stigmation, "condenser_stigmation")
         self.gun_tilt = p.model(Point, self.gun_tilt, "gun_tilt")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check_nested(self.beam_shift)
+        v.check_nested(self.beam_tilt)
+        v.check_nested(self.condenser_stigmation)
+        v.check_nested(self.gun_tilt)
 
         v.check_ge_zero(self.convergence_angle, "convergence_angle", unit_aware=True, reset_to=None)
         v.check_ge_zero(self.voltage, "voltage", unit_aware=True, reset_to=None)
@@ -2178,6 +2183,7 @@ class ProjectionSettings:
     # Diffraction Parameters (DIFFRACTION mode)
     camera_length: Optional["Quantity"] = None
     diffraction_shift: Optional[Point] = None
+    diffraction_stigmation: Optional[Point] = None
 
     screen_position: Optional[str] = None  # "UP", "DOWN"
 
@@ -2199,12 +2205,15 @@ class ProjectionSettings:
         self.objective_stigmation = p.model(Point, self.objective_stigmation, "objective_stigmation")
         self.image_shift = p.model(Point, self.image_shift, "image_shift")
         self.diffraction_shift = p.model(Point, self.diffraction_shift, "diffraction_shift")
+        self.diffraction_stigmation = p.model(Point, self.diffraction_stigmation, "diffraction_stigmation")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
 
         v.check_nested(self.objective_stigmation)
         v.check_nested(self.image_shift)
+        v.check_nested(self.diffraction_shift)
+        v.check_nested(self.diffraction_stigmation)
 
         # --- NEW VALIDATION LOGIC ---
         v.check_ge_zero(self.camera_length, "camera_length", unit_aware=True, reset_to=None)
@@ -2374,6 +2383,7 @@ class DetectorSettings:
            Values defined here override the persistent camera state for that one shot.
     """
     detector_id: Optional[str] = None
+    inserted: Optional[bool] = None
     exposure: Optional["Quantity"] = None
     binning_index: Optional[int] = None
     binning_xy: Optional[Tuple[int, int]] = None
@@ -2402,6 +2412,7 @@ class DetectorSettings:
     def __post_init__(self):
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.detector_id = p.id(self.detector_id, "detector_id")
+        self.inserted = p.bool(self.inserted, "inserted")
         self.binning_index = p.int(self.binning_index, "binning_index")
         self.binning_xy = p.pair_int(self.binning_xy, "binning_xy")
         self.frame_rate = p.qty(self.frame_rate, "frame_rate", Units.HZ)
@@ -2482,6 +2493,7 @@ class DetectorCapabilities:
         can_digital_rotation (Optional[bool]): Supports hardware rotation.
         digital_rotation_min, digital_rotation_max (Optional[Quantity]): Rotation limits.
     """
+    can_insert: Optional[bool] = None
     can_binning: Optional[bool] = None
     binning_index_min: Optional[int] = None
     binning_index_max: Optional[int] = None
@@ -2519,6 +2531,7 @@ class DetectorCapabilities:
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, self.__class__.__name__)
+        self.can_insert = p.bool(self.can_insert, "can_insert", default=False)
         self.can_binning = p.bool(self.can_binning, "can_binning")
         self.can_gain = p.bool(self.can_gain, "can_gain")
         self.can_offset = p.bool(self.can_offset, "can_offset")
@@ -2682,6 +2695,10 @@ class DetectorCapabilities:
                 max_w, max_h = self.roi_size_max
                 if w > max_w or h > max_h:
                     reasons.append(f"ROI size {w}x{h} exceeds limit {self.roi_size_max}.")
+
+        if settings.inserted is not None and self.can_insert is False:
+            # If user tries to change insertion state on a fixed detector
+            reasons.append(f"Detector does not support insertion/retraction (can_insert=False).")
 
         return SafetyCheck(allowed=(len(reasons) == 0), reasons=reasons)
 
