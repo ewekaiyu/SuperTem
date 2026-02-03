@@ -799,7 +799,14 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid BeamControlRequest: {request}")
 
-        logger.info(f"[BEAM] Executing Control. Action={request.action} Target={self._summarize_patch(request.target)}")
+        intent = []
+        if request.action:
+            intent.append(f"Action={request.action}")
+        if request.target:
+            intent.append(f"Target={self._summarize_patch(request.target)}")
+
+        intent_str = " ".join(intent) if intent else "No Operation"
+        logger.info(f"[BEAM] Control: {intent_str}")
 
         # Safety Check
         sys = self.system_settings.beam_system
@@ -986,7 +993,14 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid ProjectionControlRequest: {request}")
 
-        logger.info(f"[PROJ] Executing Control. Action={request.action} Target={self._summarize_patch(request.target)}")
+        intent = []
+        if request.action:
+            intent.append(f"Action={request.action}")
+        if request.target:
+            intent.append(f"Target={self._summarize_patch(request.target)}")
+
+        intent_str = " ".join(intent) if intent else "No Operation"
+        logger.info(f"[PROJ] Control: {intent_str}")
 
         sys = self.system_settings.projection_system
         if sys and request.target:
@@ -1314,7 +1328,14 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid DetectorControlRequest: {request}")
 
-        logger.info(f"[DET] Executing Control: {request.action} on {request.detector_id}")
+        intent = []
+        if request.action:
+            intent.append(f"Action={request.action}")
+        if request.target:
+            intent.append(f"Target={self._summarize_patch(request.target)}")
+
+        intent_str = " ".join(intent) if intent else "No Operation"
+        logger.info(f"[DET] Executing Control on {request.detector_id}: {intent_str}")
 
         sys = self.system_settings.detector_system
         if sys and request.target:
@@ -1511,7 +1532,14 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid ScanControlRequest: {request}")
 
-        logger.info(f"[SCAN] Control: Action={request.action}")
+        intent = []
+        if request.action:
+            intent.append(f"Action={request.action}")
+        if request.target:
+            intent.append(f"Target={self._summarize_patch(request.target)}")
+
+        logger.info(f"[SCAN] Control: {' '.join(intent)}")
+
         exec_opts = request.extra.options if request.extra else {}
 
         # 1. Settings
@@ -1618,6 +1646,16 @@ class TemMicroscope(ABC):
     def execute_vacuum_control(self, request: VacuumControlRequest) -> None:
         if not request.validate():
             raise ValueError(f"Invalid VacuumControlRequest: {request}")
+
+        intent = []
+        if request.action:
+            intent.append(f"Action={request.action}")
+        if request.target:
+            intent.append(f"Target={self._summarize_patch(request.target)}")
+        if request.force:
+            intent.append("(FORCE)")
+
+        logger.info(f"[VAC] Control: {' '.join(intent)}")
 
         exec_opts = request.extra.options if request.extra else {}
 
@@ -1729,7 +1767,15 @@ class TemMicroscope(ABC):
         if not request.validate():
             raise ValueError(f"Invalid ApertureControlRequest: {request}")
 
-        logger.info(f"[APT] Executing Control on '{request.aperture_id}'")
+        intent = []
+        if request.action:
+            intent.append(f"Action={request.action}")
+        if request.target:
+            intent.append(f"Target={self._summarize_patch(request.target)}")
+        if request.relative:
+            intent.append("(Relative)")
+
+        logger.info(f"[APT] Control on '{request.aperture_id}': {' '.join(intent)}")
 
         sys = self.system_settings.aperture_system
         if sys:
