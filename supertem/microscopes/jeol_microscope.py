@@ -129,7 +129,7 @@ do not map to standard physics (e.g. Alpha Selector, OLc DAC).
 """
 import time
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable
 import numpy as np
 from datetime import datetime, timezone
 
@@ -502,6 +502,66 @@ class JeolMicroscope(TemMicroscope):
         else:
             raise RuntimeError(f"Detector {detector_id} does not support settings updates.")
 
+    def _read_hw(self, hardware: Any, method_name: str, tag: str,
+                 converter: Optional[Callable[[Any], Any]] = None,
+                 default: Any = None) -> Any:
+        """
+        Atomic Getter (Null means Unknown).
+        Checks hardware existence -> Try/Catch -> Log -> Convert.
+        """
+        if not hardware:
+            logger.debug(f"[{tag}] {method_name} failed: Hardware disconnected.")
+            return default
+
+        try:
+            func = getattr(hardware, method_name)
+            val = func() if callable(func) else func
+            if converter and val is not None:
+                return converter(val)
+            return val
+        except Exception as e:
+            logger.debug(f"[{tag}] {method_name} failed: {e}")
+            return default
+
+    def _write_hw(self, hardware: Any, method_name: str, tag: str, *args) -> None:
+        """
+        Atomic Setter (Fail Loudly).
+        Checks hardware existence -> Log Intent -> Try/Catch -> Raise on error.
+        """
+        if not hardware:
+            logger.error(f"[{tag}] {method_name} failed: Hardware disconnected.")
+            raise RuntimeError(f"{tag} hardware disconnected.")
+
+        logger.debug(f"[{tag}] {method_name}{args}")
+        try:
+            getattr(hardware, method_name)(*args)
+        except Exception as e:
+            logger.error(f"[{tag}] {method_name} failed: {e}")
+            raise
+
+    # --- Common Converters ---
+
+    def _to_nm(self, v):
+        return Q_(float(v), Units.NM)
+
+    def _to_kv(self, v):
+        return Q_(float(v), "V").to(Units.KV)
+
+    def _to_ua(self, v):
+        return Q_(float(v), Units.UA)
+
+    def _to_na(self, v):
+        return Q_(float(v), Units.UA).to(Units.NA)
+
+    def _to_int(self, v):
+        return int(v)
+
+    def _to_bool(self, v):
+        return bool(v)
+
+    def _to_deg(self, v):
+        return Q_(float(v), Units.DEG)
+
     # --- EOS Helpers ---
 
     def _get_eos_mode_key(self) -> Optional[str]:
@@ -639,12 +699,7 @@ class JeolMicroscope(TemMicroscope):
         return self._connected
 
     def get_instrument_info(self) -> SystemInfo:
-        return SystemInfo(
-            manufacturer="JEOL",
-            model="ARM/F2",
-            software_version="PyJEM-TEM3",
-            _mode="lenient"
-        )
+        return self.system_settings.info
 
     # =========================================================================
     # 2. Global State & Mode
@@ -903,60 +958,21 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def get_acceleration_voltage(self) -> Optional[Quantity]:
-        """Get HT voltage. Wraps `TEM3.HT3.GetHtValue`."""
-        if not self.ht or not hasattr(self.ht, "GetHtValue"):
-            logger.debug("[BEAM] GetHtValue failed: Hardware not connected.")
-            return None
-        try:
-            v = float(self.ht.GetHtValue())
-            return Q_(v, "V").to(Units.KV)
-        except Exception as e:
-            logger.debug(f"[BEAM] GetHtValue failed: {e}")
-            return None
+        return self._read_hw(self.ht, "GetHtValue", "BEAM", self._to_kv)
 
     def get_probe_mode(self) -> Optional[str]:
-        """Get probe mode (e.g. 'Microprobe', 'Nanoprobe')."""
-        if self.eos and hasattr(self.eos, "GetProbeMode"):
-            try:
-                # 0: Micro, 1: Nano
-                mode = int(self.eos.GetProbeMode())
-                return "Nanoprobe" if mode == 1 else "Microprobe"
-            except Exception as e:
-                logger.debug(f"[BEAM] GetProbeMode failed: {e}")
-        return None
+        # Logic retention: Map 0/1 to Strings
+        val = self._read_hw(self.eos, "GetProbeMode", "BEAM", self._to_int)
+        return "Nanoprobe" if val == 1 else "Microprobe" if val == 0 else None
 
     def get_beam_current(self) -> Optional[Quantity]:
-        """Get beam current. Wraps `TEM3.GUN3.GetEmissionCurrent`."""
-        if self.gun and hasattr(self.gun, "GetEmissionCurrent"):
-            try:
-                val = self.gun.GetEmissionCurrent()
-                return Q_(val, Units.UA).to(Units.NA)
-            except Exception as e:
-                logger.debug(f"[BEAM] GetEmissionCurrent failed: {e}")
-        else:
-            logger.debug("[BEAM] GetEmissionCurrent failed: Hardware not connected.")
-        return None
+        return self._read_hw(self.gun, "GetEmissionCurrent", "BEAM", self._to_na)
 
     def get_emission_current(self) -> Optional[Quantity]:
-        """Get Gun Emission Current (uA)."""
-        if self.gun and hasattr(self.gun, "GetEmissionCurrent"):
-            try:
-                val = self.gun.GetEmissionCurrent()
-                return Q_(val, Units.UA)
-            except Exception as e:
-                logger.debug(f"[BEAM] GetEmissionCurrent failed: {e}")
-        return None
+        return self._read_hw(self.gun, "GetEmissionCurrent", "BEAM", self._to_ua)
 
     def get_spot_size(self) -> Optional[int]:
-        """Get spot size index. Wraps `TEM3.EOS3.GetSpotSize`."""
-        if self.eos and hasattr(self.eos, "GetSpotSize"):
-            try:
-                return int(self.eos.GetSpotSize())
-            except Exception as e:
-                logger.debug(f"[BEAM] GetSpotSize failed: {e}")
-        else:
-            logger.debug("[BEAM] GetSpotSize failed: Hardware not connected.")
-        return None
+        return self._read_hw(self.eos, "GetSpotSize", "BEAM", self._to_int)
 
     def get_convergence_angle(self) -> Optional[Quantity]:
         """
@@ -966,223 +982,64 @@ class JeolMicroscope(TemMicroscope):
         return None
 
     def get_beam_blank(self) -> bool:
-        """Get Beam Blank status. Wraps `TEM3.Def3.GetBeamBlank`."""
-        if self.def_ and hasattr(self.def_, "GetBeamBlank"):
-            try:
-                return bool(self.def_.GetBeamBlank())
-            except Exception as e:
-                logger.debug(f"[BEAM] GetBeamBlank failed: {e}")
-        else:
-            logger.debug("[BEAM] GetBeamBlank failed: Hardware not connected.")
-        return False
+        return self._read_hw(self.def_, "GetBeamBlank", "BEAM", self._to_bool, default=False)
 
     def get_beam_shift(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Beam Shift (CLA1). Wraps `TEM3.Def3.GetCLA1`."""
-        if self.def_ and hasattr(self.def_, "GetCLA1"):
-            try:
-                res = self._coerce_xy(self.def_.GetCLA1())
-                if res is not None:
-                    return res
-            except Exception as e:
-                logger.debug(f"[BEAM] GetCLA1 failed: {e}")
-        else:
-            logger.debug("[BEAM] GetCLA1 failed: Hardware not connected.")
-        return (None, None)
+        return self._read_hw(self.def_, "GetCLA1", "BEAM", self._coerce_xy, default=(None, None))
 
     def get_beam_tilt(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Beam Tilt Coils (CLA2)."""
-        if self.def_ and hasattr(self.def_, "GetCLA2"):
-            try:
-                res = self._coerce_xy(self.def_.GetCLA2())
-                if res is not None:
-                    return res
-            except Exception as e:
-                logger.debug(f"[BEAM] GetCLA2 failed: {e}")
-        return (None, None)
+        return self._read_hw(self.def_, "GetCLA2", "BEAM", self._coerce_xy, default=(None, None))
 
     def get_condenser_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Condenser Stigmation (CLs). Wraps `TEM3.Def3.GetCLs`."""
-        if self.def_ and hasattr(self.def_, "GetCLs"):
-            try:
-                res = self._coerce_xy(self.def_.GetCLs())
-                if res is not None:
-                    return res
-            except Exception as e:
-                logger.debug(f"[BEAM] GetCLs failed: {e}")
-        else:
-            logger.debug("[BEAM] GetCLs failed: Hardware not connected.")
-        return (None, None)
+        return self._read_hw(self.def_, "GetCLs", "BEAM", self._coerce_xy, default=(None, None))
 
     def get_gun_tilt(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Gun Tilt (AngBal). Wraps `TEM3.Def3.GetAngBal`."""
-        if self.def_ and hasattr(self.def_, "GetAngBal"):
-            try:
-                res = self._coerce_xy(self.def_.GetAngBal())
-                if res is not None:
-                    return res
-            except Exception as e:
-                logger.debug(f"[BEAM] GetAngBal failed: {e}")
-        else:
-            logger.debug("[BEAM] GetAngBal failed: Hardware not connected.")
-        return (None, None)
+        return self._read_hw(self.def_, "GetAngBal", "BEAM", self._coerce_xy, default=(None, None))
 
     # --- Atomic Getters (Vendor Specific) ---
 
     def get_alpha_index(self) -> Optional[int]:
-        """Get Alpha Selector index. Wraps `TEM3.EOS3.GetAlpha`."""
-        if not self.eos or not hasattr(self.eos, "GetAlpha"):
-            logger.debug("[BEAM] GetAlpha failed: Hardware not connected.")
-            return None
-        try:
-            return int(self.eos.GetAlpha())
-        except Exception as e:
-            logger.debug(f"[BEAM] GetAlpha failed: {e}")
-            return None
+        return self._read_hw(self.eos, "GetAlpha", "BEAM", self._to_int)
 
     # --- Atomic Setters ---
 
     def set_acceleration_voltage(self, voltage: Quantity, **kwargs) -> None:
-        """Set HT voltage. Wraps `TEM3.HT3.SetHtValue`."""
-        if not self.ht:
-            logger.error("[BEAM] SetHtValue failed: Hardware not connected.")
-            raise RuntimeError("Beam hardware (HT3) not connected.")
-        v = float(voltage.to("V").magnitude)
-        logger.debug(f"[BEAM] SetHtValue({v})")
-        try:
-            self.ht.SetHtValue(v)
-        except Exception as e:
-            logger.error(f"[BEAM] SetHtValue failed: {e}")
-            raise
+        self._write_hw(self.ht, "SetHtValue", "BEAM", float(voltage.to("V").magnitude))
 
     def set_probe_mode(self, mode: str, **kwargs) -> None:
-        """Set probe mode."""
-        if not self.eos:
-            raise RuntimeError("EOS hardware not connected.")
-
-        m = mode.strip().lower()
-        idx = 1 if "nano" in m else 0  # Default to Micro if unclear, or strict check?
-        logger.debug(f"[BEAM] SetProbeMode({mode} -> {idx})")
-        try:
-            self.eos.SetProbeMode(idx)
-        except Exception as e:
-            logger.error(f"[BEAM] SetProbeMode failed: {e}")
-            raise
-
-    def set_beam_current(self, current: Quantity, **kwargs) -> None:
-        """Not directly supported; use spot size to control current."""
-        logger.error("set_beam_current not supported by JEOL hardware; use spot_size.")
-        raise NotImplementedError("Direct beam current control not supported. Use set_spot_size.")
+        if not self.eos: raise RuntimeError("EOS hardware not connected.")
+        idx = 1 if "nano" in mode.strip().lower() else 0
+        self._write_hw(self.eos, "SetProbeMode", "BEAM", idx)
 
     def set_emission_current(self, current: Quantity, **kwargs) -> None:
-        """Set Gun Emission Current (uA)."""
-        if not self.gun:
-            raise RuntimeError("Gun hardware not connected.")
-
-        val_ua = float(current.to(Units.UA).magnitude)
-        logger.debug(f"[BEAM] SetEmissionCurrent({val_ua})")
-        try:
-            # Note: Verify specific JEOL API name (SetEmissionCurrent is typical)
-            if hasattr(self.gun, "SetEmissionCurrent"):
-                self.gun.SetEmissionCurrent(val_ua)
-            else:
-                raise NotImplementedError("SetEmissionCurrent not supported by this hardware interface.")
-        except Exception as e:
-            logger.error(f"[BEAM] SetEmissionCurrent failed: {e}")
-            raise
+        self._write_hw(self.gun, "SetEmissionCurrent", "BEAM", float(current.to(Units.UA).magnitude))
 
     def set_spot_size(self, index: int, **kwargs) -> None:
-        """Set spot size index. Wraps `TEM3.EOS3.SelectSpotSize`."""
-        if not self.eos:
-            logger.error("[BEAM] SelectSpotSize failed: Hardware not connected.")
-            raise RuntimeError("EOS hardware not connected.")
-        logger.debug(f"[BEAM] SelectSpotSize({index})")
-        try:
-            self.eos.SelectSpotSize(int(index))
-        except Exception as e:
-            logger.error(f"[BEAM] SelectSpotSize failed: {e}")
-            raise
+        self._write_hw(self.eos, "SelectSpotSize", "BEAM", int(index))
 
     def set_convergence_angle(self, angle: Quantity, **kwargs) -> None:
         """Physical angle setting not supported. Use `set_alpha_index`."""
-        raise ValueError("JEOL driver cannot set physical convergence angle. Use set_alpha_index(idx).")
+        raise NotImplementedError("JEOL driver cannot set physical convergence angle. Use set_alpha_index(idx).")
 
     def set_beam_blank(self, blank: bool, **kwargs) -> None:
-        """Set Beam Blanker. Wraps `TEM3.Def3.SetBeamBlank`."""
-        if not self.def_:
-            logger.error("[BEAM] SetBeamBlank failed: Hardware not connected.")
-            raise RuntimeError("Deflector hardware not connected.")
-
-        logger.debug(f"[BEAM] SetBeamBlank({blank})")
-        try:
-            self.def_.SetBeamBlank(1 if blank else 0)
-        except Exception as e:
-            logger.error(f"[BEAM] SetBeamBlank failed: {e}")
-            raise
+        self._write_hw(self.def_, "SetBeamBlank", "BEAM", 1 if blank else 0)
 
     def set_beam_shift(self, x: float, y: float, **kwargs) -> None:
-        """Set Beam Shift (CLA1). Wraps `TEM3.Def3.SetCLA1`."""
-        if not self.def_:
-            logger.error("[BEAM] SetCLA1 failed: Hardware not connected.")
-            raise RuntimeError("Deflector hardware not connected.")
-
-        logger.debug(f"[BEAM] SetCLA1({x}, {y})")
-        try:
-            self.def_.SetCLA1(int(x), int(y))
-        except Exception as e:
-            logger.error(f"[BEAM] SetCLA1 failed: {e}")
-            raise
+        self._write_hw(self.def_, "SetCLA1", "BEAM", int(x), int(y))
 
     def set_beam_tilt(self, x: float, y: float, **kwargs) -> None:
-        """Set Beam Tilt Coils (CLA2)."""
-        if not self.def_:
-            raise RuntimeError("Deflector hardware not connected.")
-        logger.debug(f"[BEAM] SetCLA2({x}, {y})")
-        try:
-            self.def_.SetCLA2(int(x), int(y))
-        except Exception as e:
-            logger.error(f"[BEAM] SetCLA2 failed: {e}")
-            raise
+        self._write_hw(self.def_, "SetCLA2", "BEAM", int(x), int(y))
 
     def set_condenser_stigmation(self, x: float, y: float, **kwargs) -> None:
-        """Set Condenser Stigmation (CLs). Wraps `TEM3.Def3.SetCLs`."""
-        if not self.def_:
-            logger.error("[BEAM] SetCLs failed: Hardware not connected.")
-            raise RuntimeError("Deflector hardware not connected.")
-
-        logger.debug(f"[BEAM] SetCLs({x}, {y})")
-        try:
-            self.def_.SetCLs(int(x), int(y))
-        except Exception as e:
-            logger.error(f"[BEAM] SetCLs failed: {e}")
-            raise
+        self._write_hw(self.def_, "SetCLs", "BEAM", int(x), int(y))
 
     def set_gun_tilt(self, x: float, y: float, **kwargs) -> None:
-        """Set Gun Tilt (AngBal). Wraps `TEM3.Def3.SetAngBal`."""
-        if not self.def_:
-            logger.error("[BEAM] SetAngBal failed: Hardware not connected.")
-            raise RuntimeError("Deflector hardware not connected.")
-
-        logger.debug(f"[BEAM] SetAngBal({x}, {y})")
-        try:
-            self.def_.SetAngBal(int(x), int(y))
-        except Exception as e:
-            logger.error(f"[BEAM] SetAngBal failed: {e}")
-            raise
+        self._write_hw(self.def_, "SetAngBal", "BEAM", int(x), int(y))
 
     # --- Atomic Setters (Vendor Specific) ---
 
     def set_alpha_index(self, idx: int, **kwargs) -> None:
-        """Set Alpha Selector index. Wraps `TEM3.EOS3.SetAlphaSelector`."""
-        if not self.eos:
-            logger.error("[BEAM] SetAlphaSelector failed: Hardware not connected.")
-            raise RuntimeError("EOS hardware not connected.")
-
-        logger.debug(f"[BEAM] SetAlphaSelector({idx})")
-        try:
-            self.eos.SetAlphaSelector(int(idx))
-        except Exception as e:
-            logger.error(f"[BEAM] SetAlphaSelector failed: {e}")
-            raise
+        self._write_hw(self.eos, "SetAlphaSelector", "BEAM", int(idx))
 
     # --- Helper Layer Overrides ---
 
@@ -1353,97 +1210,36 @@ class JeolMicroscope(TemMicroscope):
         return None
 
     def get_defocus(self) -> Optional[Quantity]:
-        """
-        Get defocus in physical units (nm).
-        Logic: Returns None unless a calibration scale (`defocus_scale`) was provided at init.
-        """
-        if not self._has_defocus_calibration:
-            return None
-
-        if self.lens and hasattr(self.lens, "GetOLc"):
-            try:
-                val = float(self.lens.GetOLc())
-                return Q_(val / (self.defocus_scale or 1.0), Units.NM)
-            except Exception as e:
-                logger.debug(f"[LENS] GetOLc failed: {e}")
-        else:
-            logger.debug("[LENS] GetOLc failed: Hardware not connected.")
-        return None
+        if not self._has_defocus_calibration: return None
+        return self._read_hw(
+            self.lens, "GetOLc", "LENS",
+            lambda v: Q_(float(v) / (self.defocus_scale or 1.0), Units.NM)
+        )
 
     def get_screen_position(self) -> str:
-        """Get Phosphor Screen state ('UP'/'DOWN')."""
-        if not self.det3:
-            logger.debug("[LENS] GetScreen failed: Hardware not connected.")
-            return "UNKNOWN"
-        try:
-            if hasattr(self.det3, "GetScreen"):
-                idx = int(self.det3.GetScreen())
-                return "DOWN" if idx == 2 else "UP"
-        except Exception as e:
-            logger.debug(f"[LENS] GetScreen failed: {e}")
-        return "UNKNOWN"
+        # Custom logic mapping int -> String preserved via lambda or explicit read
+        idx = self._read_hw(self.det3, "GetScreen", "LENS", self._to_int)
+        if idx is None: return "UNKNOWN"
+        return "DOWN" if idx == 2 else "UP"
 
     def get_objective_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Objective Stigmation (OLs)."""
-        if self.def_ and hasattr(self.def_, "GetOLs"):
-            try:
-                res = self._coerce_xy(self.def_.GetOLs())
-                if res is not None:
-                    return res
-            except Exception as e:
-                logger.debug(f"[LENS] GetOLs failed: {e}")
-        else:
-            logger.debug("[LENS] GetOLs failed: Hardware not connected.")
-        return (None, None)
+        return self._read_hw(self.def_, "GetOLs", "LENS", self._coerce_xy, default=(None, None))
 
     def get_diffraction_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Diffraction Stigmator Coils (ILs)."""
-        if self.def_ and hasattr(self.def_, "GetILs"):
-            try:
-                return self._coerce_xy(self.def_.GetILs()) or (None, None)
-            except Exception as e:
-                logger.debug(f"[LENS] GetILs failed: {e}")
-        return (None, None)
+        return self._read_hw(self.def_, "GetILs", "LENS", self._coerce_xy, default=(None, None))
 
     def get_image_shift(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Image Shift (IS1 or IS)."""
-        if self.def_:
-            try:
-                if hasattr(self.def_, "GetIS1"):
-                    return self._coerce_xy(self.def_.GetIS1()) or (None, None)
-                if hasattr(self.def_, "GetIS"):
-                    return self._coerce_xy(self.def_.GetIS()) or (None, None)
-            except Exception as e:
-                logger.debug(f"[LENS] GetIS/IS1 failed: {e}")
-        else:
-            logger.debug("[LENS] GetIS failed: Hardware not connected.")
-        return (None, None)
+        # Logic retention: Fallback IS1 vs IS
+        res = self._read_hw(self.def_, "GetIS1", "LENS", self._coerce_xy)
+        return res if res else self._read_hw(self.def_, "GetIS", "LENS", self._coerce_xy, default=(None, None))
 
     def get_diffraction_shift(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get Diffraction Shift (PLA)."""
-        if self.def_ and hasattr(self.def_, "GetPLA"):
-            try:
-                res = self._coerce_xy(self.def_.GetPLA())
-                if res is not None:
-                    return res
-            except Exception as e:
-                logger.debug(f"[LENS] GetPLA failed: {e}")
-        else:
-            logger.debug("[LENS] GetPLA failed: Hardware not connected.")
-        return (None, None)
+        return self._read_hw(self.def_, "GetPLA", "LENS", self._coerce_xy, default=(None, None))
 
     # --- Atomic Getters (Vendor Specific) ---
 
     def get_defocus_dac(self) -> Optional[int]:
-        """Get raw OLc DAC value."""
-        if self.lens and hasattr(self.lens, "GetOLc"):
-            try:
-                return int(self.lens.GetOLc())
-            except Exception as e:
-                logger.debug(f"[LENS] GetOLc (DAC) failed: {e}")
-        else:
-            logger.debug("[LENS] GetOLc (DAC) failed: Hardware not connected.")
-        return None
+        return self._read_hw(self.lens, "GetOLc", "LENS", self._to_int)
 
     # --- Atomic Setters ---
 
@@ -1574,112 +1370,38 @@ class JeolMicroscope(TemMicroscope):
             raise
 
     def set_defocus(self, defocus: Quantity, **kwargs) -> None:
-        """
-        Set defocus in physical units.
-        Logic: Converts nm -> DAC using `defocus_scale`. Error if uncalibrated.
-        """
         if not self._has_defocus_calibration:
             raise ValueError("JEOL driver cannot set physical defocus without calibration.")
-
-        if not self.lens:
-            logger.error("[LENS] SetOLc failed: Hardware not connected.")
-            raise RuntimeError("Lens hardware not connected.")
-
         val = float(defocus.to(Units.NM).magnitude)
         dac = int(val * (self.defocus_scale or 1.0))
-
-        logger.debug(f"[LENS] SetOLc({dac})")
-        try:
-            self.lens.SetOLc(dac)
-        except Exception as e:
-            logger.error(f"[LENS] SetOLc failed: {e}")
-            raise
+        self._write_hw(self.lens, "SetOLc", "LENS", dac)
 
     def set_screen_position(self, position: str, **kwargs) -> None:
-        """Set Phosphor Screen ('UP'/'DOWN')."""
-        if not self.det3:
-            logger.error("[LENS] SetScreen failed: Hardware not connected.")
-            raise RuntimeError("Detector3 hardware not connected.")
-
         p = (position or "").strip().upper()
-        logger.debug(f"[LENS] SetScreen({p})")
-
-        try:
-            if p == "DOWN":
-                self.det3.SetScreen(2)
-            elif p == "UP":
-                self.det3.SetScreen(0)
-        except Exception as e:
-            logger.error(f"[LENS] SetScreen failed: {e}")
-            raise
+        val = 2 if p == "DOWN" else 0
+        self._write_hw(self.det3, "SetScreen", "LENS", val)
 
     def set_objective_stigmation(self, x: float, y: float, **kwargs) -> None:
-        """Set Objective Stigmation (OLs)."""
-        if not self.def_:
-            logger.error("[LENS] SetOLs failed: Hardware not connected.")
-            raise RuntimeError("Deflector hardware not connected.")
-
-        logger.debug(f"[LENS] SetOLs({x}, {y})")
-        try:
-            self.def_.SetOLs(int(x), int(y))
-        except Exception as e:
-            logger.error(f"[LENS] SetOLs failed: {e}")
-            raise
+        self._write_hw(self.def_, "SetOLs", "LENS", int(x), int(y))
 
     def set_diffraction_stigmation(self, x: float, y: float, **kwargs) -> None:
-        """Set Diffraction Stigmator Coils (ILs)."""
-        if not self.def_:
-            raise RuntimeError("Deflector hardware not connected.")
-        logger.debug(f"[LENS] SetILs({x}, {y})")
-        try:
-            self.def_.SetILs(int(x), int(y))
-        except Exception as e:
-            logger.error(f"[LENS] SetILs failed: {e}")
-            raise
+        self._write_hw(self.def_, "SetILs", "LENS", int(x), int(y))
 
     def set_image_shift(self, x: float, y: float, **kwargs) -> None:
-        """Set Image Shift (IS1 or IS)."""
-        if not self.def_:
-            logger.error("[LENS] SetIS failed: Hardware not connected.")
-            raise RuntimeError("Deflector hardware not connected.")
-
-        logger.debug(f"[LENS] SetIS({x}, {y})")
-        try:
-            if hasattr(self.def_, "SetIS1"):
-                self.def_.SetIS1(int(x), int(y))
-            else:
-                self.def_.SetIS(int(x), int(y))
-        except Exception as e:
-            logger.error(f"[LENS] SetIS failed: {e}")
-            raise
+        # Logic retention: try IS1, fallback to IS inside try-catch block of helper?
+        # Helper is atomic. We check if method exists.
+        if hasattr(self.def_, "SetIS1"):
+            self._write_hw(self.def_, "SetIS1", "LENS", int(x), int(y))
+        else:
+            self._write_hw(self.def_, "SetIS", "LENS", int(x), int(y))
 
     def set_diffraction_shift(self, x: float, y: float, **kwargs) -> None:
-        """Set Diffraction Shift (PLA)."""
-        if not self.def_:
-            logger.error("[LENS] SetPLA failed: Hardware not connected.")
-            raise RuntimeError("Deflector hardware not connected.")
-
-        logger.debug(f"[LENS] SetPLA({x}, {y})")
-        try:
-            self.def_.SetPLA(int(x), int(y))
-        except Exception as e:
-            logger.error(f"[LENS] SetPLA failed: {e}")
-            raise
+        self._write_hw(self.def_, "SetPLA", "LENS", int(x), int(y))
 
     # --- Atomic Setters (Vendor Specific) ---
 
     def set_defocus_dac(self, dac: int) -> None:
-        """Set raw OLc DAC value."""
-        if not self.lens:
-            logger.error("[LENS] SetOLc(DAC) failed: Hardware not connected.")
-            raise RuntimeError("Lens hardware not connected.")
-
-        logger.debug(f"[LENS] SetOLc(DAC={dac})")
-        try:
-            self.lens.SetOLc(int(dac))
-        except Exception as e:
-            logger.error(f"[LENS] SetOLc (DAC) failed: {e}")
-            raise
+        self._write_hw(self.lens, "SetOLc", "LENS", int(dac))
 
     # --- Helper Layer Overrides ---
 
@@ -2378,39 +2100,27 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def get_column_valve_state(self) -> str:
-        if self.vac and hasattr(self.vac, "GetValveStatus"):
-            try:
-                # Assuming bit 0 is column valve
-                _, bitfield = self.vac.GetValveStatus()
-                return "OPEN" if (bitfield & 1) else "CLOSED"
-            except Exception:
-                pass
+        # Logic retention: Bitfield 0 check
+        res = self._read_hw(self.vac, "GetValveStatus", "VAC")
+        if res and isinstance(res, (list, tuple)) and len(res) > 1:
+            return "OPEN" if (res[1] & 1) else "CLOSED"
         return "UNKNOWN"
 
     def get_gun_valve_state(self) -> str:
-        if self.gun:
-            try:
-                return "OPEN" if int(self.gun.GetBeamValve()) == 1 else "CLOSED"
-            except Exception:
-                pass
-        return "UNKNOWN"
+        val = self._read_hw(self.gun, "GetBeamValve", "VAC", self._to_int)
+        return "OPEN" if val == 1 else "CLOSED" if val is not None else "UNKNOWN"
 
     def get_turbo_pump_state(self) -> str:
-        # Assuming bit 1 is turbo
-        if self.vac and hasattr(self.vac, "GetValveStatus"):
-            try:
-                _, bitfield = self.vac.GetValveStatus()
-                return "ON" if (bitfield & 2) else "OFF"
-            except Exception:
-                pass
+        res = self._read_hw(self.vac, "GetValveStatus", "VAC")
+        if res and isinstance(res, (list, tuple)) and len(res) > 1:
+            return "ON" if (res[1] & 2) else "OFF"
         return "UNKNOWN"
 
     def get_column_pressure(self) -> Optional[Quantity]:
-        if self.vac and hasattr(self.vac, "GetPegInfo"):
-            try:
-                return Q_(float(self.vac.GetPegInfo()[0]), Units.PA)
-            except Exception:
-                pass
+        # Logic retention: GetPegInfo()[0]
+        res = self._read_hw(self.vac, "GetPegInfo", "VAC")
+        if res and len(res) > 0:
+            return Q_(float(res[0]), Units.PA)
         return None
 
     def get_gun_pressure(self) -> Optional[Quantity]:
@@ -2418,11 +2128,9 @@ class JeolMicroscope(TemMicroscope):
         return None
 
     def get_buffer_tank_pressure(self) -> Optional[Quantity]:
-        if self.vac and hasattr(self.vac, "GetPigInfo"):
-            try:
-                return Q_(float(self.vac.GetPigInfo()[0]), Units.PA)
-            except Exception:
-                pass
+        res = self._read_hw(self.vac, "GetPigInfo", "VAC")
+        if res and len(res) > 0:
+            return Q_(float(res[0]), Units.PA)
         return None
 
     # --- Atomic Setters ---
@@ -2431,11 +2139,7 @@ class JeolMicroscope(TemMicroscope):
         raise NotImplementedError("Column Valve control not supported.")
 
     def set_gun_valve_state(self, state: str, **kwargs) -> None:
-        if not self.gun: raise RuntimeError("GUN3 not connected.")
-        try:
-            self.gun.SetBeamValve(1 if state == "OPEN" else 0)
-        except Exception as e:
-            raise e
+        self._write_hw(self.gun, "SetBeamValve", "VAC", 1 if state == "OPEN" else 0)
 
     def set_turbo_pump_state(self, state: str, **kwargs) -> None:
         raise NotImplementedError("Turbo Pump control not supported.")
@@ -2455,26 +2159,23 @@ class JeolMicroscope(TemMicroscope):
         return idx is not None and idx > 0
 
     def get_aperture_size_index(self, aperture_id: str) -> Optional[int]:
-        if not self.apt: return None
         kind = self._APERTURE_MAP.get(aperture_id)
         if kind is None: return None
-        try:
-            self.apt.SelectExpKind(kind)
-            return int(self.apt.GetExpSize(kind))
-        except Exception: return None
+
+        # Use helper for the state change and the read
+        self._write_hw(self.apt, "SelectExpKind", "APT", kind)
+        return self._read_hw(self.apt, "GetExpSize", "APT", self._to_int, args=(kind,))
 
     def get_aperture_size_label(self, aperture_id: str) -> Optional[str]:
         return None
 
     def get_aperture_position(self, aperture_id: str) -> Optional[Point]:
-        if not self.apt: return None
         kind = self._APERTURE_MAP.get(aperture_id)
         if kind is None: return None
-        try:
-            self.apt.SelectExpKind(kind)
-            xy = self.apt.GetPosition()
-            return Point(x=float(xy[0]), y=float(xy[1]))
-        except Exception: return None
+
+        self._write_hw(self.apt, "SelectExpKind", "APT", kind)
+        res = self._read_hw(self.apt, "GetPosition", "APT")
+        return Point(x=float(res[0]), y=float(res[1])) if res else None
 
     # --- Atomic Setters ---
 
@@ -2485,20 +2186,16 @@ class JeolMicroscope(TemMicroscope):
              raise ValueError("Cannot set inserted=True without specifying size_index.")
 
     def set_aperture_size_index(self, aperture_id: str, index: int, **kwargs) -> None:
-        if not self.apt: raise RuntimeError("Apt3 not connected.")
         kind = self._APERTURE_MAP.get(aperture_id)
         if kind is None: raise ValueError(f"Unknown ID {aperture_id}")
-        try:
-            self.apt.SelectExpKind(kind)
-            self.apt.SetExpSize(kind, int(index))
-            time.sleep(2) # Mechanical delay
-        except Exception as e: raise e
+
+        self._write_hw(self.apt, "SelectExpKind", "APT", kind)
+        self._write_hw(self.apt, "SetExpSize", "APT", kind, int(index))
+        time.sleep(2)  # Mechanical delay remains
 
     def set_aperture_position(self, aperture_id: str, x: float, y: float, **kwargs) -> None:
-        if not self.apt: raise RuntimeError("Apt3 not connected.")
         kind = self._APERTURE_MAP.get(aperture_id)
         if kind is None: raise ValueError(f"Unknown ID {aperture_id}")
-        try:
-            self.apt.SelectExpKind(kind)
-            self.apt.SetPosition(int(x), int(y))
-        except Exception as e: raise e
+
+        self._write_hw(self.apt, "SelectExpKind", "APT", kind)
+        self._write_hw(self.apt, "SetPosition", "APT", int(x), int(y))
