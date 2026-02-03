@@ -713,6 +713,32 @@ class TemMicroscope(ABC):
 
     # --- Helper Layer ---
 
+    def get_beam_settings(self) -> BeamSettings:
+        """Helper: Aggregates atomic beam state into a BeamSettings object."""
+        # Note: Point() construction handles the (None, None) case gracefully if needed,
+        # but we check explicit returns from atomics.
+
+        bs, bt = self.get_beam_shift(), self.get_beam_tilt()
+        cs = self.get_condenser_stigmation()
+        gt = self.get_gun_tilt()
+
+        return BeamSettings(
+            mode=self.get_mode(),  # Global mode usually lives here
+            voltage=self.get_acceleration_voltage(),
+            probe_mode=self.get_probe_mode(),
+            beam_current=self.get_beam_current(),
+            emission_current=self.get_emission_current(),
+            spot_size=self.get_spot_size(),
+            convergence_angle=self.get_convergence_angle(),
+            is_blanked=self.get_beam_blank(),
+
+            # Reconstruction of Points
+            beam_shift=Point(x=bs[0], y=bs[1]) if bs[0] is not None else None,
+            beam_tilt=Point(x=bt[0], y=bt[1]) if bt[0] is not None else None,
+            condenser_stigmation=Point(x=cs[0], y=cs[1]) if cs[0] is not None else None,
+            gun_tilt=Point(x=gt[0], y=gt[1]) if gt[0] is not None else None
+        )
+
     def apply_beam_settings(self, settings: BeamSettings, **kwargs) -> None:
         """
         Helper: Applies a partial beam configuration.
@@ -891,6 +917,26 @@ class TemMicroscope(ABC):
         pass
 
     # --- Helper Layer ---
+
+    def get_projection_settings(self) -> ProjectionSettings:
+        """Helper: Aggregates atomic projection state."""
+        obj_stig = self.get_objective_stigmation()
+        diff_stig = self.get_diffraction_stigmation()
+        img_shift = self.get_image_shift()
+        diff_shift = self.get_diffraction_shift()
+
+        return ProjectionSettings(
+            optical_mode=self.get_optical_mode(),
+            magnification=self.get_magnification(),
+            camera_length=self.get_camera_length(),
+            defocus=self.get_defocus(),
+            screen_position=self.get_screen_position(),
+
+            objective_stigmation=Point(x=obj_stig[0], y=obj_stig[1]) if obj_stig[0] is not None else None,
+            diffraction_stigmation=Point(x=diff_stig[0], y=diff_stig[1]) if diff_stig[0] is not None else None,
+            image_shift=Point(x=img_shift[0], y=img_shift[1]) if img_shift[0] is not None else None,
+            diffraction_shift=Point(x=diff_shift[0], y=diff_shift[1]) if diff_shift[0] is not None else None
+        )
 
     def apply_projection_settings(self, settings: ProjectionSettings, **kwargs) -> None:
         """Helper: Applies partial projection settings."""
@@ -1163,6 +1209,26 @@ class TemMicroscope(ABC):
 
     # --- Helper Layer ---
 
+    def get_detector_settings(self, detector_id: str) -> DetectorSettings:
+        """Helper: Aggregates atomic detector state."""
+        return DetectorSettings(
+            detector_id=detector_id,
+            inserted=self.get_detector_inserted(detector_id),
+            exposure=self.get_detector_exposure(detector_id),
+            binning_index=self.get_detector_binning_index(detector_id),
+            binning_xy=self.get_detector_binning_xy(detector_id),
+            roi=self.get_detector_roi(detector_id),
+            gain_index=self.get_detector_gain_index(detector_id),
+            offset_index=self.get_detector_offset_index(detector_id),
+            digital_rotation=self.get_detector_digital_rotation(detector_id),
+            frame_integration=self.get_detector_frame_integration(detector_id),
+            frame_rate=self.get_detector_frame_rate(detector_id),
+            total_frames=self.get_detector_total_frames(detector_id),
+            readout_mode=self.get_detector_readout_mode(detector_id),
+            shutter_mode=self.get_detector_shutter_mode(detector_id),
+            save_frames=self.get_detector_save_frames(detector_id)
+        )
+
     def apply_detector_settings(self, detector_id: str, settings: DetectorSettings, **kwargs) -> None:
         """
         Helper: Applies a partial detector configuration.
@@ -1399,6 +1465,18 @@ class TemMicroscope(ABC):
 
     # --- Helper Layer ---
 
+    def get_scan_settings(self) -> ScanSettings:
+        """Helper: Aggregates atomic scan engine state."""
+        return ScanSettings(
+            scan_mode=self.get_scan_mode(),
+            active=self.get_scan_active(),
+            width_px=self.get_scan_width(),
+            height_px=self.get_scan_height(),
+            pixel_dwell_time=self.get_scan_pixel_dwell(),
+            flyback_time=self.get_scan_flyback(),
+            scan_rotation=self.get_scan_rotation()
+        )
+
     def apply_scan_settings(self, settings: ScanSettings, **kwargs) -> None:
         """Helper: Applies a partial scan configuration."""
         if settings.scan_mode is not None:
@@ -1509,6 +1587,17 @@ class TemMicroscope(ABC):
 
     # --- Helper Layer ---
 
+    def get_vacuum_settings(self) -> VacuumSettings:
+        """Helper: Aggregates atomic vacuum state."""
+        return VacuumSettings(
+            column_valve_state=self.get_column_valve_state(),
+            gun_valve_state=self.get_gun_valve_state(),
+            turbo_pump_state=self.get_turbo_pump_state(),
+            column_pressure=self.get_column_pressure(),
+            gun_pressure=self.get_gun_pressure(),
+            buffer_tank_pressure=self.get_buffer_tank_pressure()
+        )
+
     def apply_vacuum_settings(self, settings: VacuumSettings, **kwargs) -> None:
         """Helper: Applies partial vacuum configuration."""
         if settings.column_valve_state is not None:
@@ -1596,6 +1685,16 @@ class TemMicroscope(ABC):
         pass
 
     # --- Helper Layer ---
+
+    def get_aperture_settings(self, aperture_id: str) -> ApertureSettings:
+        """Helper: Aggregates atomic aperture state."""
+        return ApertureSettings(
+            aperture_id=aperture_id,
+            inserted=self.get_aperture_inserted(aperture_id),
+            size_index=self.get_aperture_size_index(aperture_id),
+            size_label=self.get_aperture_size_label(aperture_id),
+            position=self.get_aperture_position(aperture_id)
+        )
 
     def apply_aperture_settings(self, aperture_id: str, settings: ApertureSettings, **kwargs) -> None:
         """
