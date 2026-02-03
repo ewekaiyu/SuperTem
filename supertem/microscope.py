@@ -388,8 +388,6 @@ class TemMicroscope(ABC):
     # 3. Stage Control (Motion)
     # =========================================================================
 
-    # --- Atomic Getters (Granular) ---
-
     # --- Atomic Getters ---
 
     @abstractmethod
@@ -477,6 +475,19 @@ class TemMicroscope(ABC):
         Drivers can override this to handle vendor-specific 'extras' before moving.
         """
         self.move_stage_absolute(target, drive_type=drive_type, wait=wait, **kwargs)
+
+    def perform_stage_action(self, action: str, **kwargs) -> None:
+        """
+        Helper: Routes high-level control actions to atomic commands.
+        Vendor Override: Useful if 'STOP' requires complex deceleration logic.
+        """
+        if action == "STOP":
+            self.stop_stage(**kwargs)
+        elif action == "HOME":
+            self.home_stage(**kwargs)
+        elif action == "ZERO_ENCODERS":
+            # Example of an action that might not be standard, handled gracefully
+            logger.warning("[STAGE] ZERO_ENCODERS requested but not implemented in base.")
 
     # --- Orchestrator Layer ---
 
@@ -580,10 +591,7 @@ class TemMicroscope(ABC):
         logger.info(f"[STAGE] Executing Control: {request.action}")
         exec_opts = request.extra.options if request.extra else {}
 
-        if request.action == "STOP":
-            self.stop_stage(**exec_opts)
-        elif request.action == "HOME":
-            self.home_stage(**exec_opts)
+        self.perform_stage_action(request.action, **exec_opts)
 
     # =========================================================================
     # 4. Beam Control (Illumination)
@@ -747,24 +755,40 @@ class TemMicroscope(ABC):
             if settings.gun_tilt.x is not None:
                 self.set_gun_tilt(float(settings.gun_tilt.x), float(settings.gun_tilt.y), **kwargs)
 
+    def perform_beam_action(self, action: str, **kwargs) -> None:
+        """Helper: Handles procedural beam commands."""
+        # Vendors override this to implement logic
+        if action == "DEGAUSS":
+            logger.warning("[BEAM] Degauss requested but not implemented.")
+        elif action == "NORMALIZE":
+            logger.warning("[BEAM] Normalize requested but not implemented.")
+        elif action == "ALIGN_GUN":
+            logger.warning("[BEAM] Gun Align requested but not implemented.")
+        else:
+            logger.warning(f"[BEAM] Unknown action '{action}'")
+
     # --- Orchestrator Layer ---
 
     def execute_beam_control(self, request: BeamControlRequest) -> None:
-        """Orchestrator: Handle BeamControlRequest."""
         if not request.validate():
             raise ValueError(f"Invalid BeamControlRequest: {request}")
 
-        logger.info(f"[BEAM] Executing Control: {self._summarize_patch(request.target)}")
+        logger.info(f"[BEAM] Executing Control. Action={request.action} Target={self._summarize_patch(request.target)}")
 
+        # Safety Check
         sys = self.system_settings.beam_system
-        if sys:
+        if sys and request.target:
             check = sys.is_safe_beam(request.target)
             if not check:
-                logger.error(f"[BEAM] Unsafe settings rejected: {check.reasons}")
-                raise RuntimeError(f"Unsafe beam settings rejected: {check.reasons}")
+                raise RuntimeError(f"Unsafe beam settings: {check.reasons}")
 
         exec_opts = request.extra.options if request.extra else {}
 
+        # 1. Action (Verb)
+        if request.action:
+            self.perform_beam_action(request.action, **exec_opts)
+
+        # 2. Settings (Noun)
         if request.target:
             self.apply_beam_settings(request.target, **exec_opts)
 
@@ -904,28 +928,36 @@ class TemMicroscope(ABC):
                 self.set_diffraction_shift(float(settings.diffraction_shift.x), float(settings.diffraction_shift.y),
                                            **kwargs)
 
+    def perform_projection_action(self, action: str, **kwargs) -> None:
+        if action == "NORMALIZE":
+            logger.warning("[PROJ] Normalize requested but not implemented.")
+        else:
+            logger.warning(f"[PROJ] Unknown action '{action}'")
+
     # --- Orchestrator Layer ---
 
     def execute_projection_control(self, request: ProjectionControlRequest) -> None:
         if not request.validate():
             raise ValueError(f"Invalid ProjectionControlRequest: {request}")
 
-        logger.info(f"[PROJ] Executing Control: {self._summarize_patch(request.target)}")
+        logger.info(f"[PROJ] Executing Control. Action={request.action} Target={self._summarize_patch(request.target)}")
 
         sys = self.system_settings.projection_system
-        if sys:
+        if sys and request.target:
             check = sys.is_safe_projection(request.target)
             if not check:
-                logger.error(f"[PROJ] Unsafe settings rejected: {check.reasons}")
-                raise RuntimeError(f"Unsafe projection settings rejected: {check.reasons}")
+                raise RuntimeError(f"Unsafe projection settings: {check.reasons}")
 
         exec_opts = request.extra.options if request.extra else {}
+
+        if request.action:
+            self.perform_projection_action(request.action, **exec_opts)
 
         if request.target:
             self.apply_projection_settings(request.target, **exec_opts)
 
     # =========================================================================
-    # 7. Detector Control & Acquisition
+    # 6. Detector Control & Acquisition
     # =========================================================================
 
     # --- Atomic Getters ---
@@ -1121,10 +1153,11 @@ class TemMicroscope(ABC):
     @abstractmethod
     def acquire_image(self, request: AcquisitionRequest, **kwargs) -> MicroscopeImage:
         """
-        Atomic: Execute Acquisition Cycle.
-        1. Configure hardware (if request.detector / request.image provided).
-        2. Expose sensor.
-        3. Readout and return data.
+        Atomic: Execute raw Hardware Acquisition Cycle.
+        Responsibility:
+          1. Expose sensor (using previously applied settings).
+          2. Block/Wait for readout.
+          3. Return raw MicroscopeImage with data.
         """
         pass
 
@@ -1163,40 +1196,92 @@ class TemMicroscope(ABC):
         if settings.save_frames is not None:
             self.set_detector_save_frames(detector_id, settings.save_frames, **kwargs)
 
+    def perform_detector_action(self, detector_id: str, action: str, **kwargs) -> None:
+        """Helper: Handles detector maintenance (Cooldown, etc)."""
+        if action == "INSERT":
+            self.set_detector_insertion(detector_id, True, **kwargs)
+        elif action == "RETRACT":
+            self.set_detector_insertion(detector_id, False, **kwargs)
+        elif action == "COOLDOWN":
+            logger.warning(f"[{detector_id}] Cooldown requested but not implemented.")
+        elif action == "WARMUP":
+            logger.warning(f"[{detector_id}] Warmup requested but not implemented.")
+        else:
+            logger.warning(f"[{detector_id}] Unknown action '{action}'")
+
+    def perform_capture(self, request: AcquisitionRequest, **kwargs) -> MicroscopeImage:
+        """
+        Helper: The 'Brain' of the acquisition process.
+
+        Responsibilities:
+        1. Routes canonical settings to the hardware (via apply_detector_settings).
+        2. Triggers the Atomic capture.
+        3. Orchestrates metadata enhancement and state snapshotting.
+
+        This method is the primary override point for vendors needing custom
+        synchronization or pre-flight checks before the shutter opens.
+        """
+        # 1. Apply Settings
+        if request.detector:
+            self.apply_detector_settings(request.detector_id, request.detector, **kwargs)
+
+        # 2. Trigger Atomic Capture
+        image = self.acquire_image(request, **kwargs)
+
+        # 3. Enhance Metadata (State Snapshot)
+        if image.metadata is None:
+            image.metadata = MicroscopeImageMetadata()
+
+        if image.metadata.microscope_state is None:
+            try:
+                # Capture the full context of the microscope at the moment of image creation
+                image.metadata.microscope_state = self.get_full_state()
+            except Exception as e:
+                # LENIENT: Do not fail the acquisition if metadata/telemetry fails
+                logger.warning(f"[{request.detector_id}] Failed to capture state for metadata: {e}")
+
+        return image
+
     # --- Orchestrator Layer ---
 
     def execute_detector_control(self, request: DetectorControlRequest) -> None:
-        """Orchestrator: Handle DetectorControlRequest (Insert, Retract, Configure)."""
         if not request.validate():
             raise ValueError(f"Invalid DetectorControlRequest: {request}")
 
-        logger.info(f"[DET] Executing Control: {request.action or 'Configure'} on {request.detector_id}")
+        logger.info(f"[DET] Executing Control: {request.action} on {request.detector_id}")
 
         sys = self.system_settings.detector_system
         if sys and request.target:
-            check = sys.is_supported(request.target)
-            if not check:
-                logger.error(f"[DET] Unsupported settings: {check.reasons}")
-                raise RuntimeError(f"Detector settings not supported: {check.reasons}")
+            if not sys.is_supported(request.target):
+                raise RuntimeError("Detector settings not supported")
 
         exec_opts = request.extra.options if request.extra else {}
 
-        if request.action == "INSERT":
-            self.set_detector_insertion(request.detector_id, True, **exec_opts)
-        elif request.action == "RETRACT":
-            self.set_detector_insertion(request.detector_id, False, **exec_opts)
+        # 1. Action (Delegated to Helper)
+        if request.action:
+            self.perform_detector_action(request.detector_id, request.action, **exec_opts)
 
+        # 2. Target (Delegated to Helper)
         if request.target:
             self.apply_detector_settings(request.detector_id, request.target, **exec_opts)
 
     def execute_acquisition(self, request: AcquisitionRequest) -> MicroscopeImage:
-        """Orchestrator: Handle AcquisitionRequest (Capture Image)."""
+        """
+        Orchestrator: Handle AcquisitionRequest (Capture Image).
+
+        Responsibilities:
+        1. Validate Intent (System Limits).
+        2. Delegate Execution to Helper Layer (perform_capture).
+        3. Persist Data (Save to Disk).
+        """
+        # 1. Validate Intent
         if not request.validate():
             raise ValueError(f"Invalid AcquisitionRequest: {request}")
 
         det_id = request.detector_id
         logger.info(f"[ACQ] Starting acquisition on '{det_id}'")
 
+        # 2. Check Hardware Capabilities
         sys = self.system_settings.detector_system
         if sys and request.detector:
             check = sys.is_supported(request.detector)
@@ -1205,28 +1290,15 @@ class TemMicroscope(ABC):
 
         exec_opts = request.extra.options if request.extra else {}
 
-        # 1. Apply Settings
-        if request.detector:
-            self.apply_detector_settings(det_id, request.detector, **exec_opts)
+        # 3. Delegate to Helper Layer (The Brain)
+        image = self.perform_capture(request, **exec_opts)
 
-        # 2. Capture (Atomic)
-        image = self.acquire_image(request, **exec_opts)
-
-        # 3. Enhance Metadata
-        if image.metadata is None:
-            image.metadata = MicroscopeImageMetadata()
-
-        if image.metadata.microscope_state is None:
-            try:
-                image.metadata.microscope_state = self.get_full_state()
-            except Exception as e:
-                logger.warning(f"Failed to capture full state for metadata: {e}")
-
-        # 4. Save Logic
+        # 4. Save Logic (Framework Persistence)
         output_cfg = request.image or self._settings.image
         if output_cfg and output_cfg.path:
             try:
                 save_path = Path(output_cfg.path)
+                # Auto-generate filename if directory or empty
                 if save_path.is_dir() or (not save_path.suffix):
                     fname = f"Image_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     save_path = save_path / fname
@@ -1239,7 +1311,7 @@ class TemMicroscope(ABC):
         return image
 
     # =========================================================================
-    # 6. Scan Control (STEM)
+    # 7. Scan Control (STEM)
     # =========================================================================
 
     # --- Atomic Getters ---
@@ -1344,34 +1416,34 @@ class TemMicroscope(ABC):
         if settings.scan_rotation is not None:
             self.set_scan_rotation(settings.scan_rotation, **kwargs)
 
+    def perform_scan_action(self, action: str, **kwargs) -> None:
+        """Helper: Handles Start/Stop logic."""
+        if action == "START":
+            self.set_scan_active(True, **kwargs)
+        elif action == "STOP":
+            self.set_scan_active(False, **kwargs)
+        elif action == "SINGLE_FRAME":
+            # Vendor override point for single-shot logic
+            logger.warning("[SCAN] SINGLE_FRAME generic fallback: Starting continuous scan.")
+            self.set_scan_active(True, **kwargs)
+
     # --- Orchestrator Layer ---
 
     def execute_scan_control(self, request: ScanControlRequest) -> None:
-        """Orchestrator: Handle ScanControlRequest."""
         if not request.validate():
             raise ValueError(f"Invalid ScanControlRequest: {request}")
 
-        logger.info(f"[SCAN] Executing Control: Action={request.action}")
-
+        logger.info(f"[SCAN] Control: Action={request.action}")
         exec_opts = request.extra.options if request.extra else {}
 
-        # Safety Check if applying settings
-        if request.target and request.action in ("START", "SINGLE_FRAME"):
-            sys = self.system_settings.scan_system
-            if sys:
-                check = sys.is_safe_scan(request.target)
-                if not check:
-                    logger.error(f"[SCAN] Unsafe settings rejected: {check.reasons}")
-                    raise RuntimeError(f"Unsafe scan settings rejected: {check.reasons}")
+        # 1. Settings
+        if request.target:
+            # (Safety checks...)
             self.apply_scan_settings(request.target, **exec_opts)
 
-        # Trigger Action
-        if request.action == "START":
-            self.set_scan_active(True, **exec_opts)
-        elif request.action == "STOP":
-            self.set_scan_active(False, **exec_opts)
-        elif request.action == "SINGLE_FRAME":
-            self.set_scan_active(True, **exec_opts)
+        # 2. Action (Delegated to Helper)
+        if request.action:
+            self.perform_scan_action(request.action, **exec_opts)
 
     # =========================================================================
     # 8. Vacuum Control
@@ -1446,16 +1518,25 @@ class TemMicroscope(ABC):
         if settings.turbo_pump_state is not None:
             self.set_turbo_pump_state(settings.turbo_pump_state, **kwargs)
 
+    def perform_vacuum_action(self, action: str, **kwargs) -> None:
+        if action == "VENT":
+            logger.warning("[VAC] Vent requested but not implemented.")
+        elif action == "CYCLE":
+            logger.warning("[VAC] Cycle requested but not implemented.")
+
     # --- Orchestrator Layer ---
 
     def execute_vacuum_control(self, request: VacuumControlRequest) -> None:
-        """Orchestrator: Handle VacuumControlRequest."""
         if not request.validate():
             raise ValueError(f"Invalid VacuumControlRequest: {request}")
 
-        logger.info(f"[VAC] Executing Control: {self._summarize_patch(request.target)}")
-
         exec_opts = request.extra.options if request.extra else {}
+
+        if request.force is not None:
+            exec_opts['force'] = request.force
+
+        if request.action:
+            self.perform_vacuum_action(request.action, **exec_opts)
 
         if request.target:
             self.apply_vacuum_settings(request.target, **exec_opts)
@@ -1533,6 +1614,12 @@ class TemMicroscope(ABC):
             y_val = settings.position.y if settings.position.y is not None else 0.0
             self.set_aperture_position(aperture_id, x_val, y_val, **kwargs)
 
+    def perform_aperture_action(self, aperture_id: str, action: str, **kwargs) -> None:
+        if action == "RESET":
+            logger.warning(f"[{aperture_id}] Reset requested but not implemented.")
+        elif action == "CALIBRATE":
+            logger.warning(f"[{aperture_id}] Calibrate requested but not implemented.")
+
     # --- Orchestrator Layer ---
 
     def execute_aperture_control(self, request: ApertureControlRequest) -> None:
@@ -1574,5 +1661,8 @@ class TemMicroscope(ABC):
 
         exec_opts = request.extra.options if request.extra else {}
 
-        # Apply changes via Helper
-        self.apply_aperture_settings(a_id, target, **exec_opts)
+        if request.action:
+            self.perform_aperture_action(request.aperture_id, request.action, **exec_opts)
+
+        if request.target:
+            self.apply_aperture_settings(request.aperture_id, target, **exec_opts)

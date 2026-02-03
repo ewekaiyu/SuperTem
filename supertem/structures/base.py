@@ -3969,17 +3969,25 @@ class BeamControlRequest:
             None Behavior: Validation Error (Mandatory).
     """
     target: Optional[BeamSettings] = None
+    action: Optional[str] = None  # NEW: "ALIGN", "DEGAUSS", "NORMALIZE"
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.target = p.model(BeamSettings, self.target, "target", default=BeamSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check_nested(self.target)
-        v.check_has_intent(self.target, "empty_target", "Beam request has no parameters set")
+        if self.target:
+            v.check_nested(self.target)
+
+        # Valid if it has a Target (Settings) OR an Action (Verb)
+        has_intent = (self.target is not None) or (self.action is not None)
+        has_intent = has_intent or _has_actionable_extras(self.extra)
+        v.check(has_intent, "empty", "Request must have settings (target) or an action")
+
         return v.valid
 
     def to_dict(self) -> dict:
@@ -4003,23 +4011,27 @@ class ProjectionControlRequest:
             None Behavior: Validation Error (Mandatory).
     """
     target: Optional[ProjectionSettings] = None
+    action: Optional[str] = None  # NEW: "NORMALIZE", "RESET_DEFOCUS"
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.target = p.model(ProjectionSettings, self.target, "target", default=ProjectionSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check_nested(self.target)
-        v.check_has_intent(self.target, "empty_target", "Projection request has no parameters set")
 
-        # Specific Logic: If switching to DIFFRACTION, you must provide a camera length
-        if self.target.optical_mode == "DIFFRACTION":
-            v.check(self.target.camera_length is not None, "missing_cam_len",
-                    "Switching to Diffraction requires a camera_length")
+        has_intent = (self.target is not None) or (self.action is not None)
+        has_intent = has_intent or _has_actionable_extras(self.extra)
+        v.check(has_intent, "empty", "Request must have settings (target) or an action")
 
+        if self.target:
+            v.check_nested(self.target)
+            if self.target.optical_mode == "DIFFRACTION":
+                v.check(self.target.camera_length is not None, "missing_cam_len",
+                        "Switching to Diffraction requires a camera_length")
         return v.valid
 
     def to_dict(self) -> dict:
@@ -4091,21 +4103,25 @@ class VacuumControlRequest:
             None Behavior: Defaulted to False.
     """
     target: Optional[VacuumSettings] = None
-    force: Optional[bool] = None  # If True, bypasses some software soft-checks (use with caution)
+    action: Optional[str] = None  # NEW: "VENT", "CYCLE", "BAKE"
+    force: Optional[bool] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
 
     def __post_init__(self):
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.target = p.model(VacuumSettings, self.target, "target", default=VacuumSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
         self.force = p.bool(self.force, "force", default=False)
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
-        v.check_nested(self.target)
 
-        v.check_has_intent(self.target, "empty_target",
-                           "Request must specify at least one state change")
+        has_intent = (self.target is not None) or (self.action is not None)
+        v.check(has_intent, "empty", "Request must have settings (target) or an action")
+
+        if self.target:
+            v.check_nested(self.target)
         return v.valid
 
     def to_dict(self) -> dict:
@@ -4134,6 +4150,7 @@ class ApertureControlRequest:
     """
     aperture_id: Optional[str] = None
     target: Optional[ApertureSettings] = None
+    action: Optional[str] = None  # NEW: "RESET", "CALIBRATE"
     relative: Optional[bool] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
@@ -4143,33 +4160,26 @@ class ApertureControlRequest:
         self.aperture_id = p.id(self.aperture_id, "aperture_id")
         self.relative = p.bool(self.relative, "relative", default=False)
         self.target = p.model(ApertureSettings, self.target, "target", default=ApertureSettings(_mode=p.mode))
+        self.action = p.str(self.action, "action")
+
         if self.aperture_id is None and self.target.aperture_id is not None:
             self.aperture_id = self.target.aperture_id
-        elif self.target.aperture_id is None and self.aperture_id is not None:
-            self.target.aperture_id = self.aperture_id
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
         v.check(bool(self.aperture_id), "aperture_id", "aperture_id is required")
-        v.check_nested(self.target)
 
-        # ID Mismatch
-        if self.target.aperture_id and self.aperture_id and self.target.aperture_id != self.aperture_id:
-            v.check(False, "id_mismatch",
-                    f"Ambiguous IDs: '{self.aperture_id}' vs '{self.target.aperture_id}'",
-                    heal=lambda: setattr(self.target, 'aperture_id', self.aperture_id))
+        has_intent = (self.target is not None) or (self.action is not None)
+        has_intent = has_intent or _has_actionable_extras(self.extra)
+        v.check(has_intent, "empty", "Request must have settings (target) or an action")
 
-        # Relative logic check
+        if self.target:
+            v.check_nested(self.target)
+            if self.target.aperture_id and self.aperture_id != self.target.aperture_id:
+                v.check(False, "id_mismatch", "Ambiguous IDs")
+
         if self.relative:
-            v.check(self.target.position is not None, "relative_no_pos", "Relative mode requires a position vector")
-
-        # No-Op Check
-        has_intent = (
-                self.target.inserted is not None or self.target.size_index is not None or self.target.position is not None)
-        # Vendor-only intents may live exclusively in Extras.vendor / Extras.unknown
-        has_intent = has_intent or _has_actionable_extras(getattr(self.target, 'extra', None))
-        has_intent = has_intent or _has_actionable_extras(getattr(self, 'extra', None))
-        v.check(has_intent, "empty_payload", "Request contains no changes")
+            v.check(self.target.position is not None, "relative_no_pos", "Relative move requires position")
 
         return v.valid
 
