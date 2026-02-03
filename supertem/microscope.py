@@ -376,7 +376,7 @@ class TemMicroscope(ABC):
             projection=self.get_projection_settings(),
             scan=self.get_scan_settings(),
             vacuum=self.get_vacuum_settings(),
-            apertures={a_id: self.get_aperture(a_id)
+            apertures={a_id: self.get_aperture_settings(a_id)
                        for a_id in self.list_apertures()},
             detectors={d_id: self.get_detector_settings(d_id)
                        for d_id in self.list_detectors()},
@@ -389,6 +389,9 @@ class TemMicroscope(ABC):
     # =========================================================================
 
     # --- Atomic Getters (Granular) ---
+
+    # --- Atomic Getters ---
+
     @abstractmethod
     def get_stage_x(self) -> Optional[Quantity]:
         """Atomic: Get X coordinate (nm)."""
@@ -424,12 +427,23 @@ class TemMicroscope(ABC):
         """Atomic: Get the current reference frame name."""
         pass
 
-    # --- Atomic Coordinated Move (Vector) ---
+    # --- Atomic Setters ---
+
     @abstractmethod
-    def move_stage_absolute(self, target: StagePosition, wait: bool = True) -> None:
+    def move_stage_absolute(self,
+                            target: StagePosition,
+                            drive_type: str = "default",
+                            wait: bool = True,
+                            **kwargs) -> None:
         """
         Atomic: Move multiple axes simultaneously (Vector Move).
         Target fields that are None should be ignored (no motion).
+
+        Args:
+            target: The coordinates to move to.
+            drive_type: Mechanism hint (e.g. 'piezo', 'motor', 'default').
+            wait: If True, block until move completes.
+            **kwargs: Vendor-specific parameters (e.g. tolerance_nm, retries).
         """
         pass
 
@@ -443,7 +457,8 @@ class TemMicroscope(ABC):
         """Atomic: Return stage to its mechanical origin/zero position."""
         pass
 
-    # --- Helper Layer (Aggregators) ---
+    # --- Helper Layer ---
+
     def get_stage_position(self) -> StagePosition:
         """
         Helper: Aggregates atomic primitives into a consistent StagePosition object.
@@ -458,15 +473,20 @@ class TemMicroscope(ABC):
             coordinate_system=self.get_stage_coordinate_system()
         )
 
-    def apply_stage_position(self, target: StagePosition, wait: bool = True) -> None:
+    def apply_stage_position(self,
+                             target: StagePosition,
+                             drive_type: str = "default",
+                             wait: bool = True,
+                             **kwargs) -> None:
         """
         Helper: Prepares and executes a stage move.
         Drivers can override this to handle vendor-specific 'extras' before moving.
         """
-        # We use the coordinated atomic move to ensure vector motion (not stair-stepping)
-        self.move_stage_absolute(target, wait=wait)
+        # Pass drive_type and vendor kwargs down to the atomic layer
+        self.move_stage_absolute(target, drive_type=drive_type, wait=wait, **kwargs)
 
     # --- Orchestrator Layer ---
+
     def execute_stage_move(self, request: StageMoveRequest) -> None:
         """Orchestrator: Validates intent and checks safety limits."""
         if not request.validate():
@@ -497,18 +517,32 @@ class TemMicroscope(ABC):
                 logger.error(f"[STAGE] Unsafe move rejected. Reasons: {check.reasons}")
                 raise RuntimeError(f"Unsafe move rejected: {check.reasons}")
 
-        # 3. Execution (via Safety Helper)
-        self.safe_move_stage(target_abs, drive_type=request.drive_type, wait=request.wait_for_settle)
+        # 3. Extract Vendor Options (New)
+        # Allows user to pass {"tolerance_nm": 50} in the request extras
+        vendor_opts = {}
+        if request.extra and request.extra.vendor:
+            vendor_opts = request.extra.vendor.get("options", {})
 
-    def safe_move_stage(self, target: StagePosition,
+        # 4. Execution (via Safety Helper)
+        # Pass drive_type and the new vendor options down
+        self.safe_move_stage(
+            target_abs,
+            drive_type=request.drive_type,
+            wait=request.wait_for_settle,
+            **vendor_opts
+        )
+
+    def safe_move_stage(self,
+                        target: StagePosition,
                         drive_type: str = "default",
-                        wait: bool = True) -> None:
+                        wait: bool = True,
+                        **kwargs) -> None:
         """
         Safety Helper: Breaks large moves into smaller linear steps if required.
         """
         sys = self.system_settings.stage_system
         if not sys or not sys.max_step_distance:
-            self.apply_stage_position(target, wait=wait)
+            self.apply_stage_position(target, drive_type=drive_type, wait=wait, **kwargs)
             return
 
         current = self.get_stage_position()
@@ -528,7 +562,7 @@ class TemMicroscope(ABC):
         max_dist = max(d_x, d_y, d_z)
 
         if max_dist <= max_step_nm:
-            self.apply_stage_position(target, wait=wait)
+            self.apply_stage_position(target, drive_type=drive_type, wait=wait, **kwargs)
             return
 
         # Linear Interpolation
@@ -554,7 +588,7 @@ class TemMicroscope(ABC):
                 interim.tilt_x = target.tilt_x
                 interim.tilt_y = target.tilt_y
 
-            self.apply_stage_position(interim, wait=True)
+            self.apply_stage_position(interim, drive_type=drive_type, wait=True, **kwargs)
 
     def execute_stage_control(self, request: StageControlRequest) -> None:
         """Orchestrator: Handle StageControlRequest (STOP, HOME)."""
@@ -573,9 +607,17 @@ class TemMicroscope(ABC):
     # =========================================================================
 
     # --- Atomic Getters ---
+
+    # --- Atomic Getters ---
+
     @abstractmethod
     def get_acceleration_voltage(self) -> Optional[Quantity]:
         """Get High Tension (kV). Returns None if unknown."""
+        pass
+
+    @abstractmethod
+    def get_probe_mode(self) -> Optional[str]:
+        """Get probe mode (e.g. 'Microprobe', 'Nanoprobe'). Returns None if unknown."""
         pass
 
     @abstractmethod
@@ -599,6 +641,11 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
+    def get_beam_blank(self) -> bool:
+        """Get Beam Blank Status. True=Blanked."""
+        pass
+
+    @abstractmethod
     def get_beam_shift(self) -> Tuple[Optional[float], Optional[float]]:
         """Get Beam Shift Coils (x, y). Returns (None, None) if unknown."""
         pass
@@ -618,20 +665,16 @@ class TemMicroscope(ABC):
         """Get Gun Tilt Alignment (x, y). Returns (None, None) if unknown."""
         pass
 
-    @abstractmethod
-    def get_beam_blank(self) -> bool:
-        """Get Beam Blank Status. True=Blanked."""
-        pass
-
-    @abstractmethod
-    def get_probe_mode(self) -> Optional[str]:
-        """Get probe mode (e.g. 'Microprobe', 'Nanoprobe'). Returns None if unknown."""
-        pass
-
     # --- Atomic Setters ---
+
     @abstractmethod
     def set_acceleration_voltage(self, voltage: Quantity) -> None:
         """Set High Tension (kV)."""
+        pass
+
+    @abstractmethod
+    def set_probe_mode(self, mode: str) -> None:
+        """Set probe mode."""
         pass
 
     @abstractmethod
@@ -655,6 +698,11 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
+    def set_beam_blank(self, blank: bool) -> None:
+        """Set Beam Blanker. True = Blank (Block)."""
+        pass
+
+    @abstractmethod
     def set_beam_shift(self, x: float, y: float) -> None:
         """Set Beam Shift Coils."""
         pass
@@ -674,17 +722,8 @@ class TemMicroscope(ABC):
         """Set Gun Tilt Alignment."""
         pass
 
-    @abstractmethod
-    def set_beam_blank(self, blank: bool) -> None:
-        """Set Beam Blanker. True = Blank (Block)."""
-        pass
+    # --- Helper Layer ---
 
-    @abstractmethod
-    def set_probe_mode(self, mode: str) -> None:
-        """Set probe mode."""
-        pass
-
-    # --- Logic Layer ---
     def get_beam_settings(self) -> BeamSettings:
         """Aggregator: returns full BeamSettings snapshot."""
         bs = self.get_beam_shift()
@@ -753,6 +792,8 @@ class TemMicroscope(ABC):
             if settings.gun_tilt.x is not None:
                 self.set_gun_tilt(float(settings.gun_tilt.x), float(settings.gun_tilt.y))
 
+    # --- Orchestrator Layer ---
+
     def execute_beam_control(self, request: BeamControlRequest) -> None:
         """Orchestrator: Handle BeamControlRequest."""
         if not request.validate():
@@ -775,6 +816,9 @@ class TemMicroscope(ABC):
     # =========================================================================
 
     # --- Atomic Getters ---
+
+    # --- Atomic Getters ---
+
     @abstractmethod
     def get_optical_mode(self) -> str:
         """Get optical mode (e.g., 'IMAGING', 'DIFFRACTION')."""
@@ -821,6 +865,7 @@ class TemMicroscope(ABC):
         pass
 
     # --- Atomic Setters ---
+
     @abstractmethod
     def set_optical_mode(self, mode: str) -> None:
         """Set optical mode."""
@@ -866,7 +911,7 @@ class TemMicroscope(ABC):
         """Set Diffraction Shift Coils."""
         pass
 
-    # --- Logic Layer ---
+    # --- Helper Layer ---
 
     def get_projection_settings(self) -> ProjectionSettings:
         """Aggregator: returns full ProjectionSettings snapshot."""
@@ -927,6 +972,8 @@ class TemMicroscope(ABC):
             if settings.diffraction_shift.x is not None:
                 self.set_diffraction_shift(float(settings.diffraction_shift.x), float(settings.diffraction_shift.y))
 
+    # --- Orchestrator Layer ---
+
     def execute_projection_control(self, request: ProjectionControlRequest) -> None:
         if not request.validate():
             raise ValueError(f"Invalid ProjectionControlRequest: {request}")
@@ -944,131 +991,13 @@ class TemMicroscope(ABC):
             self.apply_projection_settings(request.target)
 
     # =========================================================================
-    # 6. Scan Control (STEM)
-    # =========================================================================
-
-    # --- Atomic Getters ---
-    @abstractmethod
-    def get_scan_mode(self) -> str:
-        """Get scan engine mode."""
-        pass
-
-    @abstractmethod
-    def get_scan_width(self) -> Optional[int]:
-        """Get scan width in pixels. Returns None if unknown."""
-        pass
-
-    @abstractmethod
-    def get_scan_height(self) -> Optional[int]:
-        """Get scan height in pixels. Returns None if unknown."""
-        pass
-
-    @abstractmethod
-    def get_scan_pixel_dwell(self) -> Optional[Quantity]:
-        """Get pixel dwell time (us)."""
-        pass
-
-    @abstractmethod
-    def get_scan_flyback(self) -> Optional[Quantity]:
-        """Get flyback time (us)."""
-        pass
-
-    @abstractmethod
-    def get_scan_rotation(self) -> Optional[Quantity]:
-        """Get scan rotation (deg)."""
-        pass
-
-    @abstractmethod
-    def get_scan_active(self) -> bool:
-        """Return True if scanning is currently active."""
-        pass
-
-    # --- Atomic Setters ---
-    @abstractmethod
-    def set_scan_mode(self, mode: str) -> None:
-        """Set scan engine mode."""
-        pass
-
-    @abstractmethod
-    def set_scan_width(self, px: int) -> None:
-        """Set scan width (px)."""
-        pass
-
-    @abstractmethod
-    def set_scan_height(self, px: int) -> None:
-        """Set scan height (px)."""
-        pass
-
-    @abstractmethod
-    def set_scan_pixel_dwell(self, time: Quantity) -> None:
-        """Set dwell time (us)."""
-        pass
-
-    @abstractmethod
-    def set_scan_flyback(self, time: Quantity) -> None:
-        """Set flyback time (us)."""
-        pass
-
-    @abstractmethod
-    def set_scan_rotation(self, angle: Quantity) -> None:
-        """Set scan rotation (deg)."""
-        pass
-
-    @abstractmethod
-    def set_scan_active(self, active: bool) -> None:
-        """Start (True) or Stop (False) the scan."""
-        pass
-
-    # --- Logic Layer ---
-
-    def get_scan_settings(self) -> ScanSettings:
-        """Aggregator: returns full ScanSettings snapshot."""
-        return ScanSettings(
-            scan_mode=self.get_scan_mode(),
-            width_px=self.get_scan_width(),
-            height_px=self.get_scan_height(),
-            pixel_dwell_time=self.get_scan_pixel_dwell(),
-            flyback_time=self.get_scan_flyback(),
-            scan_rotation=self.get_scan_rotation()
-        )
-
-    def apply_scan_settings(self, settings: ScanSettings) -> None:
-        """Helper: Applies partial scan settings."""
-        if settings.scan_mode is not None: self.set_scan_mode(settings.scan_mode)
-        if settings.width_px is not None: self.set_scan_width(settings.width_px)
-        if settings.height_px is not None: self.set_scan_height(settings.height_px)
-        if settings.pixel_dwell_time is not None: self.set_scan_pixel_dwell(settings.pixel_dwell_time)
-        if settings.flyback_time is not None: self.set_scan_flyback(settings.flyback_time)
-        if settings.scan_rotation is not None: self.set_scan_rotation(settings.scan_rotation)
-
-    def execute_scan_control(self, request: ScanControlRequest) -> None:
-        if not request.validate():
-            raise ValueError(f"Invalid ScanControlRequest: {request}")
-
-        logger.info(f"[SCAN] Executing Control: Action={request.action}")
-
-        if request.target and request.action in ("START", "SINGLE_FRAME"):
-            sys = self.system_settings.scan_system
-            if sys:
-                check = sys.is_safe_scan(request.target)
-                if not check:
-                    logger.error(f"[SCAN] Unsafe settings rejected: {check.reasons}")
-                    raise RuntimeError(f"Unsafe scan settings rejected: {check.reasons}")
-            self.apply_scan_settings(request.target)
-
-        if request.action == "START":
-            self.set_scan_active(True)
-        elif request.action == "STOP":
-            self.set_scan_active(False)
-        elif request.action == "SINGLE_FRAME":
-            # Logic for single frame could involve START -> Wait -> STOP, or driver specific logic
-            self.set_scan_active(True)
-
-    # =========================================================================
     # 7. Detector Control & Acquisition
     # =========================================================================
 
     # --- Atomic Getters ---
+
+    # --- Atomic Getters ---
+
     @abstractmethod
     def list_detectors(self) -> List[str]:
         """List available detector IDs."""
@@ -1085,12 +1014,17 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
+    def get_detector_inserted(self, detector_id: str) -> bool:
+        """Return True if detector is mechanically inserted."""
+        pass
+
+    @abstractmethod
     def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
         """Get exposure time (ms)."""
         pass
 
     @abstractmethod
-    def get_detector_binning(self, detector_id: str) -> Optional[int]:
+    def get_detector_binning_index(self, detector_id: str) -> Optional[int]:
         """Get binning index (scalar)."""
         pass
 
@@ -1102,21 +1036,6 @@ class TemMicroscope(ABC):
     @abstractmethod
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
         """Get Region of Interest."""
-        pass
-
-    @abstractmethod
-    def get_detector_integration(self, detector_id: str) -> Optional[int]:
-        """Get frame integration count."""
-        pass
-
-    @abstractmethod
-    def get_detector_inserted(self, detector_id: str) -> bool:
-        """Return True if detector is mechanically inserted."""
-        pass
-
-    @abstractmethod
-    def get_detector_frame_rate(self, detector_id: str) -> Optional[Quantity]:
-        """Get estimated frame rate (Hz)."""
         pass
 
     @abstractmethod
@@ -1132,6 +1051,16 @@ class TemMicroscope(ABC):
     @abstractmethod
     def get_detector_digital_rotation(self, detector_id: str) -> Optional[Quantity]:
         """Get digital rotation (deg)."""
+        pass
+
+    @abstractmethod
+    def get_detector_frame_integration(self, detector_id: str) -> Optional[int]:
+        """Get frame integration count."""
+        pass
+
+    @abstractmethod
+    def get_detector_frame_rate(self, detector_id: str) -> Optional[Quantity]:
+        """Get estimated frame rate (Hz)."""
         pass
 
     @abstractmethod
@@ -1155,13 +1084,19 @@ class TemMicroscope(ABC):
         pass
 
     # --- Atomic Setters ---
+
+    @abstractmethod
+    def set_detector_insertion(self, detector_id: str, inserted: bool) -> None:
+        """Insert (True) or Retract (False) detector."""
+        pass
+
     @abstractmethod
     def set_detector_exposure(self, detector_id: str, exposure: Quantity) -> None:
         """Set exposure time (ms)."""
         pass
 
     @abstractmethod
-    def set_detector_binning(self, detector_id: str, index: int) -> None:
+    def set_detector_binning_index(self, detector_id: str, index: int) -> None:
         """Set binning index."""
         pass
 
@@ -1173,21 +1108,6 @@ class TemMicroscope(ABC):
     @abstractmethod
     def set_detector_roi(self, detector_id: str, roi: Optional[ROI]) -> None:
         """Set Region of Interest."""
-        pass
-
-    @abstractmethod
-    def set_detector_integration(self, detector_id: str, count: int) -> None:
-        """Set frame integration count."""
-        pass
-
-    @abstractmethod
-    def set_detector_insertion(self, detector_id: str, inserted: bool) -> None:
-        """Insert (True) or Retract (False) detector."""
-        pass
-
-    @abstractmethod
-    def set_detector_frame_rate(self, detector_id: str, rate: Quantity) -> None:
-        """Set target frame rate (Hz)."""
         pass
 
     @abstractmethod
@@ -1203,6 +1123,16 @@ class TemMicroscope(ABC):
     @abstractmethod
     def set_detector_digital_rotation(self, detector_id: str, angle: Quantity) -> None:
         """Set digital rotation (deg)."""
+        pass
+
+    @abstractmethod
+    def set_detector_frame_integration(self, detector_id: str, count: int) -> None:
+        """Set frame integration count."""
+        pass
+
+    @abstractmethod
+    def set_detector_frame_rate(self, detector_id: str, rate: Quantity) -> None:
+        """Set target frame rate (Hz)."""
         pass
 
     @abstractmethod
@@ -1235,22 +1165,22 @@ class TemMicroscope(ABC):
         """
         pass
 
-    # --- Logic Layer ---
+    # --- Helper Layer ---
 
     def get_detector_settings(self, detector_id: str) -> DetectorSettings:
         """Aggregator: returns settings for a specific detector."""
         return DetectorSettings(
             detector_id=detector_id,
+            inserted=self.get_detector_inserted(detector_id),
             exposure=self.get_detector_exposure(detector_id),
-            binning_index=self.get_detector_binning(detector_id),
+            binning_index=self.get_detector_binning_index(detector_id),
             binning_xy=self.get_detector_binning_xy(detector_id),
             roi=self.get_detector_roi(detector_id),
-            frame_integration=self.get_detector_integration(detector_id),
-            frame_rate=self.get_detector_frame_rate(detector_id),
-            inserted=self.get_detector_inserted(detector_id),
             gain_index=self.get_detector_gain_index(detector_id),
             offset_index=self.get_detector_offset_index(detector_id),
             digital_rotation=self.get_detector_digital_rotation(detector_id),
+            frame_integration=self.get_detector_frame_integration(detector_id),
+            frame_rate=self.get_detector_frame_rate(detector_id),
             total_frames=self.get_detector_total_frames(detector_id),
             readout_mode=self.get_detector_readout_mode(detector_id),
             shutter_mode=self.get_detector_shutter_mode(detector_id),
@@ -1259,26 +1189,26 @@ class TemMicroscope(ABC):
 
     def apply_detector_settings(self, detector_id: str, settings: DetectorSettings) -> None:
         """Helper: Apply partial detector settings."""
+        if settings.inserted is not None:
+            self.set_detector_insertion(detector_id, settings.inserted)
         if settings.exposure is not None:
             self.set_detector_exposure(detector_id, settings.exposure)
         if settings.binning_index is not None:
-            self.set_detector_binning(detector_id, settings.binning_index)
+            self.set_detector_binning_index(detector_id, settings.binning_index)
         if settings.binning_xy is not None:
             self.set_detector_binning_xy(detector_id, settings.binning_xy)
-        if settings.frame_integration is not None:
-            self.set_detector_integration(detector_id, settings.frame_integration)
         if settings.roi is not None:
             self.set_detector_roi(detector_id, settings.roi)
-        if settings.frame_rate is not None:
-            self.set_detector_frame_rate(detector_id, settings.frame_rate)
-        if settings.inserted is not None:
-            self.set_detector_insertion(detector_id, settings.inserted)
         if settings.gain_index is not None:
             self.set_detector_gain_index(detector_id, settings.gain_index)
         if settings.offset_index is not None:
             self.set_detector_offset_index(detector_id, settings.offset_index)
         if settings.digital_rotation is not None:
             self.set_detector_digital_rotation(detector_id, settings.digital_rotation)
+        if settings.frame_integration is not None:
+            self.set_detector_frame_integration(detector_id, settings.frame_integration)
+        if settings.frame_rate is not None:
+            self.set_detector_frame_rate(detector_id, settings.frame_rate)
         if settings.total_frames is not None:
             self.set_detector_total_frames(detector_id, settings.total_frames)
         if settings.readout_mode is not None:
@@ -1287,6 +1217,8 @@ class TemMicroscope(ABC):
             self.set_detector_shutter_mode(detector_id, settings.shutter_mode)
         if settings.save_frames is not None:
             self.set_detector_save_frames(detector_id, settings.save_frames)
+
+    # --- Orchestrator Layer ---
 
     def execute_detector_control(self, request: DetectorControlRequest) -> None:
         """
@@ -1371,10 +1303,149 @@ class TemMicroscope(ABC):
         return image
 
     # =========================================================================
+    # 6. Scan Control (STEM)
+    # =========================================================================
+
+    # --- Atomic Getters ---
+
+    # --- Atomic Getters ---
+
+    @abstractmethod
+    def get_scan_mode(self) -> str:
+        """Get scan engine mode."""
+        pass
+
+    @abstractmethod
+    def get_scan_active(self) -> bool:
+        """Return True if scanning is currently active."""
+        pass
+
+    @abstractmethod
+    def get_scan_width(self) -> Optional[int]:
+        """Get scan width in pixels. Returns None if unknown."""
+        pass
+
+    @abstractmethod
+    def get_scan_height(self) -> Optional[int]:
+        """Get scan height in pixels. Returns None if unknown."""
+        pass
+
+    @abstractmethod
+    def get_scan_pixel_dwell(self) -> Optional[Quantity]:
+        """Get pixel dwell time (us)."""
+        pass
+
+    @abstractmethod
+    def get_scan_flyback(self) -> Optional[Quantity]:
+        """Get flyback time (us)."""
+        pass
+
+    @abstractmethod
+    def get_scan_rotation(self) -> Optional[Quantity]:
+        """Get scan rotation (deg)."""
+        pass
+
+    # --- Atomic Setters ---
+
+    @abstractmethod
+    def set_scan_mode(self, mode: str) -> None:
+        """Set scan engine mode."""
+        pass
+
+    @abstractmethod
+    def set_scan_active(self, active: bool) -> None:
+        """Start (True) or Stop (False) the scan."""
+        pass
+
+    @abstractmethod
+    def set_scan_width(self, px: int) -> None:
+        """Set scan width (px)."""
+        pass
+
+    @abstractmethod
+    def set_scan_height(self, px: int) -> None:
+        """Set scan height (px)."""
+        pass
+
+    @abstractmethod
+    def set_scan_pixel_dwell(self, time: Quantity) -> None:
+        """Set dwell time (us)."""
+        pass
+
+    @abstractmethod
+    def set_scan_flyback(self, time: Quantity) -> None:
+        """Set flyback time (us)."""
+        pass
+
+    @abstractmethod
+    def set_scan_rotation(self, angle: Quantity) -> None:
+        """Set scan rotation (deg)."""
+        pass
+
+    # --- Helper Layer ---
+
+    def get_scan_settings(self) -> ScanSettings:
+        """Aggregator: returns full ScanSettings snapshot."""
+        return ScanSettings(
+            scan_mode=self.get_scan_mode(),
+            active = self.get_scan_active(),
+            width_px=self.get_scan_width(),
+            height_px=self.get_scan_height(),
+            pixel_dwell_time=self.get_scan_pixel_dwell(),
+            flyback_time=self.get_scan_flyback(),
+            scan_rotation=self.get_scan_rotation()
+        )
+
+    def apply_scan_settings(self, settings: ScanSettings) -> None:
+        """Helper: Applies partial scan settings."""
+        if settings.scan_mode is not None:
+            self.set_scan_mode(settings.scan_mode)
+        if settings.active is not None:
+            self.set_scan_active(settings.active)
+        if settings.width_px is not None:
+            self.set_scan_width(settings.width_px)
+        if settings.height_px is not None:
+            self.set_scan_height(settings.height_px)
+        if settings.pixel_dwell_time is not None:
+            self.set_scan_pixel_dwell(settings.pixel_dwell_time)
+        if settings.flyback_time is not None:
+            self.set_scan_flyback(settings.flyback_time)
+        if settings.scan_rotation is not None:
+            self.set_scan_rotation(settings.scan_rotation)
+
+    # --- Orchestrator Layer ---
+
+    def execute_scan_control(self, request: ScanControlRequest) -> None:
+        if not request.validate():
+            raise ValueError(f"Invalid ScanControlRequest: {request}")
+
+        logger.info(f"[SCAN] Executing Control: Action={request.action}")
+
+        if request.target and request.action in ("START", "SINGLE_FRAME"):
+            sys = self.system_settings.scan_system
+            if sys:
+                check = sys.is_safe_scan(request.target)
+                if not check:
+                    logger.error(f"[SCAN] Unsafe settings rejected: {check.reasons}")
+                    raise RuntimeError(f"Unsafe scan settings rejected: {check.reasons}")
+            self.apply_scan_settings(request.target)
+
+        if request.action == "START":
+            self.set_scan_active(True)
+        elif request.action == "STOP":
+            self.set_scan_active(False)
+        elif request.action == "SINGLE_FRAME":
+            # Logic for single frame could involve START -> Wait -> STOP, or driver specific logic
+            self.set_scan_active(True)
+
+    # =========================================================================
     # 8. Vacuum Control
     # =========================================================================
 
     # --- Atomic Getters (Explicit) ---
+
+    # --- Atomic Getters ---
+
     @abstractmethod
     def get_column_valve_state(self) -> str:
         """Atomic: Get Column Valve (V7/V4) state ('OPEN', 'CLOSED', 'UNKNOWN')."""
@@ -1405,7 +1476,8 @@ class TemMicroscope(ABC):
         """Atomic: Get Buffer Tank Pressure (Pa)."""
         pass
 
-    # --- Atomic Setters (Explicit) ---
+    # --- Atomic Setters ---
+
     @abstractmethod
     def set_column_valve_state(self, state: str) -> None:
         """Atomic: Set Column Valve state ('OPEN', 'CLOSED')."""
@@ -1421,7 +1493,8 @@ class TemMicroscope(ABC):
         """Atomic: Set Turbo Pump state ('ON', 'OFF')."""
         pass
 
-    # --- Logic Layer ---
+    # --- Helper Layer ---
+
     def get_vacuum_settings(self) -> VacuumSettings:
         """Aggregator: returns full vacuum status."""
         return VacuumSettings(
@@ -1442,6 +1515,8 @@ class TemMicroscope(ABC):
         if settings.turbo_pump_state is not None:
             self.set_turbo_pump_state(settings.turbo_pump_state)
 
+    # --- Orchestrator Layer ---
+
     def execute_vacuum_control(self, request: VacuumControlRequest) -> None:
         """Orchestrator: Handle VacuumControlRequest."""
         if not request.validate():
@@ -1456,6 +1531,9 @@ class TemMicroscope(ABC):
     # =========================================================================
 
     # --- Atomic Getters (Granular) ---
+
+    # --- Atomic Getters ---
+
     @abstractmethod
     def list_apertures(self) -> List[str]:
         """Atomic: List supported aperture mechanism IDs."""
@@ -1473,7 +1551,7 @@ class TemMicroscope(ABC):
 
     @abstractmethod
     def get_aperture_size_label(self, aperture_id: str) -> Optional[str]:
-        """Atomic: Get human-readable size label (optional)."""
+        """Atomic: Get human-readable size label (Read-Only metadata)."""
         pass
 
     @abstractmethod
@@ -1481,7 +1559,8 @@ class TemMicroscope(ABC):
         """Atomic: Get the mechanical XY position."""
         pass
 
-    # --- Atomic Setters (Granular) ---
+    # --- Atomic Setters ---
+
     @abstractmethod
     def set_aperture_inserted(self, aperture_id: str, inserted: bool) -> None:
         """Atomic: Insert or Retract the mechanism."""
@@ -1497,8 +1576,9 @@ class TemMicroscope(ABC):
         """Atomic: Align the aperture mechanism mechanically."""
         pass
 
-    # --- Logic Layer ---
-    def get_aperture(self, aperture_id: str) -> ApertureSettings:
+    # --- Helper Layer ---
+
+    def get_aperture_settings(self, aperture_id: str) -> ApertureSettings:
         """Helper: Aggregates atomic primitives into an object."""
         return ApertureSettings(
             aperture_id=aperture_id,
@@ -1507,6 +1587,26 @@ class TemMicroscope(ABC):
             size_label=self.get_aperture_size_label(aperture_id),
             position=self.get_aperture_position(aperture_id)
         )
+
+    def apply_aperture_settings(self, aperture_id: str, settings: ApertureSettings) -> None:
+        """
+        Helper: Applies a fully resolved aperture configuration.
+        Drivers override this to handle vendor-specific 'extras'.
+        """
+        if settings.inserted is not None:
+            self.set_aperture_inserted(aperture_id, settings.inserted)
+
+        if settings.size_index is not None:
+            self.set_aperture_size_index(aperture_id, settings.size_index)
+
+        if settings.position is not None:
+            # We enforce that if position is provided, it must be complete (X and Y)
+            # or the driver handles partials. Here we pass what we have.
+            x_val = settings.position.x if settings.position.x is not None else 0.0
+            y_val = settings.position.y if settings.position.y is not None else 0.0
+            self.set_aperture_position(aperture_id, x_val, y_val)
+
+    # --- Orchestrator Layer ---
 
     def execute_aperture_control(self, request: ApertureControlRequest) -> None:
         """
@@ -1528,9 +1628,7 @@ class TemMicroscope(ABC):
         target = request.target
         a_id = request.aperture_id
 
-        # 2. Handle Relative Position Logic
-        target_pos = target.position
-
+        # 2. Handle Relative Position Logic (Orchestrator Duty)
         if request.relative and target.position:
             # We need the current position to calculate the delta
             current_pos = self.get_aperture_position(a_id)
@@ -1544,19 +1642,9 @@ class TemMicroscope(ABC):
             new_x = cur_x + (target.position.x if target.position.x is not None else 0.0)
             new_y = cur_y + (target.position.y if target.position.y is not None else 0.0)
 
-            # Create a new Point for the calculated target
-            target_pos = replace(target.position, x=new_x, y=new_y)
+            # Update target with absolute position
+            # We use replace() to avoid mutating the original request object
+            target = replace(target, position=replace(target.position, x=new_x, y=new_y))
 
-        # 3. Apply changes via Atomic Setters (Granular application)
-        if target.inserted is not None:
-            self.set_aperture_inserted(a_id, target.inserted)
-
-        if target.size_index is not None:
-            self.set_aperture_size_index(a_id, target.size_index)
-
-        if target_pos is not None:
-            # We enforce that if position is provided, it must be complete (X and Y)
-            # or the driver handles partials. Here we pass what we have.
-            x_val = target_pos.x if target_pos.x is not None else 0.0
-            y_val = target_pos.y if target_pos.y is not None else 0.0
-            self.set_aperture_position(a_id, x_val, y_val)
+        # 3. Apply changes via Helper (Delegation)
+        self.apply_aperture_settings(a_id, target)
