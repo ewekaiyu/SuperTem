@@ -575,18 +575,22 @@ class Extras:
     fit the strict schema ends up here for later inspection instead of causing a crash.
 
     Attributes:
-    vendor: Namespaced storage for vendor-specific extensions.
+    vendor: Namespaced storage for vendor-specific extensions (Identity/State).
+            Example: {"JEOL": {"alpha_selector": 3}}
+    options: Execution modifiers and flags (Behavior/Action).
+             Example: {"tolerance_nm": 5.0, "retries": 3, "timeout": 60}
     unknown: Storage for JSON keys not recognized by the schema.
     raw: Original raw values that failed type coercion/validation.
     notes: Error messages or warnings generated during parsing.
     """
     vendor: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    options: Dict[str, Any] = field(default_factory=dict)
     unknown: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
     notes: Dict[str, Any] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
-        return not (self.vendor or self.unknown or self.raw or self.notes)
+        return not (self.vendor or self.options or self.unknown or self.raw or self.notes)
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-safe payload representation."""
@@ -618,7 +622,7 @@ class Extras:
             return ex
 
         # Smart merge logic
-        known = {"vendor", "unknown", "raw", "notes"}
+        known = {"vendor", "options", "unknown", "raw", "notes"}
         keys = set(value.keys())
 
         if keys and keys.issubset(known):
@@ -626,6 +630,7 @@ class Extras:
             for k in known:
                 if k in value and isinstance(value[k], dict):
                     setattr(ex, k, deepcopy(value[k]))
+
             # Handle vendor special case (vendor keys might not be dicts)
             if "vendor" in value and isinstance(value["vendor"], dict):
                 for vend, payload in value["vendor"].items():
@@ -668,7 +673,10 @@ def _has_actionable_extras(extra: "Extras") -> bool:
             return len(v.strip()) > 0
         return True  # numbers / bools / objects
 
-    return _has_non_none(getattr(extra, 'vendor', None)) or _has_non_none(getattr(extra, 'unknown', None))
+        # Check vendor OR options OR unknown
+    return (_has_non_none(getattr(extra, 'vendor', None)) or
+            _has_non_none(getattr(extra, 'options', None)) or
+            _has_non_none(getattr(extra, 'unknown', None)))
 
 
 @dataclass
@@ -2173,19 +2181,14 @@ class ProjectionSettings:
              associated fields (e.g. `camera_length`) become mandatory.
     """
     optical_mode: Optional[str] = None  # "IMAGING", "DIFFRACTION", "LAD"
-
-    # Imaging Parameters (IMAGING mode)
     magnification: Optional[int] = None
-    defocus: Optional["Quantity"] = None
-    objective_stigmation: Optional[Point] = None
-    image_shift: Optional[Point] = None
-
-    # Diffraction Parameters (DIFFRACTION mode)
     camera_length: Optional["Quantity"] = None
-    diffraction_shift: Optional[Point] = None
-    diffraction_stigmation: Optional[Point] = None
-
+    defocus: Optional["Quantity"] = None
     screen_position: Optional[str] = None  # "UP", "DOWN"
+    objective_stigmation: Optional[Point] = None
+    diffraction_stigmation: Optional[Point] = None
+    image_shift: Optional[Point] = None
+    diffraction_shift: Optional[Point] = None
 
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
@@ -2199,13 +2202,13 @@ class ProjectionSettings:
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.optical_mode = p.str(self.optical_mode, "optical_mode")
         self.magnification = p.int(self.magnification, "magnification")
-        self.defocus = p.qty(self.defocus, "defocus", Units.NM)
         self.camera_length = p.qty(self.camera_length, "camera_length", Units.MM)
+        self.defocus = p.qty(self.defocus, "defocus", Units.NM)
         self.screen_position = p.str(self.screen_position, "screen_position")
         self.objective_stigmation = p.model(Point, self.objective_stigmation, "objective_stigmation")
+        self.diffraction_stigmation = p.model(Point, self.diffraction_stigmation, "diffraction_stigmation")
         self.image_shift = p.model(Point, self.image_shift, "image_shift")
         self.diffraction_shift = p.model(Point, self.diffraction_shift, "diffraction_shift")
-        self.diffraction_stigmation = p.model(Point, self.diffraction_stigmation, "diffraction_stigmation")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
@@ -2388,10 +2391,10 @@ class DetectorSettings:
     binning_index: Optional[int] = None
     binning_xy: Optional[Tuple[int, int]] = None
     roi: Optional[ROI] = None
-    frame_integration: Optional[int] = None
     gain_index: Optional[int] = None
     offset_index: Optional[int] = None
     digital_rotation: Optional["Quantity"] = None
+    frame_integration: Optional[int] = None
     frame_rate: Optional["Quantity"] = None  # e.g. 40 Hz
     total_frames: Optional[int] = None  # e.g. 40 frames
 
@@ -2831,6 +2834,7 @@ class ScanSettings:
            Any field set to None retains the previous value.
     """
     scan_mode: Optional[str] = None
+    active: Optional[bool] = None
 
     # --- ADDED: Grid Dimensions ---
     width_px: Optional[int] = None
@@ -2854,6 +2858,7 @@ class ScanSettings:
     def __post_init__(self):
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.scan_mode = p.str(self.scan_mode, "scan_mode")
+        self.active = p.bool(self.active, "active")
         self.width_px = p.int(self.width_px, "width_px")
         self.height_px = p.int(self.height_px, "height_px")
         self.pixel_dwell_time = p.qty(self.pixel_dwell_time, "pixel_dwell_time", Units.US)
