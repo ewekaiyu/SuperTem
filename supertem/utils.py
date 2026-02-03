@@ -288,7 +288,7 @@ def save_live_config(
     if update_defaults:
         sys = new_settings.system
 
-        # Capture Beam
+        # --- Beam ---
         try:
             live_beam = microscope.get_beam_settings()
             if live_beam:
@@ -296,7 +296,7 @@ def save_live_config(
         except Exception as e:
             print(f"Warning: Could not capture live beam: {e}")
 
-        # Capture Projection
+        # --- Projection ---
         try:
             live_proj = microscope.get_projection_settings()
             if live_proj:
@@ -304,7 +304,35 @@ def save_live_config(
         except Exception as e:
             print(f"Warning: Could not capture live projection: {e}")
 
-        # Capture Detectors
+        # --- Scan ---
+        try:
+            live_scan = microscope.get_scan_settings()
+            if live_scan:
+                sys.scan_system.default_scan = live_scan
+        except Exception as e:
+            print(f"Warning: Could not capture live scan: {e}")
+
+        # --- Apertures ---
+        try:
+            for apt_id in microscope.list_apertures():
+                live_apt = microscope.get_aperture_settings(apt_id)
+                # Only update if we have a registry entry for it
+                if live_apt and sys.aperture_system.defaults_by_id is not None:
+                    sys.aperture_system.defaults_by_id[apt_id] = live_apt
+        except Exception as e:
+            print(f"Warning: Could not capture live apertures: {e}")
+
+        # --- Stage ---
+        try:
+            current_holder_id = microscope.system_settings.stage_system.active_holder_id
+
+            if current_holder_id:
+                sys.stage_system.active_holder_id = current_holder_id
+
+        except Exception as e:
+            print(f"Warning: Could not capture active holder from settings: {e}")
+
+        # --- Detectors ---
         try:
             for det_id in microscope.list_detectors():
                 live_det = microscope.get_detector_settings(det_id)

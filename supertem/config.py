@@ -165,7 +165,15 @@ DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
             "max_step_deg": 5.0,
             "settle_time_s": 0.5,
             "timeout_s": 30.0,
-            "eucentric_z_nm": 0.0
+            "eucentric_z_nm": 0.0,
+            "active_holder_id": "standard_single_tilt",
+            "available_holders": {
+                "standard_single_tilt": {
+                    "model": "Standard Holder",
+                    "can_tilt_x": False,
+                    "can_rotate": True
+                }
+            }
         },
         "beam_system": {
             "enabled": True,
@@ -196,7 +204,27 @@ DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
             "available_scan_modes": ["Full Frame", "Spot"],
             "pixel_dwell_time_limits_us": [0.1, 1000.0],
             "flyback_time_limits_us": [0.0, 500.0],
-            "scan_rotation_limits_deg": [0.0, 360.0]
+            "scan_rotation_limits_deg": [0.0, 360.0],
+            "default_scan": {
+                "scan_mode": "Full Frame",
+                "width_px": 512,
+                "height_px": 512,
+                "pixel_dwell_time_us": 10.0
+            }
+        },
+        "aperture_system": {
+            "enabled": True,
+            "available_aperture_ids": ["condenser", "objective", "selected_area"],
+            "defaults_by_id": {
+                "condenser": {"inserted": True, "size_index": 1},
+                "objective": {"inserted": False, "size_index": 0},
+                "selected_area": {"inserted": False, "size_index": 0}
+            },
+            "capabilities_by_id": {
+                "condenser": {"can_insert": True, "can_select_size": True, "available_sizes": ["10um", "30um", "50um"]},
+                "objective": {"can_insert": True, "can_select_size": True, "available_sizes": ["10um", "60um"]},
+                "selected_area": {"can_insert": True, "can_select_size": True, "available_sizes": ["10um", "100um"]}
+            }
         },
         "detector_system": {
             "enabled": True,
@@ -229,7 +257,6 @@ DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
     },
     "image": {
         "file_format": "tiff",
-        # Note: Paths here are relative templates, resolved at runtime
         "path": "{session_path}/images"
     }
 }
