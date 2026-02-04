@@ -1462,11 +1462,41 @@ class JeolMicroscope(TemMicroscope):
         return None
 
     def get_defocus(self) -> Optional[Quantity]:
-        if not self._has_defocus_calibration: return None
-        return self._read_hw(
-            self.lens, "GetOLc", "LENS",
-            lambda v: Q_(float(v) / (self.defocus_scale or 1.0), Units.NM)
-        )
+        """
+        Calculates physical defocus (nm) based on F200-specific DAC offsets.
+        """
+        # Safety: Only run this math for F200 models
+        model = (self.system_settings.info.model or "").upper()
+        if "F200" not in model:
+            return None
+
+        mode_key = self._get_current_mode_key()
+        mag = self.get_magnification() or 0
+
+        # TEM:LOWMAG -> OM (Objective Mini)
+        if mode_key == "TEM:LOWMAG":
+            raw_dac = self.get_objective_mini_lens()
+            if raw_dac is None: return None
+
+            # F200 Thresholds
+            if mag < 600: std_val = 0xA7C4
+            elif mag < 15000: std_val = 0xBD31
+            else: std_val = 0xC85A
+
+            # 1 bit = 1500 nm
+            return Q_((raw_dac - std_val) * 1500.0, Units.NM)
+
+        # TEM:MAG -> OLf (Objective Fine)
+        elif mode_key == "TEM:MAG":
+            raw_dac = self.get_objective_lens_fine()
+            if raw_dac is None: return None
+
+            # F200 Thresholds
+            std_val = 0x8010 if mag < 1500000 else 0x7D10
+            # 1 bit = 1.4 nm
+            return Q_((raw_dac - std_val) * 1.4, Units.NM)
+
+        return None
 
     def get_screen_position(self) -> str:
         # Custom logic mapping int -> String preserved via lambda or explicit read
@@ -1488,16 +1518,25 @@ class JeolMicroscope(TemMicroscope):
 
     # --- Atomic Getters (Vendor Specific) ---
 
-    def get_defocus_dac(self) -> Optional[int]:
+    def get_objective_lens_coarse(self) -> Optional[int]:
+        """Atomic: Get OLc (Objective Lens Coarse)."""
         return self._read_hw(self.lens, "GetOLc", "LENS", self._to_int)
 
-    def get_defocus_fine_dac(self) -> Optional[int]:
-        """Ref: Lens3.GetOLf"""
+    def get_objective_lens_fine(self) -> Optional[int]:
+        """Atomic: Get OLf (Objective Lens Fine)."""
         return self._read_hw(self.lens, "GetOLf", "LENS", self._to_int)
 
-    def get_defocus_superfine_dac(self) -> Optional[int]:
-        """Ref: Lens3.GetOLSuperFineValue"""
+    def get_objective_lens_superfine(self) -> Optional[int]:
+        """Atomic: Get OLS (Objective Lens SuperFine)."""
         return self._read_hw(self.lens, "GetOLSuperFineValue", "LENS", self._to_int)
+
+    def get_objective_mini_lens(self) -> Optional[int]:
+        """Atomic: Get OM (Objective Mini-lens)."""
+        return self._read_hw(self.lens, "GetOM", "LENS", self._to_int)
+
+    def get_intermediate_lens_1(self) -> Optional[int]:
+        """Atomic: Get IL1 (Intermediate Lens 1)."""
+        return self._read_hw(self.lens, "GetIL1", "LENS", self._to_int)
 
     def get_image_shift2(self) -> Tuple[Optional[float], Optional[float]]:
         """Ref: Def3.GetIS2 """
@@ -1608,12 +1647,36 @@ class JeolMicroscope(TemMicroscope):
         else:
             raise RuntimeError(f"Cannot set Camera Length in mode {mode_key}.")
 
-    def set_defocus(self, defocus: Quantity, **kwargs) -> None:
-        if not self._has_defocus_calibration:
-            raise ValueError("JEOL driver cannot set physical defocus without calibration.")
-        val = float(defocus.to(Units.NM).magnitude)
-        dac = int(val * (self.defocus_scale or 1.0))
-        self._write_hw(self.lens, "SetOLc", "LENS", dac)
+    def set_defocus(self, defocus: Quantity, relative: bool = False, **kwargs) -> None:
+        """
+        Sets physical defocus (nm).
+        If relative=True, calculates delta DACs from delta nm.
+        """
+        mode_key = self._get_current_mode_key()
+        mag = self.get_magnification() or 0
+        target_nm = float(defocus.to(Units.NM).magnitude)
+
+        if mode_key == "TEM:LOWMAG":
+            scale = 1500.0 # nm/bit
+            if relative:
+                dac_step = int(target_nm / scale)
+                self.set_objective_mini_lens(dac_step, relative=True)
+            else:
+                if mag < 600: std = 0xA7C4
+                elif mag < 15000: std = 0xBD31
+                else: std = 0xC85A
+                target_dac = int(std + (target_nm / scale))
+                self.set_objective_mini_lens(target_dac, relative=False)
+
+        elif mode_key == "TEM:MAG":
+            scale = 1.4 # nm/bit
+            if relative:
+                dac_step = int(target_nm / scale)
+                self.set_objective_lens_fine(dac_step, relative=True)
+            else:
+                std = 0x8010 if mag < 1500000 else 0x7D10
+                target_dac = int(std + (target_nm / scale))
+                self.set_objective_lens_fine(target_dac, relative=False)
 
     def set_screen_position(self, position: str, **kwargs) -> None:
         p = (position or "").strip().upper()
@@ -1637,130 +1700,137 @@ class JeolMicroscope(TemMicroscope):
 
     # --- Atomic Setters (Vendor Specific) ---
 
-    def set_defocus_dac(self, dac: int) -> None:
-        self._write_hw(self.lens, "SetOLc", "LENS", int(dac))
+    def set_objective_lens_coarse(self, dac: int, relative: bool = False) -> None:
+        """Atomic: Set OLc (Objective Lens Coarse)."""
+        val = int(dac)
+        if relative:
+            curr = self.get_objective_lens_coarse()
+            if curr is None: raise RuntimeError("OLc current value unknown")
+            val += curr
+        self._write_hw(self.lens, "SetOLc", "LENS", val)
 
-    def set_defocus_fine_dac(self, dac: int) -> None:
-        """Ref: Lens3.SetOLf [cite: 1703]"""
-        self._write_hw(self.lens, "SetOLf", "LENS", int(dac))
+    def set_objective_lens_fine(self, dac: int, relative: bool = False) -> None:
+        """Atomic: Set OLf (Objective Lens Fine)."""
+        val = int(dac)
+        if relative:
+            curr = self.get_objective_lens_fine()
+            if curr is None: raise RuntimeError("OLf current value unknown")
+            val += curr
+        self._write_hw(self.lens, "SetOLf", "LENS", val)
 
-    def set_defocus_superfine_dac(self, dac: int) -> None:
-        """
-        Set OLS (SuperFine).
-        Ref: Lens3.SetOLSuperFineValue [cite: 1688]
-        """
-        # Ensure switch is ON [cite: 1682]
+    def set_objective_lens_superfine(self, dac: int, relative: bool = False) -> None:
+        """Atomic: Set OLS (Objective Lens SuperFine)."""
+        val = int(dac)
+        if relative:
+            curr = self.get_objective_lens_superfine()
+            if curr is None: raise RuntimeError("OLS current value unknown")
+            val += curr
         self._write_hw(self.lens, "SetOLSuperFineSw", "LENS", 1)
-        self._write_hw(self.lens, "SetOLSuperFineValue", "LENS", int(dac))
+        self._write_hw(self.lens, "SetOLSuperFineValue", "LENS", val)
+
+    def set_objective_mini_lens(self, dac: int, relative: bool = False) -> None:
+        """Atomic: Set OM (Objective Mini-lens)."""
+        val = int(dac)
+        if relative:
+            curr = self.get_objective_mini_lens()
+            if curr is None: raise RuntimeError("OM current value unknown")
+            val += curr
+        self._write_hw(self.lens, "SetOM", "LENS", val)
+
+    def set_intermediate_lens_1(self, dac: int, relative: bool = False) -> None:
+        """Atomic: Set IL1 (Intermediate Lens 1)."""
+        val = int(dac)
+        if relative:
+            curr = self.get_intermediate_lens_1()
+            if curr is None: raise RuntimeError("IL1 current value unknown")
+            val += curr
+        self._write_hw(self.lens, "SetIL1", "LENS", val)
 
     def set_standard_focus(self) -> None:
-        """
-        Execute Standard Focus (Hysteresis Reset).
-        Ref: Lens3.SetStdFocus
-        """
+        """Atomic: Execute Standard Focus."""
         self._write_hw(self.lens, "SetStdFocus", "LENS")
 
     def set_image_shift2(self, x: float, y: float) -> None:
-        """Ref: Def3.SetIS2 [cite: 516]"""
         self._write_hw(self.def_, "SetIS2", "LENS", int(x), int(y))
 
-    def set_diffraction_focus(self, val: int, absolute: bool = True) -> None:
+    def set_diffraction_focus(self, dac: int, relative: bool = False) -> None:
         """
-        Control Diffraction Focus.
-        Ref: Lens3.SetDiffFocus (Absolute) [cite: 1609]
-        Ref: EOS3.SetDiffFocus (Relative Knob) [cite: 929]
+        Atomic: Set Diffraction Focus (IL1).
         """
-        if absolute:
-            self._write_hw(self.lens, "SetDiffFocus", "LENS", int(val))
-        else:
-            self._write_hw(self.eos, "SetDiffFocus", "LENS", int(val))
-
-    def step_objective_focus(self, steps: int) -> None:
-        """
-        Simulate Objective Focus Knob (Relative).
-        Ref: EOS3.SetObjFocus [cite: 945]
-        """
-        self._write_hw(self.eos, "SetObjFocus", "LENS", int(steps))
+        self.set_intermediate_lens_1(int(dac), relative=relative)
 
     # --- Helper Layer Overrides ---
 
     def get_projection_settings(self) -> ProjectionSettings:
         """
-        Override Reason: Populate vendor-specific 'defocus_olc_dac' if uncalibrated.
+        Aggregates optical state.
+        Ensures raw DACs are ALWAYS stored in extras by calling atomic getters.
         """
+        # 1. Get Standard Physics
         ps = super().get_projection_settings()
 
-        # Populate extras with Fine/SuperFine DACs
+        # 2. Store Raw Hardware Registers (Source of Truth)
         extras = ps.extra.vendor.setdefault("JEOL", {})
 
-        # Coarse (if uncalibrated)
-        if not self._has_defocus_calibration:
-            dac = self.get_defocus_dac()
-            if dac is not None:
-                extras["defocus_olc_dac"] = dac
-                ps.extra.notes["defocus"] = "Uncalibrated OLc DAC"
-
-        # Fine
-        f_dac = self.get_defocus_fine_dac()
-        if f_dac is not None:
-            extras["defocus_olf_dac"] = f_dac
-
-        # SuperFine
-        sf_dac = self.get_defocus_superfine_dac()
-        if sf_dac is not None:
-            extras["defocus_ols_dac"] = sf_dac
+        extras["objective_lens_coarse"] = self.get_objective_lens_coarse()
+        extras["objective_lens_fine"] = self.get_objective_lens_fine()
+        extras["objective_lens_superfine"] = self.get_objective_lens_superfine()
+        extras["objective_mini_lens"] = self.get_objective_mini_lens()
+        extras["intermediate_lens_1"] = self.get_intermediate_lens_1()
 
         return ps
 
     def apply_projection_settings(self, settings: ProjectionSettings, **kwargs) -> None:
         """
-        Override Reason: Support setting defocus via 'defocus_olc_dac' when physical calibration is missing.
+        Applies settings.
+        Priority:
+        1. Standard 'defocus' (nm) -> Calls set_defocus() -> Calculates OM/OLf.
+        2. Vendor Extras -> Explicitly sets OLc/OLf/OM via Atomic Setters.
         """
-        if (settings.defocus is not None) and (not self._has_defocus_calibration):
-            raise ValueError(
-                "JEOL driver cannot apply ProjectionSettings.defocus (nm) without defocus_scale calibration. "
-                "Use ProjectionSettings.extra.vendor['JEOL']['defocus_olc_dac'] instead."
-            )
-        super().apply_projection_settings(settings)
-        try:
-            vend = getattr(settings.extra, "vendor", None) or {}
-            jeol_v = vend.get("JEOL") if isinstance(vend, dict) else None
+        # 1. Apply Standard Physics (Safe to call super)
+        super().apply_projection_settings(settings, **kwargs)
 
-            if isinstance(jeol_v, dict):
-                # Coarse DAC (fallback)
-                if 'defocus_olc_dac' in jeol_v:
-                    self.set_defocus_dac(int(jeol_v['defocus_olc_dac']))
+        # 2. Apply Register Overrides (Manual DAC Control)
+        vend = getattr(settings.extra, "vendor", {})
+        jeol_v = vend.get("JEOL") if isinstance(vend, dict) else None
 
-                # Fine DAC
-                if 'defocus_olf_dac' in jeol_v:
-                    self.set_defocus_fine_dac(int(jeol_v['defocus_olf_dac']))
-
-                # SuperFine DAC
-                if 'defocus_ols_dac' in jeol_v:
-                    self.set_defocus_superfine_dac(int(jeol_v['defocus_ols_dac']))
-
-        except Exception as e:
-            logger.error(f"[LENS] Failed to apply projection extras: {e}")
-            raise
+        if isinstance(jeol_v, dict):
+            if "objective_lens_coarse" in jeol_v:
+                self.set_objective_lens_coarse(jeol_v["objective_lens_coarse"])
+            if "objective_lens_fine" in jeol_v:
+                self.set_objective_lens_fine(jeol_v["objective_lens_fine"])
+            if "objective_lens_superfine" in jeol_v:
+                self.set_objective_lens_superfine(jeol_v["objective_lens_superfine"])
+            if "objective_mini_lens" in jeol_v:
+                self.set_objective_mini_lens(jeol_v["objective_mini_lens"])
+            if "intermediate_lens_1" in jeol_v:
+                self.set_intermediate_lens_1(jeol_v["intermediate_lens_1"])
 
     def perform_projection_action(self, action: str, **kwargs) -> None:
-        """
-        Override: Handles STD_FOCUS, STEP_FOCUS, etc.
-        """
         act = action.upper().strip()
 
         if act == "STD_FOCUS":
             logger.info("[LENS] Executing Standard Focus...")
             self.set_standard_focus()
 
-        elif act == "STEP_FOCUS":
-            # Simulate knob turn
-            steps = int(kwargs.get("steps", 1))
-            self.step_objective_focus(steps)
-
         elif act == "STEP_DIFF_FOCUS":
+            # Delegate relative math to Atomic Layer via set_diffraction_focus
             steps = int(kwargs.get("steps", 1))
-            self.set_diffraction_focus(steps, absolute=False)
+            self.set_diffraction_focus(steps, relative=True)
+
+        elif act == "STEP_FOCUS":
+            # Route steps to the correct lens for the active mode
+            steps = int(kwargs.get("steps", 1))
+            mode_key = self._get_current_mode_key()
+
+            if mode_key == "TEM:LOWMAG":
+                logger.debug(f"[LENS] Stepping Focus (OM) by {steps}")
+                self.set_objective_mini_lens(steps, relative=True)
+            elif mode_key == "TEM:MAG":
+                logger.debug(f"[LENS] Stepping Focus (OLf) by {steps}")
+                self.set_objective_lens_fine(steps, relative=True)
+            else:
+                logger.warning(f"[LENS] STEP_FOCUS not defined for mode {mode_key}")
 
         else:
             super().perform_projection_action(action, **kwargs)
