@@ -216,6 +216,7 @@ class JeolMicroscope(TemMicroscope):
         self.gun = None
         self.feg = None
         self.det3 = None
+        self.mds = None
         self._connected = False
 
         # Detector caching
@@ -685,6 +686,7 @@ class JeolMicroscope(TemMicroscope):
             self.feg = self.tem3_mod.FEG3()
             self.gun = self.tem3_mod.GUN3()
             self.det3 = self.tem3_mod.Detector3()
+            self.mds = self.tem3_mod.MDS3()
 
             self._connected = True
             self._refresh_detectors()
@@ -1141,7 +1143,7 @@ class JeolMicroscope(TemMicroscope):
         return None
 
     def get_beam_current(self) -> Optional[Quantity]:
-        # JEOL does not report Probe Current. Returns None.
+        # JEOL hardware typically does not report "Probe Current" directly
         return None
 
     def get_emission_current(self) -> Optional[Quantity]:
@@ -1149,7 +1151,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_spot_size(self) -> Optional[int]:
         # EOS3.GetSpotSize -> int (0-based index)
-        # NOTE: In display the index is one higher
+        # NOTE: In manufacturer UI, index is often 1-based (1..5)
         return self._read_hw(self.eos, "GetSpotSize", "BEAM", self._to_int_plus_one)
 
     def get_convergence_angle(self) -> Optional[Quantity]:
@@ -1188,6 +1190,21 @@ class JeolMicroscope(TemMicroscope):
         """Vendor: Get CL3 Lens Value (0-65535). Controls Brightness."""
         return self._read_hw(self.lens, "GetCL3", "BEAM", self._to_int)
 
+    def get_mds_mode(self) -> str:
+        """
+        Vendor: Get Minimum Dose System (MDS) status.
+        Returns: 'OFF', 'SEARCH', 'FOCUS', 'PHOTO', or 'UNKNOWN'.
+        """
+        if self._read_hw(self.mds, "GetSearchMode", "BEAM") == 1:
+            return "SEARCH"
+        if self._read_hw(self.mds, "GetFocusMode", "BEAM") == 1:
+            return "FOCUS"
+        if self._read_hw(self.mds, "GetPhotoMode", "BEAM") == 1:
+            return "PHOTO"
+        if self.mds:
+            return "OFF"
+        return "UNKNOWN"
+
     # --- Atomic Setters ---
 
     def set_acceleration_voltage(self, voltage: Quantity, **kwargs) -> None:
@@ -1221,6 +1238,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_spot_size(self, index: int, **kwargs) -> None:
         # EOS3.SelectSpotSize(0-N)
+        # Input is 1-based (from UI), HW is 0-based
         self._write_hw(self.eos, "SelectSpotSize", "BEAM", int(index - 1))
 
     def set_convergence_angle(self, angle: Quantity, **kwargs) -> None:
@@ -1255,6 +1273,39 @@ class JeolMicroscope(TemMicroscope):
     def set_brightness_value(self, val: int, **kwargs) -> None:
         """Vendor: Set CL3 Lens (Brightness) Value (0-65535)."""
         self._write_hw(self.lens, "SetCL3", "BEAM", int(val))
+
+    def set_mds_mode(self, mode: str) -> None:
+        """
+        Vendor: Set MDS Mode.
+        mode: 'OFF', 'SEARCH', 'FOCUS', 'PHOTO'
+        """
+        m = mode.strip().upper()
+
+        if m == "OFF":
+            # MDS3.EndMdsMode()
+            self._write_hw(self.mds, "EndMdsMode", "BEAM")
+        elif m == "SEARCH":
+            # MDS3.SetSearchMode(1)
+            self._write_hw(self.mds, "SetSearchMode", "BEAM", 1)
+        elif m == "FOCUS":
+            # MDS3.SetFocusMode(1)
+            self._write_hw(self.mds, "SetFocusMode", "BEAM", 1)
+        elif m == "PHOTO":
+            # MDS3.SetPhotoMode(1)
+            self._write_hw(self.mds, "SetPhotoMode", "BEAM", 1)
+        else:
+            logger.error(f"[BEAM] Set MDS failed: Unknown mode {mode}")
+            raise ValueError(f"Unknown MDS mode: {mode}")
+
+    def set_ht_wobbler(self, active: bool) -> None:
+        """Vendor: Control HT Wobbler (Voltage Center)."""
+        state = 1 if active else 0
+        self._write_hw(self.gun, "SetHtWobbler", "BEAM", state)
+
+    def set_a2_wobbler(self, active: bool) -> None:
+        """Vendor: Control A2 Wobbler (Gun Alignment)."""
+        state = 1 if active else 0
+        self._write_hw(self.gun, "SetA2Wobbler", "BEAM", state)
 
     # --- Helper Layer Overrides (Logic & Validation) ---
 
@@ -1342,6 +1393,21 @@ class JeolMicroscope(TemMicroscope):
         elif act in ["CLOSE_VALVE", "CLOSE_V1"]:
             logger.info("[BEAM] Closing Gun Valve (V1)...")
             self.set_gun_valve_state("CLOSED")
+
+        elif act == "SET_MDS":
+            # kwargs: mode (str)
+            mode = kwargs.get("mode", "OFF")
+            self.set_mds_mode(mode)
+
+        elif act == "WOBBLE_HT":
+            active = bool(kwargs.get("active", True))
+            logger.info(f"[BEAM] HT Wobbler active={active}")
+            self.set_ht_wobbler(active)
+
+        elif act == "WOBBLE_A2":
+            active = bool(kwargs.get("active", True))
+            logger.info(f"[BEAM] A2 (Gun) Wobbler active={active}")
+            self.set_a2_wobbler(active)
 
         else:
             super().perform_beam_action(action, **kwargs)
