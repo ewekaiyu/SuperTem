@@ -1206,6 +1206,14 @@ class JeolMicroscope(TemMicroscope):
             return "OFF"
         return "UNKNOWN"
 
+    def get_condenser_lens_1(self) -> Optional[int]:
+        """Atomic: Get CL1 (Spot Size Lens)."""
+        return self._read_hw(self.lens, "GetCL1", "BEAM", self._to_int)
+
+    def get_condenser_lens_2(self) -> Optional[int]:
+        """Atomic: Get CL2 (Convergence Lens)."""
+        return self._read_hw(self.lens, "GetCL2", "BEAM", self._to_int)
+
     # --- Atomic Setters ---
 
     def set_acceleration_voltage(self, voltage: Quantity, **kwargs) -> None:
@@ -1298,6 +1306,14 @@ class JeolMicroscope(TemMicroscope):
             logger.error(f"[BEAM] Set MDS failed: Unknown mode {mode}")
             raise ValueError(f"Unknown MDS mode: {mode}")
 
+    def set_condenser_lens_1(self, dac: int) -> None:
+        """Atomic: Set CL1."""
+        self._write_hw(self.lens, "SetCL1", "BEAM", int(dac))
+
+    def set_condenser_lens_2(self, dac: int) -> None:
+        """Atomic: Set CL2."""
+        self._write_hw(self.lens, "SetCL2", "BEAM", int(dac))
+
     def set_ht_wobbler(self, active: bool) -> None:
         """Vendor: Control HT Wobbler (Voltage Center)."""
         state = 1 if active else 0
@@ -1321,12 +1337,18 @@ class JeolMicroscope(TemMicroscope):
         # 2. Get Vendor Extras
         alpha = self.get_alpha_index()
         cl3 = self.get_brightness_value()
+        cl1 = self.get_condenser_lens_1()
+        cl2 = self.get_condenser_lens_2()
 
         vendor_extras = {}
         if alpha is not None:
             vendor_extras["alpha_index"] = alpha
         if cl3 is not None:
             vendor_extras["brightness_value"] = cl3
+        if cl1 is not None:
+            vendor_extras["condenser_lens_1"] = cl1
+        if cl2 is not None:
+            vendor_extras["condenser_lens_2"] = cl2
 
         # 3. Merge into extras
         if vendor_extras:
@@ -1373,6 +1395,12 @@ class JeolMicroscope(TemMicroscope):
                     logger.error(f"[BEAM] Failed to set brightness_value: {e}")
                     raise
 
+            if 'condenser_lens_1' in jeol_v:
+                self.set_condenser_lens_1(int(jeol_v['condenser_lens_1']))
+
+            if 'condenser_lens_2' in jeol_v:
+                self.set_condenser_lens_2(int(jeol_v['condenser_lens_2']))
+
     def perform_beam_action(self, action: str, **kwargs) -> None:
         """
         Override: Handles 'FLASH_FEG', 'OPEN_VALVE', etc.
@@ -1409,6 +1437,29 @@ class JeolMicroscope(TemMicroscope):
             active = bool(kwargs.get("active", True))
             logger.info(f"[BEAM] A2 (Gun) Wobbler active={active}")
             self.set_a2_wobbler(active)
+
+        elif act == "WOBBLE_TILT":
+            amp_x = int(kwargs.get("amp_x", 200))
+            amp_y = int(kwargs.get("amp_y", 0))
+            cycles = int(kwargs.get("cycles", 5))
+            delay = float(kwargs.get("delay", 0.15))
+
+            cx_raw, cy_raw = self.get_beam_tilt()
+            if cx_raw is None or cy_raw is None:
+                raise RuntimeError("Cannot wobble: Current Beam Tilt unknown.")
+
+            cx, cy = float(cx_raw), float(cy_raw)
+            logger.info(f"[BEAM] Starting Tilt Wobbler (Center: {cx:.0f},{cy:.0f})")
+
+            try:
+                for _ in range(cycles):
+                    self.set_beam_tilt(cx + amp_x, cy + amp_y)
+                    time.sleep(delay)
+                    self.set_beam_tilt(cx - amp_x, cy - amp_y)
+                    time.sleep(delay)
+            finally:
+                self.set_beam_tilt(cx, cy)
+                logger.debug("[BEAM] Tilt Wobbler finished.")
 
         else:
             super().perform_beam_action(action, **kwargs)
@@ -1476,7 +1527,7 @@ class JeolMicroscope(TemMicroscope):
 
         # TEM:LOWMAG -> OM (Objective Mini)
         if mode_key == "TEM:LOWMAG":
-            raw_dac = self.get_objective_mini_lens()
+            raw_dac = self.get_objective_mini_lens_1()
             if raw_dac is None: return None
 
             # F200 Thresholds
@@ -1531,13 +1582,49 @@ class JeolMicroscope(TemMicroscope):
         """Atomic: Get OLS (Objective Lens SuperFine)."""
         return self._read_hw(self.lens, "GetOLSuperFineValue", "LENS", self._to_int)
 
-    def get_objective_mini_lens(self) -> Optional[int]:
+    def get_objective_mini_lens_1(self) -> Optional[int]:
         """Atomic: Get OM (Objective Mini-lens)."""
         return self._read_hw(self.lens, "GetOM", "LENS", self._to_int)
+
+    def get_objective_mini_lens_2(self) -> Optional[int]:
+        """Atomic: Get OM2."""
+        return self._read_hw(self.lens, "GetOM2", "LENS", self._to_int)
+
+    def get_focus_lens_coarse(self) -> Optional[int]:
+        """Atomic: Get FLc (Focus Lens Coarse)."""
+        return self._read_hw(self.lens, "GetFLc", "LENS", self._to_int)
+
+    def get_focus_lens_fine(self) -> Optional[int]:
+        """Atomic: Get FLf (Focus Lens Fine)."""
+        return self._read_hw(self.lens, "GetFLf", "LENS", self._to_int)
 
     def get_intermediate_lens_1(self) -> Optional[int]:
         """Atomic: Get IL1 (Intermediate Lens 1)."""
         return self._read_hw(self.lens, "GetIL1", "LENS", self._to_int)
+
+    def get_intermediate_lens_2(self) -> Optional[int]:
+        """Atomic: Get IL2."""
+        return self._read_hw(self.lens, "GetIL2", "LENS", self._to_int)
+
+    def get_intermediate_lens_3(self) -> Optional[int]:
+        """Atomic: Get IL3."""
+        return self._read_hw(self.lens, "GetIL3", "LENS", self._to_int)
+
+    def get_intermediate_lens_4(self) -> Optional[int]:
+        """Atomic: Get IL4."""
+        return self._read_hw(self.lens, "GetIL4", "LENS", self._to_int)
+
+    def get_projector_lens_1(self) -> Optional[int]:
+        """Atomic: Get PL1."""
+        return self._read_hw(self.lens, "GetPL1", "LENS", self._to_int)
+
+    def get_projector_lens_2(self) -> Optional[int]:
+        """Atomic: Get PL2."""
+        return self._read_hw(self.lens, "GetPL2", "LENS", self._to_int)
+
+    def get_projector_lens_3(self) -> Optional[int]:
+        """Atomic: Get PL3."""
+        return self._read_hw(self.lens, "GetPL3", "LENS", self._to_int)
 
     def get_image_shift_2(self) -> Tuple[Optional[float], Optional[float]]:
         """Ref: Def3.GetIS2 """
@@ -1693,7 +1780,7 @@ class JeolMicroscope(TemMicroscope):
             else:
                 std = 0xC85A
             target_dac = int(std + (target_nm / 1500.0))
-            self.set_objective_mini_lens(target_dac)
+            self.set_objective_mini_lens_1(target_dac)
 
         elif mode_key == "TEM:MAG":
             std = 0x8010 if mag < 1500000 else 0x7D10
@@ -1735,13 +1822,49 @@ class JeolMicroscope(TemMicroscope):
         self._write_hw(self.lens, "SetOLSuperFineSw", "LENS", 1)
         self._write_hw(self.lens, "SetOLSuperFineValue", "LENS", int(dac))
 
-    def set_objective_mini_lens(self, dac: int) -> None:
+    def set_objective_mini_lens_1(self, dac: int) -> None:
         """Atomic: Set OM."""
         self._write_hw(self.lens, "SetOM", "LENS", int(dac))
+
+    def set_objective_mini_lens_2(self, dac: int) -> None:
+        """Atomic: Set OM2."""
+        self._write_hw(self.lens, "SetOM2", "LENS", int(dac))
+
+    def set_focus_lens_coarse(self, dac: int) -> None:
+        """Atomic: Set FLc."""
+        self._write_hw(self.lens, "SetFLc", "LENS", int(dac))
+
+    def set_focus_lens_fine(self, dac: int) -> None:
+        """Atomic: Set FLf."""
+        self._write_hw(self.lens, "SetFLf", "LENS", int(dac))
 
     def set_intermediate_lens_1(self, dac: int) -> None:
         """Atomic: Set IL1."""
         self._write_hw(self.lens, "SetIL1", "LENS", int(dac))
+
+    def set_intermediate_lens_2(self, dac: int) -> None:
+        """Atomic: Set IL2."""
+        self._write_hw(self.lens, "SetIL2", "LENS", int(dac))
+
+    def set_intermediate_lens_3(self, dac: int) -> None:
+        """Atomic: Set IL3."""
+        self._write_hw(self.lens, "SetIL3", "LENS", int(dac))
+
+    def set_intermediate_lens_4(self, dac: int) -> None:
+        """Atomic: Set IL4."""
+        self._write_hw(self.lens, "SetIL4", "LENS", int(dac))
+
+    def set_projector_lens_1(self, dac: int) -> None:
+        """Atomic: Set PL1."""
+        self._write_hw(self.lens, "SetPL1", "LENS", int(dac))
+
+    def set_projector_lens_2(self, dac: int) -> None:
+        """Atomic: Set PL2."""
+        self._write_hw(self.lens, "SetPL2", "LENS", int(dac))
+
+    def set_projector_lens_3(self, dac: int) -> None:
+        """Atomic: Set PL3."""
+        self._write_hw(self.lens, "SetPL3", "LENS", int(dac))
 
     def set_standard_focus(self) -> None:
         """Atomic: Execute Standard Focus."""
@@ -1790,8 +1913,17 @@ class JeolMicroscope(TemMicroscope):
         extras["objective_lens_coarse"] = self.get_objective_lens_coarse()
         extras["objective_lens_fine"] = self.get_objective_lens_fine()
         extras["objective_lens_superfine"] = self.get_objective_lens_superfine()
-        extras["objective_mini_lens"] = self.get_objective_mini_lens()
+        extras["objective_mini_lens_1"] = self.get_objective_mini_lens_1()
+        extras["objective_mini_lens_2"] = self.get_objective_mini_lens_2()
+        extras["focus_lens_coarse"] = self.get_focus_lens_coarse()
+        extras["focus_lens_fine"] = self.get_focus_lens_fine()
         extras["intermediate_lens_1"] = self.get_intermediate_lens_1()
+        extras["intermediate_lens_2"] = self.get_intermediate_lens_2()
+        extras["intermediate_lens_3"] = self.get_intermediate_lens_3()
+        extras["intermediate_lens_4"] = self.get_intermediate_lens_4()
+        extras["projector_lens_1"] = self.get_projector_lens_1()
+        extras["projector_lens_2"] = self.get_projector_lens_2()
+        extras["projector_lens_3"] = self.get_projector_lens_3()
 
         # 3. Logical Properties
         extras["diffraction_focus_index"] = self.get_diffraction_focus()
@@ -1820,10 +1952,28 @@ class JeolMicroscope(TemMicroscope):
                 self.set_objective_lens_fine(jeol_v["objective_lens_fine"])
             if "objective_lens_superfine" in jeol_v:
                 self.set_objective_lens_superfine(jeol_v["objective_lens_superfine"])
-            if "objective_mini_lens" in jeol_v:
-                self.set_objective_mini_lens(jeol_v["objective_mini_lens"])
+            if "objective_mini_lens_1" in jeol_v:
+                self.set_objective_mini_lens_1(jeol_v["objective_mini_lens_1"])
+            if "objective_mini_lens_2" in jeol_v:
+                self.set_objective_mini_lens_2(jeol_v["objective_mini_lens_2"])
+            if "focus_lens_coarse" in jeol_v:
+                self.set_focus_lens_coarse(jeol_v["focus_lens_coarse"])
+            if "focus_lens_fine" in jeol_v:
+                self.set_focus_lens_fine(jeol_v["focus_lens_fine"])
             if "intermediate_lens_1" in jeol_v:
                 self.set_intermediate_lens_1(jeol_v["intermediate_lens_1"])
+            if "intermediate_lens_2" in jeol_v:
+                self.set_intermediate_lens_2(jeol_v["intermediate_lens_2"])
+            if "intermediate_lens_3" in jeol_v:
+                self.set_intermediate_lens_3(jeol_v["intermediate_lens_3"])
+            if "intermediate_lens_4" in jeol_v:
+                self.set_intermediate_lens_4(jeol_v["intermediate_lens_4"])
+            if "projector_lens_1" in jeol_v:
+                self.set_projector_lens_1(jeol_v["projector_lens_1"])
+            if "projector_lens_2" in jeol_v:
+                self.set_projector_lens_2(jeol_v["projector_lens_2"])
+            if "projector_lens_3" in jeol_v:
+                self.set_projector_lens_2(jeol_v["projector_lens_3"])
             if "image_shift_2" in jeol_v:
                 val = jeol_v["image_shift_2"]
                 if isinstance(val, (list, tuple)) and len(val) >= 2:
