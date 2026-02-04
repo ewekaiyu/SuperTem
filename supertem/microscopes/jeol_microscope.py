@@ -556,6 +556,9 @@ class JeolMicroscope(TemMicroscope):
     def _to_int(self, v):
         return int(v)
 
+    def _to_int_plus_one(self, v):
+        return int(v + 1)
+
     def _to_bool(self, v):
         return bool(v)
 
@@ -1124,77 +1127,118 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def get_acceleration_voltage(self) -> Optional[Quantity]:
+        # HT3.GetHtValue -> float (Volts). Convert to kV.
         return self._read_hw(self.ht, "GetHtValue", "BEAM", self._to_kv)
 
     def get_probe_mode(self) -> Optional[str]:
-        # Logic retention: Map 0/1 to Strings
+        # EOS3.GetProbeMode -> 0= TEM, 1= EDS, 2= NBD, 3= CBD
         val = self._read_hw(self.eos, "GetProbeMode", "BEAM", self._to_int)
-        return "Nanoprobe" if val == 1 else "Microprobe" if val == 0 else None
+        if val == 0: return "TEM"
+        if val == 1: return "EDS"
+        if val == 2: return "NBD"
+        if val == 3: return "CBD"
+
+        return None
 
     def get_beam_current(self) -> Optional[Quantity]:
-        return self._read_hw(self.gun, "GetEmissionCurrent", "BEAM", self._to_na)
+        # JEOL does not report Probe Current. Returns None.
+        return None
 
     def get_emission_current(self) -> Optional[Quantity]:
-        return self._read_hw(self.gun, "GetEmissionCurrent", "BEAM", self._to_ua)
+        return self._read_hw(self.gun, "GetEmissionCurrentValue", "BEAM", self._to_ua)
 
     def get_spot_size(self) -> Optional[int]:
-        return self._read_hw(self.eos, "GetSpotSize", "BEAM", self._to_int)
+        # EOS3.GetSpotSize -> int (0-based index)
+        # NOTE: In display the index is one higher
+        return self._read_hw(self.eos, "GetSpotSize", "BEAM", self._to_int_plus_one)
 
     def get_convergence_angle(self) -> Optional[Quantity]:
-        """
-        Physical convergence angle is not available from the hardware directly.
-        Use `get_alpha_index()` instead.
-        """
+        # Physical angle requires calibration. Returns None.
         return None
 
     def get_beam_blank(self) -> bool:
-        return self._read_hw(self.def_, "GetBeamBlank", "BEAM", self._to_bool, default=False)
+        # Def3.GetBeamBlank -> 0=OFF(Unblanked), 1=ON(Blanked)
+        val = self._read_hw(self.def_, "GetBeamBlank", "BEAM", self._to_int)
+        return (val == 1)
 
     def get_beam_shift(self) -> Tuple[Optional[float], Optional[float]]:
-        return self._read_hw(self.def_, "GetCLA1", "BEAM", self._coerce_xy, default=(None, None))
+        # Def3.GetShifBal -> [x, y] (User Beam Shift)
+        return self._read_hw(self.def_, "GetShifBal", "BEAM", self._coerce_xy, default=(None, None))
 
     def get_beam_tilt(self) -> Tuple[Optional[float], Optional[float]]:
-        return self._read_hw(self.def_, "GetCLA2", "BEAM", self._coerce_xy, default=(None, None))
+        # Def3.GetTiltBal -> [x, y] (User Beam Tilt)
+        return self._read_hw(self.def_, "GetTiltBal", "BEAM", self._coerce_xy, default=(None, None))
 
     def get_condenser_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
+        # Def3.GetCLs -> [x, y]
         return self._read_hw(self.def_, "GetCLs", "BEAM", self._coerce_xy, default=(None, None))
 
     def get_gun_tilt(self) -> Tuple[Optional[float], Optional[float]]:
+        # Def3.GetAngBal -> [x, y] (Angle Balance)
         return self._read_hw(self.def_, "GetAngBal", "BEAM", self._coerce_xy, default=(None, None))
 
     # --- Atomic Getters (Vendor Specific) ---
 
     def get_alpha_index(self) -> Optional[int]:
-        return self._read_hw(self.eos, "GetAlpha", "BEAM", self._to_int)
+        """Vendor: Get Alpha (Convergence) Selector Index (0-8)."""
+        # NOTE: In display the index is one higher
+        return self._read_hw(self.eos, "GetAlpha", "BEAM", self._to_int_plus_one)
+
+    def get_brightness_value(self) -> Optional[int]:
+        """Vendor: Get CL3 Lens Value (0-65535). Controls Brightness."""
+        return self._read_hw(self.lens, "GetCL3", "BEAM", self._to_int)
 
     # --- Atomic Setters ---
 
     def set_acceleration_voltage(self, voltage: Quantity, **kwargs) -> None:
-        self._write_hw(self.ht, "SetHtValue", "BEAM", float(voltage.to("V").magnitude))
+        # HT3.SetHtValue(Volts)
+        volts = float(voltage.to(Units.V).magnitude)
+        self._write_hw(self.ht, "SetHtValue", "BEAM", volts)
 
     def set_probe_mode(self, mode: str, **kwargs) -> None:
-        if not self.eos: raise RuntimeError("EOS hardware not connected.")
-        idx = 1 if "nano" in mode.strip().lower() else 0
-        self._write_hw(self.eos, "SetProbeMode", "BEAM", idx)
+        # EOS3.SelectProbeMode(0= TEM, 1= EDS, 2= NBD, 3= CBD)
+        m = mode.strip().upper()
+        if m == "TEM":
+            idx = 0
+        elif m == "EDS":
+            idx = 1
+        elif m == "NBD":
+            idx = 2
+        elif m == "CBD":
+            idx = 3
+        else:
+            logger.error(f"[BEAM] Cannot set {mode} as probe mode. Available: TEM, EDS, NBD, CBD")
+            raise ValueError(f"{mode} not in available modes (TEM, EDS, NBD, CBD).")
+        self._write_hw(self.eos, "SelectProbeMode", "BEAM", idx)
+
+    def set_beam_current(self, current: Quantity, **kwargs) -> None:
+        # WARNING: This typically sets Emission Current on JEOL.
+        raise NotImplementedError("Setting beam current is not supported on JEOL.")
 
     def set_emission_current(self, current: Quantity, **kwargs) -> None:
-        self._write_hw(self.gun, "SetEmissionCurrent", "BEAM", float(current.to(Units.UA).magnitude))
+        uA = float(current.to(Units.UA).magnitude)
+        self._write_hw(self.gun, "SetEmissionCurrentValue", "BEAM", uA)
 
     def set_spot_size(self, index: int, **kwargs) -> None:
-        self._write_hw(self.eos, "SelectSpotSize", "BEAM", int(index))
+        # EOS3.SelectSpotSize(0-N)
+        self._write_hw(self.eos, "SelectSpotSize", "BEAM", int(index - 1))
 
     def set_convergence_angle(self, angle: Quantity, **kwargs) -> None:
-        """Physical angle setting not supported. Use `set_alpha_index`."""
-        raise NotImplementedError("JEOL driver cannot set physical convergence angle. Use set_alpha_index(idx).")
+        # Cannot set physical angle without calibration mapping.
+        raise NotImplementedError("Use 'alpha_index' extra to set convergence on JEOL.")
 
     def set_beam_blank(self, blank: bool, **kwargs) -> None:
-        self._write_hw(self.def_, "SetBeamBlank", "BEAM", 1 if blank else 0)
+        # Def3.SetBeamBlank(1=ON/Blanked, 0=OFF/Unblanked)
+        val = 1 if blank else 0
+        self._write_hw(self.def_, "SetBeamBlank", "BEAM", val)
 
     def set_beam_shift(self, x: float, y: float, **kwargs) -> None:
-        self._write_hw(self.def_, "SetCLA1", "BEAM", int(x), int(y))
+        # Def3.SetShifBal - User Beam Shift
+        self._write_hw(self.def_, "SetShifBal", "BEAM", int(x), int(y))
 
     def set_beam_tilt(self, x: float, y: float, **kwargs) -> None:
-        self._write_hw(self.def_, "SetCLA2", "BEAM", int(x), int(y))
+        # Def3.SetTiltBal - User Beam Tilt
+        self._write_hw(self.def_, "SetTiltBal", "BEAM", int(x), int(y))
 
     def set_condenser_stigmation(self, x: float, y: float, **kwargs) -> None:
         self._write_hw(self.def_, "SetCLs", "BEAM", int(x), int(y))
@@ -1205,78 +1249,102 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Setters (Vendor Specific) ---
 
     def set_alpha_index(self, idx: int, **kwargs) -> None:
-        self._write_hw(self.eos, "SetAlphaSelector", "BEAM", int(idx))
+        """Vendor: Set Alpha Selector (0-8)."""
+        self._write_hw(self.eos, "SetAlphaSelector", "BEAM", int(idx - 1))
 
-    # --- Helper Layer Overrides ---
+    def set_brightness_value(self, val: int, **kwargs) -> None:
+        """Vendor: Set CL3 Lens (Brightness) Value (0-65535)."""
+        self._write_hw(self.lens, "SetCL3", "BEAM", int(val))
+
+    # --- Helper Layer Overrides (Logic & Validation) ---
 
     def get_beam_settings(self) -> BeamSettings:
         """
         Aggregates beam state.
-        Override Reason: Collects vendor-specific 'alpha_index' alongside canonical physics.
+        Override: Adds 'alpha_index' and 'brightness_value' (CL3) to extras.
         """
-        raw_flags: Dict[str, Any] = {}
+        # 1. Get Base Settings (Calls standard atomics)
+        bs = super().get_beam_settings()
 
-        # Acceleration voltage
-        vq = self.get_acceleration_voltage()
-        voltage_val = 0.0
-        if vq is None:
-            raw_flags["ht_unavailable"] = True
-        else:
-            try:
-                voltage_val = float(vq.to(Units.KV).magnitude)
-            except Exception:
-                raw_flags["ht_unavailable"] = True
+        # 2. Get Vendor Extras
+        alpha = self.get_alpha_index()
+        cl3 = self.get_brightness_value()
 
-        # Beam current
-        cq = self.get_beam_current()
-        current_ua = 0.0
-        if cq is None:
-            raw_flags["beam_current_unavailable"] = True
-        else:
-            try:
-                current_ua = float(cq.to(Units.UA).magnitude)
-            except Exception:
-                raw_flags["beam_current_unavailable"] = True
+        vendor_extras = {}
+        if alpha is not None:
+            vendor_extras["alpha_index"] = alpha
+        if cl3 is not None:
+            vendor_extras["brightness_value"] = cl3
 
-        # Spot size
-        spot_idx = self.get_spot_size()
-        if spot_idx is None:
-            raw_flags["spot_size_unavailable"] = True
+        # 3. Merge into extras
+        if vendor_extras:
+            current_extras = bs.extra.vendor if (bs.extra and bs.extra.vendor) else {}
+            current_extras.setdefault("JEOL", {}).update(vendor_extras)
 
-        # Alpha selector index
-        alpha_idx = self.get_alpha_index()
-        if alpha_idx is None:
-            raw_flags["alpha_unavailable"] = True
+            if not bs.extra:
+                bs.extra = Extras(vendor=current_extras)
+            else:
+                bs.extra.vendor = current_extras
 
-        # Beam shift
-        beam_shift_dac: Optional[Tuple[int, int]] = None
-        bs = self.get_beam_shift()
-        if bs[0] is not None and bs[1] is not None:
-            beam_shift_dac = (int(round(bs[0])), int(round(bs[1])))
-        else:
-            raw_flags["beam_shift_unavailable"] = True
-
-        return jeol_adapter.from_jeol_beam_stats(
-            voltage_val=voltage_val,
-            current_ua=current_ua,
-            spot_size_idx=spot_idx,  # type: ignore
-            alpha_idx=alpha_idx,    # type: ignore
-            beam_shift_dac=beam_shift_dac,
-            raw_flags=raw_flags if raw_flags else None
-        )
+        return bs
 
     def apply_beam_settings(self, settings: BeamSettings, **kwargs) -> None:
-        """Override to handle alpha_index extra."""
+        """
+        Override: Handles standard settings + Vendor Extras (Alpha, Brightness).
+        """
+        # 1. Apply Standard Settings (Voltage, Spot, etc)
         super().apply_beam_settings(settings, **kwargs)
 
+        # 2. Handle JEOL Extras
         vend = getattr(settings.extra, 'vendor', None)
         jeol_v = vend.get('JEOL') if isinstance(vend, dict) else None
-        if isinstance(jeol_v, dict) and 'alpha_index' in jeol_v:
-            try:
-                idx = int(jeol_v['alpha_index'])
-                if 0 <= idx <= 8: self.set_alpha_index(idx)
-            except Exception:
-                pass
+
+        if isinstance(jeol_v, dict):
+            # A. Alpha Index (Convergence)
+            if 'alpha_index' in jeol_v:
+                try:
+                    idx = int(jeol_v['alpha_index'])
+                    # Validation: Hardware usually 0-8
+                    if not (0 <= idx <= 8):
+                        raise ValueError(f"Alpha index {idx} out of range (0-8).")
+                    self.set_alpha_index(idx)
+                except Exception as e:
+                    logger.error(f"[BEAM] Failed to set alpha_index: {e}")
+                    raise
+
+            # B. Brightness (CL3)
+            if 'brightness_value' in jeol_v:
+                try:
+                    val = int(jeol_v['brightness_value'])
+                    self.set_brightness_value(val)
+                except Exception as e:
+                    logger.error(f"[BEAM] Failed to set brightness_value: {e}")
+                    raise
+
+    def perform_beam_action(self, action: str, **kwargs) -> None:
+        """
+        Override: Handles 'FLASH_FEG', 'OPEN_VALVE', etc.
+        """
+        act = action.upper().strip()
+
+        if act == "FLASH_FEG":
+            # PyJEM FEG3: ExecAutoFlashing(1) -> Start
+            if hasattr(self.feg, "ExecAutoFlashing"):
+                logger.info("[BEAM] Executing FEG Auto-Flash...")
+                self._write_hw(self.feg, "ExecAutoFlashing", "BEAM", 1)
+            else:
+                raise RuntimeError("FEG Flashing not supported (FEG3 module missing or incompatible).")
+
+        elif act in ["OPEN_VALVE", "OPEN_V1"]:
+            logger.info("[BEAM] Opening Gun Valve (V1)...")
+            self.set_gun_valve_state("OPEN")
+
+        elif act in ["CLOSE_VALVE", "CLOSE_V1"]:
+            logger.info("[BEAM] Closing Gun Valve (V1)...")
+            self.set_gun_valve_state("CLOSED")
+
+        else:
+            super().perform_beam_action(action, **kwargs)
 
     # =========================================================================
     # 5. Projection Control (Imaging/Optics)
@@ -2273,8 +2341,20 @@ class JeolMicroscope(TemMicroscope):
         return "UNKNOWN"
 
     def get_gun_valve_state(self) -> str:
-        val = self._read_hw(self.gun, "GetBeamValve", "VAC", self._to_int)
-        return "OPEN" if val == 1 else "CLOSED" if val is not None else "UNKNOWN"
+        """Atomic: Robust check for V1 (FEG or Thermionic)."""
+        # 1. Try FEG3 (Modern/FEG)
+        if hasattr(self.feg, "GetBeamValve"):
+            val = self._read_hw(self.feg, "GetBeamValve", "VAC")
+            if val == 1: return "OPEN"
+            if val == 0: return "CLOSED"
+
+        # 2. Fallback to GUN3 (Thermionic)
+        # Cite: PyJEM_TEM3_reorganized_clean.docx (GUN3.GetBeamValve)
+        val = self._read_hw(self.gun, "GetBeamValve", "VAC")
+        if val == 1: return "OPEN"
+        if val == 0: return "CLOSED"
+
+        return "UNKNOWN"
 
     def get_turbo_pump_state(self) -> str:
         res = self._read_hw(self.vac, "GetValveStatus", "VAC")
@@ -2305,7 +2385,15 @@ class JeolMicroscope(TemMicroscope):
         raise NotImplementedError("Column Valve control not supported.")
 
     def set_gun_valve_state(self, state: str, **kwargs) -> None:
-        self._write_hw(self.gun, "SetBeamValve", "VAC", 1 if state == "OPEN" else 0)
+        """Atomic: Set V1 State (Open/Close). Handles FEG vs Thermionic."""
+        is_open = 1 if state.upper() == "OPEN" else 0
+
+        # Prefer FEG3 if available
+        if hasattr(self.feg, "SetBeamValve"):
+            self._write_hw(self.feg, "SetBeamValve", "VAC", is_open)
+        else:
+            # Cite: PyJEM_TEM3_reorganized_clean.docx (GUN3.SetBeamValve)
+            self._write_hw(self.gun, "SetBeamValve", "VAC", is_open)
 
     def set_turbo_pump_state(self, state: str, **kwargs) -> None:
         raise NotImplementedError("Turbo Pump control not supported.")
