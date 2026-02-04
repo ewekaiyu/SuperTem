@@ -1663,49 +1663,22 @@ class JeolMicroscope(TemMicroscope):
         else:
             raise RuntimeError(f"Cannot set Camera Length in mode {mode_key}.")
 
-    def set_defocus(self, defocus: Union[Quantity, int], relative: bool = False, **kwargs) -> None:
+    def set_defocus(self, defocus: Quantity, **kwargs) -> None:
         """
-        Sets defocus.
-        - Relative=True: Uses universal 'SetObjFocus' (steps).
-        - Relative=False: Uses model-specific logic (nm -> DAC).
+        Sets absolute physical defocus (nm).
+        Only supported on models with known calibration (e.g., F200).
         """
-        # 1. Universal Relative Step
-        if relative:
-            steps = 0
-            # If Quantity provided (e.g. 100nm), convert to steps if F200, else fail or assume 1:1?
-            # For simplicity & universality, we assume 'int' steps or conversion if possible.
-            if isinstance(defocus, int):
-                steps = defocus
-            elif isinstance(defocus, Quantity):
-                # Try F200 conversion if model matches, otherwise we can't convert nm->steps reliably
-                model = (self.system_settings.info.model or "").upper()
-                if "F200" in model:
-                    target_nm = float(defocus.to(Units.NM).magnitude)
-                    mode_key = self._get_current_mode_key()
-                    if mode_key == "TEM:LOWMAG":
-                        steps = int(target_nm / 1500.0)
-                    elif mode_key == "TEM:MAG":
-                        steps = int(target_nm / 1.4)
-                    else:
-                        steps = int(target_nm)  # Fallback
-                else:
-                    raise NotImplementedError(
-                        f"Relative defocus by physical amount ({defocus}) not supported for model '{model}' "
-                        "(Scale unknown). Use integer steps instead."
-                    )
+        # 1. Enforce Contract: Reject Steps/Integers
+        if not isinstance(defocus, Quantity):
+            raise TypeError(
+                "set_defocus requires a Quantity (nm). "
+                "For relative steps, use the 'STEP_FOCUS' action via perform_projection_action."
+            )
 
-            self._write_hw(self.eos, "SetObjFocus", "LENS", steps)
-            return
-
-        # 2. Model-Specific Absolute Setting
-        # Only F200 logic is implemented for absolute nm -> DAC mapping
+        # 2. Model-Specific Absolute Setting (F200 Logic)
         model = (self.system_settings.info.model or "").upper()
         if "F200" not in model:
             logger.warning("[LENS] Absolute physical defocus setting only supported for F200.")
-            return
-
-        if not isinstance(defocus, Quantity):
-            logger.warning("[LENS] Absolute set_defocus requires Quantity(nm).")
             return
 
         target_nm = float(defocus.to(Units.NM).magnitude)
@@ -1798,6 +1771,10 @@ class JeolMicroscope(TemMicroscope):
         else:
             logger.warning("[LENS] Absolute diffraction focus not supported for this model (Requires F200 IL1 logic).")
 
+    def set_relative_focus_steps(self, steps: int) -> None:
+        """Atomic: Adjust focus by relative hardware steps (Knob turn)."""
+        self._write_hw(self.eos, "SetObjFocus", "LENS", int(steps))
+
     # --- Helper Layer Overrides ---
 
     def get_projection_settings(self) -> ProjectionSettings:
@@ -1861,15 +1838,35 @@ class JeolMicroscope(TemMicroscope):
             logger.info("[LENS] Executing Standard Focus...")
             self.set_standard_focus()
 
-        elif act == "STEP_DIFF_FOCUS":
-            # Universal Relative Step
-            steps = int(kwargs.get("steps", 1))
-            self.set_diffraction_focus(steps, relative=True)
-
+        # CASE 1: Relative Steps (Knob clicks) - Hardware Command
         elif act == "STEP_FOCUS":
-            # Universal Relative Step
             steps = int(kwargs.get("steps", 1))
-            self.set_defocus(steps, relative=True)
+            logger.debug(f"[LENS] Stepping focus by {steps} clicks")
+            self.set_relative_focus_steps(steps)  # The new Atomic setter we discussed
+
+        # CASE 2: Relative Nanometers (Physical Shift) - Software Calculation
+        elif act == "SHIFT_FOCUS_NM":
+            # 1. Validate Input
+            amount = kwargs.get("amount")
+            if not isinstance(amount, Quantity):
+                # Fallback: Try to construct Quantity if raw float provided (assuming nm)
+                if isinstance(amount, (int, float)):
+                    amount = Q_(amount, Units.NM)
+                else:
+                    raise ValueError("SHIFT_FOCUS_NM requires 'amount' as a Quantity (nm).")
+
+            # 2. Read Current State (The "Read" phase)
+            current = self.get_defocus()
+            if current is None:
+                raise RuntimeError(
+                    "Cannot shift focus physically: Current absolute defocus is unknown (Calibration missing?).")
+
+            # 3. Calculate New Target (The "Modify" phase)
+            target = current + amount
+            logger.info(f"[LENS] Shifting focus: {current} + {amount} -> {target}")
+
+            # 4. Execute Absolute Move (The "Write" phase)
+            self.set_defocus(target)
 
         else:
             super().perform_projection_action(action, **kwargs)
