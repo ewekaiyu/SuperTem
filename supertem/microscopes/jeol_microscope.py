@@ -159,7 +159,7 @@ from supertem.structures.base import (
 
 # Import Vendor Adapters
 from supertem.vendor.JEOL import jeol_adapter
-from supertem.vendor.JEOL.jeol_eos_tables import EOS_MODE_TABLES, get_list
+from supertem.vendor.JEOL.jeol_eos_tables import DEFAULT_TABLES
 
 logger = logging.getLogger(__name__)
 
@@ -175,19 +175,28 @@ class JeolMicroscope(TemMicroscope):
         "ENT": 5, "HX": 6, "BF": 7,
         "AUX": 8, "AUX1": 8, "AUX2": 9, "AUX3": 10, "AUX4": 11
     }
-    _EOS_MODE_MAP = {
-        (0, 0): "TEM:MAG",
-        (0, 1): "TEM:MAG2",
-        (0, 2): "TEM:LOWMAG",
-        (0, 3): "TEM:SAMAG",
-        (0, 4): "TEM:DIFF",
-        (1, 0): "STEM:ALIGN",
-        (1, 1): "STEM:SM-LMAG",
-        (1, 2): "STEM:SM-MAG",
-        (1, 3): "STEM:AMAG",
-        (1, 4): "STEM:UUDIFF",
-        (1, 5): "STEM:ROCKING",
+
+    # TEM Function Indices
+    _TEM_FUNC_MAP = {
+        0: "MAG",
+        1: "MAG2",
+        2: "LOWMAG",
+        3: "SAMAG",
+        4: "DIFF"
     }
+    # STEM Function Indices [cite: 819, 888]
+    _STEM_FUNC_MAP = {
+        0: "ALIGN",
+        1: "SM-LMAG",
+        2: "SM-MAG",
+        3: "AMAG",
+        4: "UUDIFF",  # Often maps to "DIFF" logic in STEM
+        5: "ROCKING"
+    }
+
+    # Reverse maps for Setters
+    _TEM_FUNC_NAME_TO_IDX = {v: k for k, v in _TEM_FUNC_MAP.items()}
+    _STEM_FUNC_NAME_TO_IDX = {v: k for k, v in _STEM_FUNC_MAP.items()}
 
     def __init__(self, config: MicroscopeSettings):
         """
@@ -230,6 +239,9 @@ class JeolMicroscope(TemMicroscope):
         self._has_defocus_calibration: bool = False
         self.defocus_scale: float = 1.0
 
+        # Load Tables: Start with Defaults, then Override with Config
+        self.optical_tables = DEFAULT_TABLES.copy()
+
         if config:
             # Check for attribute first (Pydantic/Dataclass)
             val = getattr(config, 'defocus_scale', None)
@@ -240,6 +252,20 @@ class JeolMicroscope(TemMicroscope):
             if val is not None:
                 self._has_defocus_calibration = True
                 self.defocus_scale = float(val)
+
+            # Table Overrides (e.g., config.extra.vendor["JEOL"]["optical_tables"]["STEM:SM-MAG"])
+            if hasattr(config, "extra") and config.extra:
+                vendor = getattr(config.extra, "vendor", {})
+                if vendor and "JEOL" in vendor:
+                    custom = vendor["JEOL"].get("optical_tables")
+                    if custom:
+                        # Deep merge or update
+                        for mode_key, tables in custom.items():
+                            if mode_key in self.optical_tables:
+                                self.optical_tables[mode_key].update(tables)
+                            else:
+                                self.optical_tables[mode_key] = tables
+                        logger.info(f"Loaded custom JEOL optical tables for: {list(custom.keys())}")
 
     # ---------------------------------------------------------------------
     # Internal helpers
@@ -568,95 +594,71 @@ class JeolMicroscope(TemMicroscope):
 
     # --- EOS Helpers ---
 
-    def _get_eos_mode_key(self) -> Optional[str]:
+    def _get_current_mode_key(self) -> str:
         """
-        Determine the current EOS mode string (e.g., 'TEM:MAG', 'STEM:AMAG').
-        Used to look up magnification tables.
-        """
-        if not self.eos or not hasattr(self.eos, "GetFunctionMode"):
-            return None
-        try:
-            function_mode = self.eos.GetFunctionMode()[0]
-            main_mode = self.eos.GetTemStemMode()
-        except Exception:
-            return None
+        Robustly determine the current EOS mode key (e.g., 'STEM:SM-MAG').
+        Sources of Truth:
+          1. EOS3.GetTemStemMode() -> TEM vs STEM
+          2. EOS3.GetFunctionMode() -> Function Index
 
-        key = self._EOS_MODE_MAP.get((int(main_mode), int(function_mode)))
-        if key:
-            return key
-
-        # Fallback if map is incomplete
-        obs = "TEM" if int(main_mode) == 0 else "STEM"
-        return f"{obs}:{int(function_mode)}"
-
-    def _normalize_eos_key(self, key: str) -> Optional[str]:
-        """
-        Match a user-provided mode string against the known EOS_MODE_TABLES keys.
-        Case-insensitive.
-        """
-        if not key:
-            return None
-        if key in EOS_MODE_TABLES:
-            return key
-        up = key.upper()
-        if up in EOS_MODE_TABLES:
-            return up
-        for k in EOS_MODE_TABLES.keys():
-            if k.upper() == up:
-                return k
-        return None
-
-    def _select_eos_mode_key(self, key: str) -> None:
-        """
-        Switch the microscope to the specified EOS mode key.
-        Handles the complexity of selecting TEM/STEM mode first, then Function mode.
+        Returns:
+            "TEM:MAG", "STEM:SM-MAG", etc., or "UNKNOWN" on failure.
         """
         if not self.eos:
-            logger.error(f"[LENS] SelectFunctionMode({key}) failed: EOS hardware not connected.")
-            raise RuntimeError("EOS hardware not connected.")
-
-        logger.debug(f"[LENS] SelectFunctionMode({key})")
-
-        norm = self._normalize_eos_key(key) or key
-        if ":" not in norm:
-            raise ValueError(f"Invalid EOS mode key: {key!r}")
-
-        obs, func = norm.split(":", 1)
-        obs = obs.strip().upper()
-        func = func.strip().upper()
-
-        # JEOL internal function mode indices
-        tem_funcs = {"MAG": 0, "MAG2": 1, "LOWMAG": 2, "SAMAG": 3, "DIFF": 4}
-        stem_funcs = {"ALIGN": 0, "SM-LMAG": 1, "SM-MAG": 2, "AMAG": 3, "UUDIFF": 4, "ROCKING": 5}
+            return "UNKNOWN"
 
         try:
-            if obs == "TEM":
-                if hasattr(self.eos, "SelectTemStem"):
-                    self.eos.SelectTemStem(0)
-                if hasattr(self.eos, "SelectFunctionMode"):
-                    self.eos.SelectFunctionMode(int(tem_funcs.get(func, 0)))
-            elif obs == "STEM":
-                if hasattr(self.eos, "SelectTemStem"):
-                    self.eos.SelectTemStem(1)
-                if hasattr(self.eos, "SelectFunctionMode"):
-                    self.eos.SelectFunctionMode(int(stem_funcs.get(func, 2)))
-            else:
-                raise ValueError(f"Unknown EOS observation mode: {obs!r}")
-        except Exception as e:
-            logger.error(f"[LENS] Failed to switch mode to {key}: {e}")
-            raise
+            # 1. Determine Base Mode (TEM=0, STEM=1)
+            # Direct hardware call protected by try/except
+            base_mode_idx = int(self.eos.GetTemStemMode())
+            base_mode = "STEM" if base_mode_idx == 1 else "TEM"
 
-    def _resolve_eos_table_info(self) -> Tuple[Optional[str], Optional[str]]:
+            # 2. Determine Function Index
+            # Handle PyJEM version differences (list vs scalar return)
+            func_data = self.eos.GetFunctionMode()
+            func_idx = -1
+
+            if isinstance(func_data, (list, tuple)):
+                func_idx = int(func_data[0])
+            else:
+                func_idx = int(func_data)
+
+            # 3. Map Index to Standardized Name (using class constants)
+            if base_mode == "TEM":
+                func_name = self._TEM_FUNC_MAP.get(func_idx, f"UNKNOWN-{func_idx}")
+            else:
+                func_name = self._STEM_FUNC_MAP.get(func_idx, f"UNKNOWN-{func_idx}")
+
+            return f"{base_mode}:{func_name}"
+
+        except Exception as e:
+            # Getter Pattern: Log failure at DEBUG, return safe default
+            logger.debug(f"[EOS] Mode detection failed: {e}")
+            return "UNKNOWN"
+
+    def _get_table_entry(self, mode_key: str, list_type: str) -> List[float]:
         """
-        Determine which EOS table list to use based on the current mode.
-        Returns: (mode_key, list_name) e.g., ('TEM:DIFF', 'MagList').
+        Retrieve the specific MagList or CamList for the active mode.
+        Falls back to defaults if specific sub-mode table is missing.
         """
-        key = self._get_eos_mode_key()
-        key = self._normalize_eos_key(key or "") if key else None
-        if not key:
-            return None, None
-        list_name = "StemCamList" if key.startswith("STEM:") else "MagList"
-        return key, list_name
+        # 1. Direct Lookup
+        if mode_key in self.optical_tables:
+            return self.optical_tables[mode_key].get(list_type, [])
+
+        # 2. Fallback Logic
+        # If we are in STEM but the specific mode (e.g. unknown new mode) isn't in tables,
+        # fallback to 'STEM:SM-MAG' as the safe default for this instrument.
+        if "STEM" in mode_key and "STEM:SM-MAG" in self.optical_tables:
+            logger.debug(f"[EOS] Table '{mode_key}' missing, using 'STEM:SM-MAG' fallback.")
+            return self.optical_tables["STEM:SM-MAG"].get(list_type, [])
+
+        return []
+
+    def _find_closest_index(self, table: List[float], value: float) -> int:
+        if not table: return 0
+        arr = np.array(table)
+        idx = (np.abs(arr - value)).argmin()
+        return int(idx)
 
     # =========================================================================
     # 1. Connection & Lifecycle
@@ -724,21 +726,20 @@ class JeolMicroscope(TemMicroscope):
     def set_mode(self, mode: str) -> None:
         """Set the main observation mode ('TEM' or 'STEM')."""
         if not self.eos:
-            logger.error("[EOS] SelectTemStem failed: Hardware not connected.")
             raise RuntimeError("EOS hardware not connected.")
 
-        if not hasattr(self.eos, "SelectTemStem"):
-            return
+        target = mode.strip().upper()
+        if target not in ["TEM", "STEM"]:
+            raise ValueError(f"Invalid mode '{mode}'. Use TEM or STEM.")
 
-        m = (mode or "").strip().upper()
-        if m not in {"TEM", "STEM"}:
-            return
-
-        logger.debug(f"[EOS] SelectTemStem({m})")
+        logger.info(f"[EOS] Switching to {target} mode...")
         try:
-            self.eos.SelectTemStem(0 if m == "TEM" else 1)
+            self.eos.SelectTemStem(0 if target == "TEM" else 1)
+
+            # Stabilization wait (hardware mode switching is slow)
+            time.sleep(1.0)
         except Exception as e:
-            logger.error(f"[EOS] Failed to set mode {m}: {e}")
+            logger.error(f"[EOS] Failed to set mode {target}: {e}")
             raise
 
     # =========================================================================
@@ -1420,53 +1421,43 @@ class JeolMicroscope(TemMicroscope):
 
     def get_optical_mode(self) -> str:
         """Get the logical optical mode (e.g. 'TEM:MAG')."""
-        key, _ = self._resolve_eos_table_info()
-        return key if key else "UNKNOWN"
+        return self._get_current_mode_key()
 
     def get_magnification(self) -> Optional[int]:
         """Get the magnification value (e.g., 100000)."""
-        if not self.eos:
-            logger.debug("[LENS] GetMagValue failed: Hardware not connected.")
+        if not self.eos: return None
+        mode_key = self._get_current_mode_key()
+
+        # In DIFF mode, 'Magnification' is actually Camera Length
+        if "DIFF" in mode_key:
             return None
 
-        if hasattr(self.eos, "GetMagValue"):
-            try:
-                val = self.eos.GetMagValue()
-                # PyJEM returns [value, unit, label] e.g. [50000, 'X', 'x50k']
-                if isinstance(val, (list, tuple)) and len(val) >= 2:
-                    if str(val[1]).strip().upper() == "X":
-                        return int(round(float(val[0])))
-                else:
-                    return int(round(float(val)))
-            except Exception as e:
-                logger.debug(f"[LENS] GetMagValue failed: {e}")
-        return None
+        # Use _read_hw to preserve "Null means Unknown" logging logic
+        # EOS3.GetMagValue returns [val, unit, label]
+        def _extract_mag(raw):
+            if isinstance(raw, (list, tuple)) and len(raw) > 0:
+                return int(float(raw[0]))
+            return int(float(raw))
+
+        return self._read_hw(self.eos, "GetMagValue", "LENS", _extract_mag)
 
     def get_camera_length(self) -> Optional[Quantity]:
         """
-        Get diffraction camera length.
-        Logic: Only valid if in 'DIFF' or 'STEM' mode. Uses `GetMagValue` (TEM) or `GetStemCamValue` (STEM).
+        Universal Getter.
+        TEM:DIFF -> Uses GetMagValue.
+        STEM:* -> Uses GetStemCamValue.
         """
-        if not self.eos:
-            logger.debug("[LENS] GetCameraLength failed: Hardware not connected.")
-            return None
+        if not self.eos: return None
+        mode_key = self._get_current_mode_key()
 
-        key = self._get_eos_mode_key() or ""
-        key_u = key.upper()
+        def _extract_mm(raw):
+            val = raw[0] if isinstance(raw, (list, tuple)) else raw
+            return Q_(float(val), Units.MM)
 
-        try:
-            if key_u.startswith("STEM:"):
-                if hasattr(self.eos, "GetStemCamValue"):
-                    val, unit, _ = self.eos.GetStemCamValue()
-                    return Q_(float(val), str(unit)).to(Units.MM)
-                return None
-
-            if "DIFF" in key_u and hasattr(self.eos, "GetMagValue"):
-                val, unit, _ = self.eos.GetMagValue()
-                return Q_(float(val), str(unit)).to(Units.MM)
-
-        except Exception as e:
-            logger.debug(f"[LENS] Camera Length Read failed: {e}")
+        if "TEM:DIFF" in mode_key:
+            return self._read_hw(self.eos, "GetMagValue", "LENS", _extract_mm)
+        elif "STEM" in mode_key:
+            return self._read_hw(self.eos, "GetStemCamValue", "LENS", _extract_mm)
 
         return None
 
@@ -1516,129 +1507,106 @@ class JeolMicroscope(TemMicroscope):
 
     def set_optical_mode(self, mode: str, **kwargs) -> None:
         """
-        Set EOS mode.
-        Logic: Maps 'IMAGING'/'DIFFRACTION' to JEOL-specific keys (e.g. 'TEM:MAG', 'TEM:DIFF').
+        Set the optical function mode (e.g., 'TEM:MAG', 'STEM:SM-MAG').
+        Automatically switches TEM/STEM base mode if necessary.
         """
-        if not mode:
-            logger.error("[LENS] SetOpticalMode failed: Empty mode provided.")
-            raise ValueError("Mode cannot be empty.")
+        if not self.eos: raise RuntimeError("EOS hardware not connected.")
 
-        m = mode.strip().upper()
-        logger.debug(f"[LENS] SwitchFunctionMode({m})")
+        target = mode.strip().upper()
 
-        if ":" in m:
-            self._select_eos_mode_key(m)
-            return
+        # Parse Input
+        if ":" in target:
+            base, func = target.split(":", 1)
+        else:
+            base = self.get_mode()
+            func = target
 
-        obs = (self.get_mode() or "TEM").strip().upper()
-        if "DIFF" in m:
-            self._select_eos_mode_key("STEM:UUDIFF" if obs == "STEM" else "TEM:DIFF")
-            return
+        base = base.strip()
+        func = func.strip().replace("_", "-")
 
-        self._select_eos_mode_key("STEM:SM-MAG" if obs == "STEM" else "TEM:MAG")
+        # Switch Base Mode (TEM/STEM) if needed
+        current_base = self.get_mode()
+        if base != current_base:
+            self.set_mode(base)
 
-    def set_magnification(self, index: int, **kwargs) -> None:
+        # Resolve Function Index
+        func_idx = None
+        if base == "TEM":
+            func_idx = self._TEM_FUNC_NAME_TO_IDX.get(func)
+        elif base == "STEM":
+            func_idx = self._STEM_FUNC_NAME_TO_IDX.get(func)
+
+        if func_idx is None:
+            valid = list(self._TEM_FUNC_MAP.values()) if base == "TEM" else list(self._STEM_FUNC_MAP.values())
+            raise ValueError(f"Invalid function '{func}' for mode {base}. Valid: {valid}")
+
+        logger.info(f"[EOS] Setting Optical Mode: {base}:{func} (Index {func_idx})")
+
+        # Safe Execution using _write_hw to catch/log errors
+        self._write_hw(self.eos, "SelectFunctionMode", "EOS", func_idx)
+
+    def set_magnification(self, value: int, **kwargs) -> None:
         """
-        Set magnification.
-        Logic: Finds the closest selector index in `EOS_MODE_TABLES` for the requested value.
+        Universal Setter.
+        Always uses 'MagList' and 'SetSelector'.
         """
-        if not self.eos:
-            logger.error("[LENS] SetMagnification failed: Hardware not connected.")
-            raise RuntimeError("EOS hardware not connected.")
+        if not self.eos: raise RuntimeError("Hardware disconnected")
 
-        logger.debug(f"[LENS] SetSelector({index})")
-        key = self._normalize_eos_key(self._get_eos_mode_key() or "")
-        if not key:
-            logger.error("[LENS] SetMagnification failed: Could not determine EOS mode key.")
-            raise RuntimeError("Cannot resolve EOS mode for magnification lookup.")
+        mode_key = self._get_current_mode_key()
 
-        try:
-            mag_list = get_list(key, "MagList") or []
-        except Exception:
-            mag_list = []
+        # 1. Validation: Can't set Mag in Diff mode
+        if "DIFF" in mode_key:
+            raise RuntimeError(f"Cannot set Magnification in Diffraction mode ({mode_key}). Use Camera Length.")
 
-        if not mag_list or str(mag_list[0][1]).strip().upper() != "X":
-            logger.error(f"[LENS] SetMagnification failed: MagList unavailable for mode {key}.")
-            raise RuntimeError(f"Magnification table not found for mode {key}.")
+        # 2. Get Table
+        table = self._get_table_entry(mode_key, "MagList")
+        if not table:
+            raise RuntimeError(f"Magnification table (MagList) missing for mode {mode_key}.")
 
-        target = float(index)
-        best_i = 0
-        for i, (v, _, _) in enumerate(mag_list):
-            try:
-                if float(v) <= target:
-                    best_i = i
-            except Exception:
-                continue
-        try:
-            self.eos.SetSelector(int(best_i + 1))
-        except Exception:
-            try:
-                self.eos.SetSelector(int(best_i))
-            except Exception as e:
-                logger.error(f"[LENS] SetSelector failed: {e}")
-                raise
+        # 3. Find Index
+        idx = self._find_closest_index(table, float(value))
+
+        # 4. Log High-Level Intent (Info)
+        logger.info(f"[LENS] SetMag ({mode_key}): {table[idx]}x (Index {idx})")
+
+        # 5. Execute via Safe Wrapper (Preserves Debug/Error logging)
+        self._write_hw(self.eos, "SetSelector", "LENS", idx)
 
     def set_camera_length(self, length: Quantity, **kwargs) -> None:
         """
-        Set diffraction camera length.
-        Logic: Finds the closest selector index in `MagList` (TEM) or `StemCamList` (STEM).
+        Universal Setter.
+        [cite_start]TEM:DIFF -> Uses 'MagList' table -> SetSelector [cite: 953]
+        [cite_start]STEM:* -> Uses 'CamList' table -> SetStemCamSelector [cite: 975]
         """
-        logger.debug(f"[LENS] SetCameraLength({length})")
+        if not self.eos: raise RuntimeError("Hardware disconnected")
 
-        if not self.eos:
-            # FIX: Fail Loudly
-            logger.error("[LENS] SetCameraLength failed: Hardware not connected.")
-            raise RuntimeError("EOS hardware not connected.")
-
-        if length is None:
-            raise ValueError("Camera length cannot be None.")
-
-        key, list_name = self._resolve_eos_table_info()
-        if not key or not list_name:
-            logger.error("[LENS] SetCameraLength failed: Could not resolve table info (Not in DIFF/STEM mode?).")
-            raise RuntimeError(f"Camera length control unavailable in mode: {self.get_mode()}")
-
-        targets = get_list(key, list_name) or []
-        if not targets:
-            logger.error(f"[LENS] SetCameraLength failed: Lookup list '{list_name}' is empty/missing for {key}.")
-            raise RuntimeError(f"Camera length table empty for mode {key}")
-
-        first_unit = str(targets[0][1]).strip().lower()
-        if first_unit not in ['cm', 'mm', 'm']:
-            logger.error(f"[LENS] SetCameraLength failed: Current mode '{key}' uses non-length units '{first_unit}'.")
-            raise RuntimeError(f"Cannot set Camera Length in mode {key} (Table unit: {first_unit})")
-
+        mode_key = self._get_current_mode_key()
         target_mm = length.to(Units.MM).magnitude
-        best_i, best_err = 0, float("inf")
 
-        found_match = False  # Track if we actually calculated a valid error
-        for i, (val, unit, _) in enumerate(targets):
-            try:
-                # This conversion might still fail if there's garbage data,
-                # so we keep the try/except but track success.
-                mm = Q_(float(val), str(unit)).to(Units.MM).magnitude
-                err = abs(mm - target_mm)
-                if err < best_err:
-                    best_err = err
-                    best_i = i
-                    found_match = True
-            except Exception:
-                continue
+        if "TEM:DIFF" in mode_key:
+            # Special Case: TEM Diff uses the Mag Selector logic
+            table = self._get_table_entry(mode_key, "MagList")
+            if not table: raise RuntimeError(f"Camera Length table missing for {mode_key}")
 
-        if not found_match:
-            raise RuntimeError(f"No valid camera length entries found in table for {key}")
+            idx = self._find_closest_index(table, target_mm)
+            logger.info(f"[LENS] SetCL ({mode_key}): {table[idx]}mm via SetSelector (Index {idx})")
 
-        selector = int(best_i + 1)
-        try:
-            if key.startswith("STEM:") and hasattr(self.eos, "SetStemCamSelector"):
-                self.eos.SetStemCamSelector(selector)
-            elif hasattr(self.eos, "SetSelector"):
-                self.eos.SetSelector(selector)
-            else:
-                raise AttributeError("No suitable selector method found on EOS3.")
-        except Exception as e:
-            logger.error(f"[LENS] SetCameraLength failed (Selector={selector}): {e}")
-            raise
+            # Safe execution
+            self._write_hw(self.eos, "SetSelector", "LENS", idx)
+
+        elif "STEM" in mode_key:
+            # Standard Case: STEM uses the dedicated Cam Selector logic
+            table = self._get_table_entry(mode_key, "CamList")
+            if not table: raise RuntimeError(f"Camera Length table (CamList) missing for {mode_key}")
+
+            idx = self._find_closest_index(table, target_mm)
+            logger.info(f"[LENS] SetCL ({mode_key}): {table[idx]}mm via SetStemCamSelector (Index {idx})")
+
+            # Safe execution
+            self._write_hw(self.eos, "SetStemCamSelector", "LENS", idx)
+
+        else:
+            raise RuntimeError(f"Cannot set Camera Length in mode {mode_key}.")
 
     def set_defocus(self, defocus: Quantity, **kwargs) -> None:
         if not self._has_defocus_calibration:
