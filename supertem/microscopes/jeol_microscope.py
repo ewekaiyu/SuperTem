@@ -743,53 +743,123 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def get_stage_x(self) -> Optional[Quantity]:
-        if not self.stage: return None
-        try:
-            val = self.stage.GetX() if hasattr(self.stage, "GetX") else self.stage.GetPos()[0]
-            return Q_(float(val), Units.NM)
-        except Exception:
-            return None
+        # GetPos returns [x, y, z, tx, ty]
+        return self._read_hw(
+            self.stage, "GetPos", "STAGE",
+            lambda v: Q_(float(v[0]), Units.NM) if len(v) > 0 else None
+        )
 
     def get_stage_y(self) -> Optional[Quantity]:
-        if not self.stage: return None
-        try:
-            val = self.stage.GetY() if hasattr(self.stage, "GetY") else self.stage.GetPos()[1]
-            return Q_(float(val), Units.NM)
-        except Exception:
-            return None
+        return self._read_hw(
+            self.stage, "GetPos", "STAGE",
+            lambda v: Q_(float(v[1]), Units.NM) if len(v) > 1 else None
+        )
 
     def get_stage_z(self) -> Optional[Quantity]:
-        if not self.stage: return None
-        try:
-            val = self.stage.GetZ() if hasattr(self.stage, "GetZ") else self.stage.GetPos()[2]
-            return Q_(float(val), Units.NM)
-        except Exception:
-            return None
+        return self._read_hw(
+            self.stage, "GetPos", "STAGE",
+            lambda v: Q_(float(v[2]), Units.NM) if len(v) > 2 else None
+        )
 
     def get_stage_tilt_x(self) -> Optional[Quantity]:
-        if not self.stage: return None
-        try:
-            val = self.stage.GetTiltXAngle() if hasattr(self.stage, "GetTiltXAngle") else self.stage.GetPos()[3]
-            return Q_(float(val), Units.DEG)
-        except Exception:
-            return None
+        return self._read_hw(
+            self.stage, "GetPos", "STAGE",
+            lambda v: Q_(float(v[3]), Units.DEG) if len(v) > 3 else None
+        )
 
     def get_stage_tilt_y(self) -> Optional[Quantity]:
-        if not self.stage: return None
-        try:
-            val = self.stage.GetTiltYAngle() if hasattr(self.stage, "GetTiltYAngle") else self.stage.GetPos()[4]
-            return Q_(float(val), Units.DEG)
-        except Exception:
-            return None
+        return self._read_hw(
+            self.stage, "GetPos", "STAGE",
+            lambda v: Q_(float(v[4]), Units.DEG) if len(v) > 4 else None
+        )
 
     def get_stage_r(self) -> Optional[Quantity]:
-        # Rotation not typically supported in standard PyJEM Stage3
+        """
+        Get Rotation (deg).
+        Feature Detection: Checks for 6-axis support (ARM200F+) via GetPosEx.
+        GetPosEx returns [x, y, z, tx, ty, rot]
+        """
+
+        def _extract_rot(val):
+            if isinstance(val, (list, tuple)) and len(val) >= 6:
+                return Q_(float(val[5]), Units.DEG)
+            return None
+
+        # Try 6-axis method first
+        val = self._read_hw(self.stage, "GetPosEx", "STAGE", _extract_rot)
+        if val is not None:
+            return val
+
+        # Fallback: F200/5-axis machines do not support rotation -> None
         return None
 
     def get_stage_coordinate_system(self) -> Optional[str]:
-        """Get the current reference frame name."""
-        # JEOL usually operates in a single mechanical coordinate system
         return "Mechanical"
+
+    # ---  Atomic Getters (Vendor Specific) ---
+
+    def get_stage_holder_inserted(self) -> str:
+        """
+        Check if holder is inserted.
+        GetHolderStts: 0=Out, 1=In
+        """
+        val = self._read_hw(self.stage, "GetHolderStts", "STAGE", self._to_int)
+        if val == 1:
+            return "INSERTED"
+        elif val == 0:
+            return "RETRACTED"
+        return "UNKNOWN"
+
+    def get_stage_piezo_position(self) -> Optional[Tuple[float, float]]:
+        """
+        Get raw piezo offset (x, y) in nm.
+        GetPiezoPosi returns [x, y]
+        """
+        return self._read_hw(self.stage, "GetPiezoPosi", "STAGE", self._coerce_xy)
+
+    def get_stage_speed_mode(self, drive_mode: int = 0) -> Dict[str, str]:
+        """
+        Get speed settings for Motor(0) or Piezo(1).
+        GetSpeedMode returns [xy, z, tiltxy] (0=slow, 1=normal, 2=fast)
+        """
+        raw = self._read_hw(self.stage, "GetSpeedMode", "STAGE", args=(drive_mode,))
+
+        speed_map = {0: "slow", 1: "normal", 2: "fast"}
+        if raw and len(raw) >= 3:
+            return {
+                "xy": speed_map.get(raw[0], "unknown"),
+                "z": speed_map.get(raw[1], "unknown"),
+                "tilt": speed_map.get(raw[2], "unknown")
+            }
+        return {}
+
+    def get_stage_axis_status(self) -> Dict[str, str]:
+        """
+        Get detailed status for each axis (detects Limit Errors).
+        Returns: Dict mapping axis ('x','y', etc.) to status.
+        """
+        status_map = {0: "REST", 1: "MOVING", 2: "LIMIT_ERROR"}
+        raw = None
+        axes = ["x", "y", "z", "tx", "ty", "r"]
+
+        # Try 6-axis status first
+        if hasattr(self.stage, "GetStatusEx"):
+            try:
+                raw = self.stage.GetStatusEx()
+            except Exception:
+                pass
+
+        # Fallback to 5-axis
+        if not raw:
+            raw = self._read_hw(self.stage, "GetStatus", "STAGE", default=[])
+            axes = ["x", "y", "z", "tx", "ty"]
+
+        result = {}
+        if isinstance(raw, (list, tuple)):
+            for i, code in enumerate(raw):
+                if i < len(axes):
+                    result[axes[i]] = status_map.get(code, f"UNKNOWN_{code}")
+        return result
 
     # --- Atomic Setters ---
 
@@ -799,74 +869,60 @@ class JeolMicroscope(TemMicroscope):
                             tolerance_deg: float = 0.1,
                             max_retries: int = 3, **kwargs) -> None:
         """
-        Move the stage to coordinates.
-
-        Hardware Quirk:
-            JEOL stages sometimes report "Idle" (Status 0) momentarily while changing direction.
-            This method implements a retry loop that waits for stability and re-issues
-            the command if the final position is not within tolerance.
+        Move stage to coordinates with 5-axis vs 6-axis feature detection.
         """
         if not self.stage:
             logger.error("[STAGE] Move failed: Hardware not connected.")
             raise RuntimeError("Stage hardware not connected.")
 
-        if target.r is not None:
-             # If hardware supports rotation (Gon_Rot), implement here.
-             # Otherwise, fail if rotation is requested.
-             logger.warning("[STAGE] Rotation (r) requested but not supported by this driver version.")
-             # Uncomment to enforce strictness:
-             # raise ValueError("Stage rotation is not supported by JEOL driver.")
-
         dt = (drive_type or "motor").strip().lower()
         is_piezo = (dt == "piezo")
+
+        # Parse canonical target into dictionary of raw values (nm/deg)
         t_args = jeol_adapter.to_jeol_stage_args(target)
 
         logger.debug(f"[STAGE] IO Write ({dt}): {t_args}")
 
         def _dispatch():
-            if is_piezo:
-                # --- PIEZO PATH (SelDrvMode = 1) ---
-                if not hasattr(self.stage, "SelDrvMode"):
-                    logger.error("[STAGE] Hardware mismatch: 'SelDrvMode' not found.")
-                    raise RuntimeError("Piezo control not supported by this stage driver.")
+            # SelDrvMode: 0=Motor, 1=Piezo
+            mode_idx = 1 if is_piezo else 0
 
-                # Warn if unsupported axes are requested
-                if any(k in t_args for k in ['z', 'tx', 'ty']):
-                    logger.warning("[STAGE] Piezo mode supports X/Y only. Z/Tilt ignored.")
+            # Switch Drive Mode
+            if hasattr(self.stage, "SelDrvMode"):
+                self.stage.SelDrvMode(mode_idx)
 
-                try:
-                    # 1. Switch to Piezo Mode
-                    self.stage.SelDrvMode(1)
-
-                    # 2. Issue Moves (X/Y Only)
-                    if 'x' in t_args and hasattr(self.stage, "SetX"):
-                        self.stage.SetX(t_args['x'])
-                    if 'y' in t_args and hasattr(self.stage, "SetY"):
-                        self.stage.SetY(t_args['y'])
-
-                finally:
-                    # 3. Restore to Motor Mode (Safety)
-                    # We restore immediately so subsequent calls default to standard behavior
-                    self.stage.SelDrvMode(0)
-
-            else:
-                # --- MOTOR PATH (SelDrvMode = 0) ---
-                if hasattr(self.stage, "SelDrvMode"):
-                    self.stage.SelDrvMode(0)
-
+            try:
+                # Execute Moves (Methods exist on Stage3 class)
+                # Note: SetX/SetY work for both Motor and Piezo based on SelDrvMode
                 if 'x' in t_args and hasattr(self.stage, "SetX"):
                     self.stage.SetX(t_args['x'])
                 if 'y' in t_args and hasattr(self.stage, "SetY"):
                     self.stage.SetY(t_args['y'])
-                if 'z' in t_args and hasattr(self.stage, "SetZ"):
-                    self.stage.SetZ(t_args['z'])
-                if 'tx' in t_args and hasattr(self.stage, "SetTiltXAngle"):
-                    self.stage.SetTiltXAngle(t_args['tx'])
-                if 'ty' in t_args and hasattr(self.stage, "SetTiltYAngle"):
-                    self.stage.SetTiltYAngle(t_args['ty'])
 
-            # Execute
+                # Piezo usually X/Y only; ignore Z/Tilt/Rot unless hardware supports it explicitly
+                if not is_piezo:
+                    if 'z' in t_args and hasattr(self.stage, "SetZ"):
+                        self.stage.SetZ(t_args['z'])
+                    if 'tx' in t_args and hasattr(self.stage, "SetTiltXAngle"):
+                        self.stage.SetTiltXAngle(t_args['tx'])
+                    if 'ty' in t_args and hasattr(self.stage, "SetTiltYAngle"):
+                        self.stage.SetTiltYAngle(t_args['ty'])
 
+                    # --- Rotation Support (Feature Detection) ---
+                    # SetRotation exists on ARM200F+ [cite: 2058]
+                    if 'r' in t_args:
+                        if hasattr(self.stage, "SetRotation"):
+                            self.stage.SetRotation(float(t_args['r']))
+                        else:
+                            logger.warning(
+                                f"[STAGE] Rotation {t_args['r']} ignored (Hardware not 6-axis compatible).")
+
+            finally:
+                # Always restore to Motor mode for safety if we switched to Piezo
+                if is_piezo and hasattr(self.stage, "SelDrvMode"):
+                    self.stage.SelDrvMode(0)
+
+        # Execute
         try:
             _dispatch()
         except Exception as e:
@@ -883,73 +939,183 @@ class JeolMicroscope(TemMicroscope):
 
         # Motor requires hysteresis retry loop
         for attempt in range(max_retries + 1):
-            # Wait for status to settle (Idle)
             self._wait_for_stage(timeout=30.0)
 
-            # Read back current position
+            # Verification Read
             current = self.get_stage_position()
-            if current is None:
-                logger.warning("[STAGE] Position unreadable during verification.")
-                return
 
-            # Check if we are close enough
             if target.is_close(current, tol_nm=tolerance_nm, tol_deg=tolerance_deg):
                 logger.debug(f"[STAGE] Move verified within tolerance (Attempt {attempt + 1}).")
                 return
 
-            # If not, retry
             if attempt < max_retries:
                 logger.info(f"[STAGE] Hysteresis Correction {attempt + 1}/{max_retries}: Adjusting position.")
                 try:
                     _dispatch()
-                except Exception as e:
-                    logger.error(f"[STAGE] Correction IO Error: {e}")
+                except Exception:
+                    pass
                 time.sleep(0.5)
             else:
-                logger.warning(f"[STAGE] Move finished but outside tolerance ({tolerance_nm}nm).")
+                logger.warning(f"[STAGE] Move finished but outside tolerance.")
 
     def stop_stage(self, **kwargs) -> None:
-        """Immediately halt stage movement."""
-        try:
-            if self.stage and hasattr(self.stage, "Stop"):
-                logger.debug("[STAGE] Stop()")
-                self.stage.Stop()
-            elif not self.stage:
-                logger.error("[STAGE] Stop failed: Hardware not connected.")
-                raise RuntimeError("Stage hardware not connected.")
-        except Exception as e:
-            logger.error(f"[STAGE] Stop failed: {e}")
-            raise
+        """ Stop all drives. """
+        self._write_hw(self.stage, "Stop", "STAGE")
 
     def home_stage(self, **kwargs) -> None:
+        """ SetOrg: Move to origin. """
+        self._write_hw(self.stage, "SetOrg", "STAGE")
+
+    # --- Atomic Setters (Vendor Specific) ---
+
+    def set_stage_speed_mode(self, speed: str, axis: str = "xy", drive_mode: int = 0) -> None:
         """
-        Move the stage to the mechanical origin (0, 0, 0, 0, 0).
-        Wraps `TEM3.Stage3.SetOrg`.
+        Set speed mode.
+        SetSpeedMode(mode, xy, z, tilt)
         """
+        speed_map = {"slow": 0, "normal": 1, "fast": 2}
+        s_idx = speed_map.get(speed.lower(), 1)
+
+        # Read current state first to preserve other axes
+        current_indices = [1, 1, 1]
         try:
-            if self.stage and hasattr(self.stage, "SetOrg"):
-                logger.debug("[STAGE] SetOrg() (Homing)")
-                self.stage.SetOrg()
-            elif not self.stage:
-                logger.error("[STAGE] Homing failed: Hardware not connected.")
-                raise RuntimeError("Stage hardware not connected.")
-            else:
-                logger.warning("[STAGE] 'SetOrg' method not found on hardware interface.")
-        except Exception as e:
-            logger.error(f"[STAGE] SetOrg failed: {e}")
-            raise
+            raw = self.stage.GetSpeedMode(drive_mode)
+            if raw: current_indices = list(raw)
+        except Exception:
+            pass
+
+        if axis in ["xy", "all"]: current_indices[0] = s_idx
+        if axis in ["z", "all"]: current_indices[1] = s_idx
+        if axis in ["tilt", "all"]: current_indices[2] = s_idx
+
+        self._write_hw(self.stage, "SetSpeedMode", "STAGE",
+                       drive_mode, current_indices[0], current_indices[1], current_indices[2])
+
+    def set_stage_drive_frequency(self, frequency_hz: int, axis: str = "xy", drive_mode: int = 1) -> None:
+        """
+        Advanced: Tune the drive frequency (f1) to reduce vibration.
+        Typically used for Piezo (drive_mode=1).
+        """
+        # 0=trackball(manual), 1=switch, 2=command(computer control)
+        KIND_COMMAND = 2
+
+        current = [0, 0, 0, 0, 0]  # x, y, z, tx, ty
+        try:
+            # Getf1OverRate(kind, drive_mode) [cite: 2006]
+            raw = self.stage.Getf1OverRate(KIND_COMMAND, drive_mode)
+            if raw: current = list(raw)
+        except Exception:
+            pass
+
+        if axis in ["xy", "all"]:
+            current[0] = frequency_hz  # X
+            current[1] = frequency_hz  # Y
+        if axis in ["z", "all"]:
+            current[2] = frequency_hz
+        if axis in ["tilt", "all"]:
+            current[3] = frequency_hz  # Tx
+            current[4] = frequency_hz  # Ty
+
+        logger.info(f"[STAGE] Tuning Drive Frequency (f1) for {axis} to {frequency_hz} (Mode: {drive_mode})")
+        # Note: Unpacking *current list into individual args
+        self._write_hw(self.stage, "Setf1OverRate", "STAGE",
+                       KIND_COMMAND, drive_mode, *current)
+
+    def set_stage_acceleration(self, axis_index: int, accel: int, decel: int) -> None:
+        """
+        Set acceleration/deceleration rates.
+        axis_index: 2=Z, 3=TiltX, 4=TiltY
+        Rate: 64 (Slow) - 65535 (Fast)
+        """
+        if axis_index not in [2, 3, 4]:
+            logger.warning("[STAGE] Acceleration control only supported for Z (2), Tx (3), Ty (4).")
+            return
+
+        self._write_hw(self.stage, "SetAccelAndDclrRate", "STAGE", axis_index, int(accel), int(decel))
 
     # --- Helper Layer Overrides ---
 
     def get_stage_position(self) -> StagePosition:
-        """Override to perform efficient bulk read via GetPos."""
+        """
+        Override to perform efficient bulk read and include extras.
+        """
         if not self.stage:
             return StagePosition()
-        try:
-            # Helper: Aggregates atomic primitives efficiently
-            return jeol_adapter.from_jeol_stage_position(self.stage.GetPos())
-        except Exception:
-            return StagePosition()
+
+        # 1. Base Read (5-axis standard) [cite: 1953]
+        raw_5 = self._read_hw(self.stage, "GetPos", "STAGE", default=[])
+        pos = jeol_adapter.from_jeol_stage_position(raw_5)
+
+        # 2. Check for 6-axis Rotation (Feature Detection) [cite: 1960]
+        if hasattr(self.stage, "GetPosEx"):
+            try:
+                raw_6 = self.stage.GetPosEx()
+                if isinstance(raw_6, (list, tuple)) and len(raw_6) >= 6:
+                    pos.r = Q_(float(raw_6[5]), Units.DEG)
+            except Exception:
+                pass
+
+        # 3. Add Status, Piezo & Holder Info to Extras
+        extras = {}
+
+        piezo = self.get_stage_piezo_position()
+        if piezo:
+            extras["piezo_offset_nm"] = piezo
+
+        holder = self.get_stage_holder_inserted()
+        if holder != "UNKNOWN":
+            extras["holder_status"] = holder
+
+        # Add detailed limit switch info if any errors exist
+        status = self.get_stage_axis_status()
+        if any(s == "LIMIT_ERROR" for s in status.values()):
+            extras["axis_status"] = status
+
+        if extras:
+            pos.extra.vendor["JEOL"] = extras
+
+        return pos
+
+    def perform_stage_action(self, action: str, **kwargs) -> None:
+        """
+        Override: Routes high-level actions to JEOL-specific atomic methods.
+        Arguments come from 'StageControlRequest.extra.options'.
+        """
+        act = action.upper().strip()
+
+        if act == "STOP":
+            self.stop_stage(**kwargs)
+
+        elif act == "HOME":
+            self.home_stage(**kwargs)
+
+        elif act == "SET_SPEED":
+            # Unpack options: defaults to 'normal', 'xy', Motor(0)
+            speed = kwargs.get("speed", "normal")
+            axis = kwargs.get("axis", "xy")
+            drive_mode = kwargs.get("drive_mode", 0)
+
+            logger.info(f"[STAGE] Setting Speed: {speed} (Axis: {axis}, Mode: {drive_mode})")
+            self.set_stage_speed_mode(speed, axis=axis, drive_mode=int(drive_mode))
+
+        elif act == "TUNE_FREQUENCY":
+            # options: freq=1000, axis='xy', drive_mode=1
+            freq = int(kwargs.get("freq", 1000))
+            self.set_stage_drive_frequency(freq, axis=kwargs.get("axis", "xy"))
+
+        elif act == "SET_ACCEL":
+            # options: axis_idx=2 (Z), val=10000
+            idx = int(kwargs.get("axis_idx", 2))
+            val = int(kwargs.get("val", 10000))
+            self.set_stage_acceleration(idx, val, val)
+
+        elif act == "ZERO_PIEZO":
+            logger.info("[STAGE] Zeroing Piezo position")
+            zero = StagePosition(x=Q_(0, "nm"), y=Q_(0, "nm"))
+            self.move_stage_absolute(zero, drive_type="piezo", wait=True)
+
+        else:
+            super().perform_stage_action(action, **kwargs)
 
     # =========================================================================
     # 4. Beam Control (Illumination)
