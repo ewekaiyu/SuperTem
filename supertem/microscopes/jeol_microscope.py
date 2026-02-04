@@ -1424,21 +1424,15 @@ class JeolMicroscope(TemMicroscope):
         return key if key else "UNKNOWN"
 
     def get_magnification(self) -> Optional[int]:
-        """
-        Get the magnification value (e.g., 100000).
-
-        Logic:
-            1. Try `GetMagValue()` directly.
-            2. If unavailable, use `GetSelector()` to look up the value in static tables (`EOS_MODE_TABLES`).
-        """
+        """Get the magnification value (e.g., 100000)."""
         if not self.eos:
             logger.debug("[LENS] GetMagValue failed: Hardware not connected.")
             return None
 
-        # Method 1: Direct Hardware Query
         if hasattr(self.eos, "GetMagValue"):
             try:
                 val = self.eos.GetMagValue()
+                # PyJEM returns [value, unit, label] e.g. [50000, 'X', 'x50k']
                 if isinstance(val, (list, tuple)) and len(val) >= 2:
                     if str(val[1]).strip().upper() == "X":
                         return int(round(float(val[0])))
@@ -1446,39 +1440,6 @@ class JeolMicroscope(TemMicroscope):
                     return int(round(float(val)))
             except Exception as e:
                 logger.debug(f"[LENS] GetMagValue failed: {e}")
-
-        # Method 2: Table Lookup via Selector
-        key = self._normalize_eos_key(self._get_eos_mode_key() or "")
-        if not key:
-            return None
-        try:
-            lst = get_list(key, "MagList") or []
-        except Exception:
-            return None
-        if not lst or str(lst[0][1]).strip().upper() != "X":
-            return None
-
-        sel = None
-        if hasattr(self.eos, "GetCurrentMagSelectorID"):
-            try:
-                sel = int(self.eos.GetCurrentMagSelectorID())
-            except Exception:
-                pass
-        if sel is None and hasattr(self.eos, "GetSelector"):
-            try:
-                sel = int(self.eos.GetSelector())
-            except Exception:
-                pass
-        if sel is None:
-            return None
-
-        # Check surrounding indices for robustness
-        for idx in (sel - 1, sel, sel + 1):
-            if 0 <= idx < len(lst):
-                try:
-                    return int(round(float(lst[idx][0])))
-                except Exception:
-                    continue
         return None
 
     def get_camera_length(self) -> Optional[Quantity]:
@@ -1519,8 +1480,8 @@ class JeolMicroscope(TemMicroscope):
     def get_screen_position(self) -> str:
         # Custom logic mapping int -> String preserved via lambda or explicit read
         idx = self._read_hw(self.det3, "GetScreen", "LENS", self._to_int)
-        if idx is None: return "UNKNOWN"
-        return "DOWN" if idx == 2 else "UP"
+        mapping = {0: "UP", 1: "INTERCEPT", 2: "DOWN"}
+        return mapping.get(idx, "UNKNOWN")
 
     def get_objective_stigmation(self) -> Tuple[Optional[float], Optional[float]]:
         return self._read_hw(self.def_, "GetOLs", "LENS", self._coerce_xy, default=(None, None))
@@ -1529,9 +1490,7 @@ class JeolMicroscope(TemMicroscope):
         return self._read_hw(self.def_, "GetILs", "LENS", self._coerce_xy, default=(None, None))
 
     def get_image_shift(self) -> Tuple[Optional[float], Optional[float]]:
-        # Logic retention: Fallback IS1 vs IS
-        res = self._read_hw(self.def_, "GetIS1", "LENS", self._coerce_xy)
-        return res if res else self._read_hw(self.def_, "GetIS", "LENS", self._coerce_xy, default=(None, None))
+        return self._read_hw(self.def_, "GetIS1", "LENS", self._coerce_xy, default=(None, None))
 
     def get_diffraction_shift(self) -> Tuple[Optional[float], Optional[float]]:
         return self._read_hw(self.def_, "GetPLA", "LENS", self._coerce_xy, default=(None, None))
@@ -1540,6 +1499,18 @@ class JeolMicroscope(TemMicroscope):
 
     def get_defocus_dac(self) -> Optional[int]:
         return self._read_hw(self.lens, "GetOLc", "LENS", self._to_int)
+
+    def get_defocus_fine_dac(self) -> Optional[int]:
+        """Ref: Lens3.GetOLf"""
+        return self._read_hw(self.lens, "GetOLf", "LENS", self._to_int)
+
+    def get_defocus_superfine_dac(self) -> Optional[int]:
+        """Ref: Lens3.GetOLSuperFineValue"""
+        return self._read_hw(self.lens, "GetOLSuperFineValue", "LENS", self._to_int)
+
+    def get_image_shift2(self) -> Tuple[Optional[float], Optional[float]]:
+        """Ref: Def3.GetIS2 """
+        return self._read_hw(self.def_, "GetIS2", "LENS", self._coerce_xy, default=(None, None))
 
     # --- Atomic Setters ---
 
@@ -1678,7 +1649,10 @@ class JeolMicroscope(TemMicroscope):
 
     def set_screen_position(self, position: str, **kwargs) -> None:
         p = (position or "").strip().upper()
-        val = 2 if p == "DOWN" else 0
+        mapping = {"UP": 0, "INTERCEPT": 1, "DOWN": 2}
+        val = mapping.get(p)
+        if val is None:
+            raise ValueError(f"Invalid screen position '{p}'. Use UP, DOWN, or INTERCEPT.")
         self._write_hw(self.det3, "SetScreen", "LENS", val)
 
     def set_objective_stigmation(self, x: float, y: float, **kwargs) -> None:
@@ -1688,12 +1662,7 @@ class JeolMicroscope(TemMicroscope):
         self._write_hw(self.def_, "SetILs", "LENS", int(x), int(y))
 
     def set_image_shift(self, x: float, y: float, **kwargs) -> None:
-        # Logic retention: try IS1, fallback to IS inside try-catch block of helper?
-        # Helper is atomic. We check if method exists.
-        if hasattr(self.def_, "SetIS1"):
-            self._write_hw(self.def_, "SetIS1", "LENS", int(x), int(y))
-        else:
-            self._write_hw(self.def_, "SetIS", "LENS", int(x), int(y))
+        self._write_hw(self.def_, "SetIS1", "LENS", int(x), int(y))
 
     def set_diffraction_shift(self, x: float, y: float, **kwargs) -> None:
         self._write_hw(self.def_, "SetPLA", "LENS", int(x), int(y))
@@ -1703,6 +1672,48 @@ class JeolMicroscope(TemMicroscope):
     def set_defocus_dac(self, dac: int) -> None:
         self._write_hw(self.lens, "SetOLc", "LENS", int(dac))
 
+    def set_defocus_fine_dac(self, dac: int) -> None:
+        """Ref: Lens3.SetOLf [cite: 1703]"""
+        self._write_hw(self.lens, "SetOLf", "LENS", int(dac))
+
+    def set_defocus_superfine_dac(self, dac: int) -> None:
+        """
+        Set OLS (SuperFine).
+        Ref: Lens3.SetOLSuperFineValue [cite: 1688]
+        """
+        # Ensure switch is ON [cite: 1682]
+        self._write_hw(self.lens, "SetOLSuperFineSw", "LENS", 1)
+        self._write_hw(self.lens, "SetOLSuperFineValue", "LENS", int(dac))
+
+    def set_standard_focus(self) -> None:
+        """
+        Execute Standard Focus (Hysteresis Reset).
+        Ref: Lens3.SetStdFocus
+        """
+        self._write_hw(self.lens, "SetStdFocus", "LENS")
+
+    def set_image_shift2(self, x: float, y: float) -> None:
+        """Ref: Def3.SetIS2 [cite: 516]"""
+        self._write_hw(self.def_, "SetIS2", "LENS", int(x), int(y))
+
+    def set_diffraction_focus(self, val: int, absolute: bool = True) -> None:
+        """
+        Control Diffraction Focus.
+        Ref: Lens3.SetDiffFocus (Absolute) [cite: 1609]
+        Ref: EOS3.SetDiffFocus (Relative Knob) [cite: 929]
+        """
+        if absolute:
+            self._write_hw(self.lens, "SetDiffFocus", "LENS", int(val))
+        else:
+            self._write_hw(self.eos, "SetDiffFocus", "LENS", int(val))
+
+    def step_objective_focus(self, steps: int) -> None:
+        """
+        Simulate Objective Focus Knob (Relative).
+        Ref: EOS3.SetObjFocus [cite: 945]
+        """
+        self._write_hw(self.eos, "SetObjFocus", "LENS", int(steps))
+
     # --- Helper Layer Overrides ---
 
     def get_projection_settings(self) -> ProjectionSettings:
@@ -1710,13 +1721,27 @@ class JeolMicroscope(TemMicroscope):
         Override Reason: Populate vendor-specific 'defocus_olc_dac' if uncalibrated.
         """
         ps = super().get_projection_settings()
+
+        # Populate extras with Fine/SuperFine DACs
+        extras = ps.extra.vendor.setdefault("JEOL", {})
+
+        # Coarse (if uncalibrated)
         if not self._has_defocus_calibration:
             dac = self.get_defocus_dac()
             if dac is not None:
-                ps.extra.vendor.setdefault("JEOL", {})["defocus_olc_dac"] = dac
-                ps.extra.notes["ProjectionSettings.defocus_uncalibrated"] = (
-                    "JEOL OLc reported in DAC units; physical nm defocus requires defocus_scale calibration."
-                )
+                extras["defocus_olc_dac"] = dac
+                ps.extra.notes["defocus"] = "Uncalibrated OLc DAC"
+
+        # Fine
+        f_dac = self.get_defocus_fine_dac()
+        if f_dac is not None:
+            extras["defocus_olf_dac"] = f_dac
+
+        # SuperFine
+        sf_dac = self.get_defocus_superfine_dac()
+        if sf_dac is not None:
+            extras["defocus_ols_dac"] = sf_dac
+
         return ps
 
     def apply_projection_settings(self, settings: ProjectionSettings, **kwargs) -> None:
@@ -1732,12 +1757,45 @@ class JeolMicroscope(TemMicroscope):
         try:
             vend = getattr(settings.extra, "vendor", None) or {}
             jeol_v = vend.get("JEOL") if isinstance(vend, dict) else None
-            if isinstance(jeol_v, dict) and 'defocus_olc_dac' in jeol_v:
-                v = jeol_v.get('defocus_olc_dac')
-                if v is not None:
-                    self.set_defocus_dac(int(v))
-        except Exception:
+
+            if isinstance(jeol_v, dict):
+                # Coarse DAC (fallback)
+                if 'defocus_olc_dac' in jeol_v:
+                    self.set_defocus_dac(int(jeol_v['defocus_olc_dac']))
+
+                # Fine DAC
+                if 'defocus_olf_dac' in jeol_v:
+                    self.set_defocus_fine_dac(int(jeol_v['defocus_olf_dac']))
+
+                # SuperFine DAC
+                if 'defocus_ols_dac' in jeol_v:
+                    self.set_defocus_superfine_dac(int(jeol_v['defocus_ols_dac']))
+
+        except Exception as e:
+            logger.error(f"[LENS] Failed to apply projection extras: {e}")
             raise
+
+    def perform_projection_action(self, action: str, **kwargs) -> None:
+        """
+        Override: Handles STD_FOCUS, STEP_FOCUS, etc.
+        """
+        act = action.upper().strip()
+
+        if act == "STD_FOCUS":
+            logger.info("[LENS] Executing Standard Focus...")
+            self.set_standard_focus()
+
+        elif act == "STEP_FOCUS":
+            # Simulate knob turn
+            steps = int(kwargs.get("steps", 1))
+            self.step_objective_focus(steps)
+
+        elif act == "STEP_DIFF_FOCUS":
+            steps = int(kwargs.get("steps", 1))
+            self.set_diffraction_focus(steps, absolute=False)
+
+        else:
+            super().perform_projection_action(action, **kwargs)
 
     # =========================================================================
     # 6. Detector Control & Acquisition
