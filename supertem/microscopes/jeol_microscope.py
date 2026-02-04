@@ -129,7 +129,7 @@ do not map to standard physics (e.g. Alpha Selector, OLc DAC).
 """
 import time
 import logging
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any, Callable, Union
 import numpy as np
 from datetime import datetime, timezone
 
@@ -1468,6 +1468,7 @@ class JeolMicroscope(TemMicroscope):
         # Safety: Only run this math for F200 models
         model = (self.system_settings.info.model or "").upper()
         if "F200" not in model:
+            logger.debug(f"[LENS] get_defocus skipped: Model '{model}' is not F200 (Physical scaling unknown).")
             return None
 
         mode_key = self._get_current_mode_key()
@@ -1538,9 +1539,24 @@ class JeolMicroscope(TemMicroscope):
         """Atomic: Get IL1 (Intermediate Lens 1)."""
         return self._read_hw(self.lens, "GetIL1", "LENS", self._to_int)
 
-    def get_image_shift2(self) -> Tuple[Optional[float], Optional[float]]:
+    def get_image_shift_2(self) -> Tuple[Optional[float], Optional[float]]:
         """Ref: Def3.GetIS2 """
         return self._read_hw(self.def_, "GetIS2", "LENS", self._coerce_xy, default=(None, None))
+
+    def get_diffraction_focus(self) -> Optional[int]:
+        """
+        Get the logical 'diffraction focus' property.
+
+        Logic:
+          - F200: Returns IL1 (Intermediate Lens 1).
+          - Generic: Returns None (or specific register if known).
+        """
+        model = (self.system_settings.info.model or "").upper()
+        if "F200" in model:
+            return self.get_intermediate_lens_1()
+
+        logger.debug(f"[LENS] get_diffraction_focus skipped: Model '{model}' is not F200 (IL1 mapping unknown).")
+        return None
 
     # --- Atomic Setters ---
 
@@ -1647,36 +1663,69 @@ class JeolMicroscope(TemMicroscope):
         else:
             raise RuntimeError(f"Cannot set Camera Length in mode {mode_key}.")
 
-    def set_defocus(self, defocus: Quantity, relative: bool = False, **kwargs) -> None:
+    def set_defocus(self, defocus: Union[Quantity, int], relative: bool = False, **kwargs) -> None:
         """
-        Sets physical defocus (nm).
-        If relative=True, calculates delta DACs from delta nm.
+        Sets defocus.
+        - Relative=True: Uses universal 'SetObjFocus' (steps).
+        - Relative=False: Uses model-specific logic (nm -> DAC).
         """
+        # 1. Universal Relative Step
+        if relative:
+            steps = 0
+            # If Quantity provided (e.g. 100nm), convert to steps if F200, else fail or assume 1:1?
+            # For simplicity & universality, we assume 'int' steps or conversion if possible.
+            if isinstance(defocus, int):
+                steps = defocus
+            elif isinstance(defocus, Quantity):
+                # Try F200 conversion if model matches, otherwise we can't convert nm->steps reliably
+                model = (self.system_settings.info.model or "").upper()
+                if "F200" in model:
+                    target_nm = float(defocus.to(Units.NM).magnitude)
+                    mode_key = self._get_current_mode_key()
+                    if mode_key == "TEM:LOWMAG":
+                        steps = int(target_nm / 1500.0)
+                    elif mode_key == "TEM:MAG":
+                        steps = int(target_nm / 1.4)
+                    else:
+                        steps = int(target_nm)  # Fallback
+                else:
+                    raise NotImplementedError(
+                        f"Relative defocus by physical amount ({defocus}) not supported for model '{model}' "
+                        "(Scale unknown). Use integer steps instead."
+                    )
+
+            self._write_hw(self.eos, "SetObjFocus", "LENS", steps)
+            return
+
+        # 2. Model-Specific Absolute Setting
+        # Only F200 logic is implemented for absolute nm -> DAC mapping
+        model = (self.system_settings.info.model or "").upper()
+        if "F200" not in model:
+            logger.warning("[LENS] Absolute physical defocus setting only supported for F200.")
+            return
+
+        if not isinstance(defocus, Quantity):
+            logger.warning("[LENS] Absolute set_defocus requires Quantity(nm).")
+            return
+
+        target_nm = float(defocus.to(Units.NM).magnitude)
         mode_key = self._get_current_mode_key()
         mag = self.get_magnification() or 0
-        target_nm = float(defocus.to(Units.NM).magnitude)
 
         if mode_key == "TEM:LOWMAG":
-            scale = 1500.0 # nm/bit
-            if relative:
-                dac_step = int(target_nm / scale)
-                self.set_objective_mini_lens(dac_step, relative=True)
+            if mag < 600:
+                std = 0xA7C4
+            elif mag < 15000:
+                std = 0xBD31
             else:
-                if mag < 600: std = 0xA7C4
-                elif mag < 15000: std = 0xBD31
-                else: std = 0xC85A
-                target_dac = int(std + (target_nm / scale))
-                self.set_objective_mini_lens(target_dac, relative=False)
+                std = 0xC85A
+            target_dac = int(std + (target_nm / 1500.0))
+            self.set_objective_mini_lens(target_dac)
 
         elif mode_key == "TEM:MAG":
-            scale = 1.4 # nm/bit
-            if relative:
-                dac_step = int(target_nm / scale)
-                self.set_objective_lens_fine(dac_step, relative=True)
-            else:
-                std = 0x8010 if mag < 1500000 else 0x7D10
-                target_dac = int(std + (target_nm / scale))
-                self.set_objective_lens_fine(target_dac, relative=False)
+            std = 0x8010 if mag < 1500000 else 0x7D10
+            target_dac = int(std + (target_nm / 1.4))
+            self.set_objective_lens_fine(target_dac)
 
     def set_screen_position(self, position: str, **kwargs) -> None:
         p = (position or "").strip().upper()
@@ -1700,64 +1749,54 @@ class JeolMicroscope(TemMicroscope):
 
     # --- Atomic Setters (Vendor Specific) ---
 
-    def set_objective_lens_coarse(self, dac: int, relative: bool = False) -> None:
-        """Atomic: Set OLc (Objective Lens Coarse)."""
-        val = int(dac)
-        if relative:
-            curr = self.get_objective_lens_coarse()
-            if curr is None: raise RuntimeError("OLc current value unknown")
-            val += curr
-        self._write_hw(self.lens, "SetOLc", "LENS", val)
+    def set_objective_lens_coarse(self, dac: int) -> None:
+        """Atomic: Set OLc."""
+        self._write_hw(self.lens, "SetOLc", "LENS", int(dac))
 
-    def set_objective_lens_fine(self, dac: int, relative: bool = False) -> None:
-        """Atomic: Set OLf (Objective Lens Fine)."""
-        val = int(dac)
-        if relative:
-            curr = self.get_objective_lens_fine()
-            if curr is None: raise RuntimeError("OLf current value unknown")
-            val += curr
-        self._write_hw(self.lens, "SetOLf", "LENS", val)
+    def set_objective_lens_fine(self, dac: int) -> None:
+        """Atomic: Set OLf."""
+        self._write_hw(self.lens, "SetOLf", "LENS", int(dac))
 
-    def set_objective_lens_superfine(self, dac: int, relative: bool = False) -> None:
-        """Atomic: Set OLS (Objective Lens SuperFine)."""
-        val = int(dac)
-        if relative:
-            curr = self.get_objective_lens_superfine()
-            if curr is None: raise RuntimeError("OLS current value unknown")
-            val += curr
+    def set_objective_lens_superfine(self, dac: int) -> None:
+        """Atomic: Set OLS."""
         self._write_hw(self.lens, "SetOLSuperFineSw", "LENS", 1)
-        self._write_hw(self.lens, "SetOLSuperFineValue", "LENS", val)
+        self._write_hw(self.lens, "SetOLSuperFineValue", "LENS", int(dac))
 
-    def set_objective_mini_lens(self, dac: int, relative: bool = False) -> None:
-        """Atomic: Set OM (Objective Mini-lens)."""
-        val = int(dac)
-        if relative:
-            curr = self.get_objective_mini_lens()
-            if curr is None: raise RuntimeError("OM current value unknown")
-            val += curr
-        self._write_hw(self.lens, "SetOM", "LENS", val)
+    def set_objective_mini_lens(self, dac: int) -> None:
+        """Atomic: Set OM."""
+        self._write_hw(self.lens, "SetOM", "LENS", int(dac))
 
-    def set_intermediate_lens_1(self, dac: int, relative: bool = False) -> None:
-        """Atomic: Set IL1 (Intermediate Lens 1)."""
-        val = int(dac)
-        if relative:
-            curr = self.get_intermediate_lens_1()
-            if curr is None: raise RuntimeError("IL1 current value unknown")
-            val += curr
-        self._write_hw(self.lens, "SetIL1", "LENS", val)
+    def set_intermediate_lens_1(self, dac: int) -> None:
+        """Atomic: Set IL1."""
+        self._write_hw(self.lens, "SetIL1", "LENS", int(dac))
 
     def set_standard_focus(self) -> None:
         """Atomic: Execute Standard Focus."""
         self._write_hw(self.lens, "SetStdFocus", "LENS")
 
-    def set_image_shift2(self, x: float, y: float) -> None:
+    def set_image_shift_2(self, x: float, y: float) -> None:
         self._write_hw(self.def_, "SetIS2", "LENS", int(x), int(y))
 
-    def set_diffraction_focus(self, dac: int, relative: bool = False) -> None:
+    def set_diffraction_focus(self, index: int, relative: bool = False) -> None:
         """
-        Atomic: Set Diffraction Focus (IL1).
+        Set 'diffraction focus'.
+        - Relative: Uses universal 'SetDiffFocus' (Knob turn).
+        - Absolute: Uses F200 'SetIL1' (Physical register).
         """
-        self.set_intermediate_lens_1(int(dac), relative=relative)
+        val = int(index)
+
+        # 1. Universal Relative Step
+        if relative:
+            # Universal command for all JEOL models
+            self._write_hw(self.eos, "SetDiffFocus", "LENS", val)
+            return
+
+        # 2. Model-Specific Absolute Setting
+        model = (self.system_settings.info.model or "").upper()
+        if "F200" in model:
+            self.set_intermediate_lens_1(val)
+        else:
+            logger.warning("[LENS] Absolute diffraction focus not supported for this model (Requires F200 IL1 logic).")
 
     # --- Helper Layer Overrides ---
 
@@ -1769,14 +1808,17 @@ class JeolMicroscope(TemMicroscope):
         # 1. Get Standard Physics
         ps = super().get_projection_settings()
 
-        # 2. Store Raw Hardware Registers (Source of Truth)
+        # 2. Raw Hardware Registers (Source of Truth)
         extras = ps.extra.vendor.setdefault("JEOL", {})
-
         extras["objective_lens_coarse"] = self.get_objective_lens_coarse()
         extras["objective_lens_fine"] = self.get_objective_lens_fine()
         extras["objective_lens_superfine"] = self.get_objective_lens_superfine()
         extras["objective_mini_lens"] = self.get_objective_mini_lens()
         extras["intermediate_lens_1"] = self.get_intermediate_lens_1()
+
+        # 3. Logical Properties
+        extras["diffraction_focus_index"] = self.get_diffraction_focus()
+        extras["image_shift_2"] = self.get_image_shift_2()
 
         return ps
 
@@ -1805,6 +1847,12 @@ class JeolMicroscope(TemMicroscope):
                 self.set_objective_mini_lens(jeol_v["objective_mini_lens"])
             if "intermediate_lens_1" in jeol_v:
                 self.set_intermediate_lens_1(jeol_v["intermediate_lens_1"])
+            if "image_shift_2" in jeol_v:
+                val = jeol_v["image_shift_2"]
+                if isinstance(val, (list, tuple)) and len(val) >= 2:
+                    self.set_image_shift_2(val[0], val[1])
+            if "diffraction_focus_index" in jeol_v:
+                self.set_diffraction_focus(jeol_v["diffraction_focus_index"])
 
     def perform_projection_action(self, action: str, **kwargs) -> None:
         act = action.upper().strip()
@@ -1814,23 +1862,14 @@ class JeolMicroscope(TemMicroscope):
             self.set_standard_focus()
 
         elif act == "STEP_DIFF_FOCUS":
-            # Delegate relative math to Atomic Layer via set_diffraction_focus
+            # Universal Relative Step
             steps = int(kwargs.get("steps", 1))
             self.set_diffraction_focus(steps, relative=True)
 
         elif act == "STEP_FOCUS":
-            # Route steps to the correct lens for the active mode
+            # Universal Relative Step
             steps = int(kwargs.get("steps", 1))
-            mode_key = self._get_current_mode_key()
-
-            if mode_key == "TEM:LOWMAG":
-                logger.debug(f"[LENS] Stepping Focus (OM) by {steps}")
-                self.set_objective_mini_lens(steps, relative=True)
-            elif mode_key == "TEM:MAG":
-                logger.debug(f"[LENS] Stepping Focus (OLf) by {steps}")
-                self.set_objective_lens_fine(steps, relative=True)
-            else:
-                logger.warning(f"[LENS] STEP_FOCUS not defined for mode {mode_key}")
+            self.set_defocus(steps, relative=True)
 
         else:
             super().perform_projection_action(action, **kwargs)
