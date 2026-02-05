@@ -2216,23 +2216,21 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_inserted(self, detector_id: str) -> bool:
         """Check if detector is mechanically inserted."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetInserted failed: Hardware not connected.")
-            return True
-        try:
-            d = self._get_detector(detector_id)
-            if hasattr(d, "get_insert_state"):
-                st = d.get_insert_state()
-                if isinstance(st, dict):
-                    for k in ("InsertState", "state", "Status"):
-                        if k in st:
-                            v = st[k]
-                            if isinstance(v, str):
-                                return v.strip().upper() in ("IN", "INSERT", "ON")
-                            return bool(v)
-        except Exception as e:
-            logger.debug(f"[DET] GetInserted({detector_id}) failed: {e}")
-        return True
+        d = self._get_detector(detector_id)
+
+        def _parse_insert(st):
+            if isinstance(st, dict):
+                # PyJEM responses vary by detector type
+                for k in ("InsertState", "state", "Status"):
+                    if k in st:
+                        v = st[k]
+                        if isinstance(v, str):
+                            return v.strip().upper() in ("IN", "INSERT", "ON")
+                        return bool(v)
+            return True  # Default to inserted if we can't determine (safest)
+
+        # Use _read_hw to handle logging/errors
+        return self._read_hw(d, "get_insert_state", "DET", converter=_parse_insert, default=True)
 
     def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
         """
@@ -2253,17 +2251,14 @@ class JeolMicroscope(TemMicroscope):
         return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_binning_index(self, detector_id: str) -> Optional[int]:
-        """Get binning index."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetBinning failed: Hardware not connected.")
-            return None
-        try:
-            d = self._get_detector(detector_id)
-            res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
-            return res.binning_index
-        except Exception as e:
-            logger.debug(f"[DET] GetBinning({detector_id}) failed: {e}")
-            return None
+        d = self._get_detector(detector_id)
+
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.binning_index
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_binning_xy(self, detector_id: str) -> Optional[Tuple[int, int]]:
         b = self.get_detector_binning_index(detector_id)
@@ -2282,37 +2277,38 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_gain_index(self, detector_id: str) -> Optional[int]:
         d = self._get_detector(detector_id)
-        if not hasattr(d, "get_detectorsetting"): return None
-        try:
-            st = d.get_detectorsetting()
-            return int(st.get("GainIndex")) if "GainIndex" in st else None
-        except Exception:
-            return None
+        return self._read_hw(d, "get_detectorsetting", "DET",
+                             converter=lambda st: self._first_int(st, ("GainIndex",)))
 
     def get_detector_offset_index(self, detector_id: str) -> Optional[int]:
         d = self._get_detector(detector_id)
-        try:
-            st = d.get_detectorsetting() if hasattr(d, "get_detectorsetting") else {}
-            return int(st.get("OffsetIndex")) if "OffsetIndex" in st else None
-        except Exception:
-            return None
+        return self._read_hw(d, "get_detectorsetting", "DET",
+                             converter=lambda st: self._first_int(st, ("OffsetIndex",)))
 
     def get_detector_digital_rotation(self, detector_id: str) -> Optional[Quantity]:
-        # See scan rotation, usually shared or part of setting
-        return None
+        """
+        Get Digital Rotation (Software Image Flip).
+        Returns None for STEM detectors (Strict Separation).
+        """
+        d = self._get_detector(detector_id)
+
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            # Adapter now strictly looks ONLY for "DigitalRotation"
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.digital_rotation
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_frame_integration(self, detector_id: str) -> Optional[int]:
-        """Get frame integration count."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetIntegration failed: Hardware not connected.")
-            return None
-        try:
-            d = self._get_detector(detector_id)
-            res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
-            return res.frame_integration
-        except Exception as e:
-            logger.debug(f"[DET] GetIntegration({detector_id}) failed: {e}")
-            return None
+        d = self._get_detector(detector_id)
+
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.frame_integration
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_frame_rate(self, detector_id: str) -> Optional[Quantity]:
         # Typically not exposed directly by PyJEM unless calculated
@@ -2334,20 +2330,20 @@ class JeolMicroscope(TemMicroscope):
 
     def set_detector_insertion(self, detector_id: str, inserted: bool, **kwargs) -> None:
         """Insert or retract detector."""
-        if self.det_mod is None:
-            logger.error("[DET] SetInsertion failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
+        d = self._get_detector(detector_id)
 
-        try:
-            d = self._get_detector(detector_id)
-            logger.debug(f"[DET] SetInsertion({detector_id}, {inserted})")
-            if inserted and hasattr(d, "insert"):
-                d.insert()
-            elif (not inserted) and hasattr(d, "retract"):
-                d.retract()
-        except Exception as e:
-            logger.error(f"[DET] SetInsertion failed: {e}")
-            raise
+        # _write_hw handles the "Hardware disconnected" check and logging
+        if inserted:
+            if hasattr(d, "insert"):
+                self._write_hw(d, "insert", "DET")
+            else:
+                # Fallback/No-op log if method missing (unlikely for valid detector)
+                logger.warning(f"[DET] Detector {detector_id} does not support 'insert'.")
+        else:
+            if hasattr(d, "retract"):
+                self._write_hw(d, "retract", "DET")
+            else:
+                logger.warning(f"[DET] Detector {detector_id} does not support 'retract'.")
 
     def set_detector_exposure(self, detector_id: str, exposure: Quantity, **kwargs) -> None:
         """Set detector physical exposure time (Cameras Only)."""
@@ -2418,28 +2414,37 @@ class JeolMicroscope(TemMicroscope):
         self._atomic_detector_update(detector_id, {"OffsetIndex": int(index)})
 
     def set_detector_digital_rotation(self, detector_id: str, angle: Quantity, **kwargs) -> None:
-        # Check set_scanrotation
+        """
+        Set Digital Rotation (Software Image Flip).
+        Strictly for TEM Cameras. STEM users must use set_scan_rotation().
+        """
         deg = float(angle.to(Units.DEG).magnitude)
         d = self._get_detector(detector_id)
-        if hasattr(d, "set_scanrotation"):
-            d.set_scanrotation(deg)
-        else:
-            raise NotImplementedError("Digital rotation not supported on this detector.")
+        is_stem = self._is_stem_detector(detector_id)
+
+        if is_stem:
+            # STRICT SEPARATION:
+            # We no longer automatically rotate coils here.
+            # We assume STEM detectors don't do digital flips unless proven otherwise.
+            msg = (f"Detector '{detector_id}' is a STEM detector. "
+                   f"Use 'set_scan_rotation' to rotate the scan coils. "
+                   f"'digital_rotation' is reserved for camera image flipping.")
+            logger.error(f"[DET] {msg}")
+            raise ValueError(msg)
+
+        # Standard TEM Camera Logic
+        self._write_hw(d, "set_detectorsetting", "DET", {"DigitalRotation": deg})
 
     def set_detector_frame_integration(self, detector_id: str, count: int, **kwargs) -> None:
         """Set frame integration count."""
-        if self.det_mod is None:
-            logger.error("[DET] SetIntegration failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
+        d = self._get_detector(detector_id)
 
-        try:
-            d = self._get_detector(detector_id)
-            logger.debug(f"[DET] SetIntegration({detector_id}, {count})")
-            if hasattr(d, "set_frameintegration"):
-                d.set_frameintegration(int(count))
-        except Exception as e:
-            logger.error(f"[DET] SetIntegration failed: {e}")
-            raise
+        if hasattr(d, "set_frameintegration"):
+            self._write_hw(d, "set_frameintegration", "DET", int(count))
+        else:
+            # Some cameras might use the dict interface, but set_frameintegration is standard for cameras
+            # Fallback to dict update if needed, or raise
+            self._write_hw(d, "set_detectorsetting", "DET", {"frameIntegration": int(count)})
 
     def set_detector_frame_rate(self, detector_id: str, rate: Quantity, **kwargs) -> None:
         raise NotImplementedError("Setting frame rate explicitly not supported.")
@@ -2598,6 +2603,47 @@ class JeolMicroscope(TemMicroscope):
 
         return MicroscopeImage(data=arr, metadata=metadata)
 
+    def execute_detector_auto_contrast(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Contrast/Brightness (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoContrastBrightness", "DET")
+
+    def execute_detector_auto_focus(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Focus (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoFocus", "DET")
+
+    def execute_detector_auto_stigmator(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Stigmator (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoStigmator", "DET")
+
+    def execute_detector_auto_z(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Z (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoZ", "DET")
+
+    def execute_detector_auto_orientation(self, detector_id: str) -> None:
+        """Atomic: Execute Auto Orientation (STEM)."""
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "AutoOrientation", "DET")
+
+    def execute_snapshot_all(self) -> None:
+        """Atomic: Trigger simultaneous acquisition on all detectors (STEM)."""
+        fn_mod = self._get_detector_function_module()
+        if not fn_mod:
+            raise RuntimeError("Detector module function interface missing.")
+        self._write_hw(fn_mod, "snapshotall", "DET")
+
+    def set_detector_accumulation(self, active: bool) -> None:
+        """Atomic: Enable/Disable Live Image Accumulation/Averaging."""
+        fn_mod = self._get_detector_function_module()
+        if not fn_mod:
+            raise RuntimeError("Detector module function interface missing.")
+
+        method = "start_accumulate_image_cache" if active else "stop_accumulate_image_cache"
+        self._write_hw(fn_mod, method, "DET")
+
     # --- Helper Layer Overrides ---
 
     def get_detector_settings(self, detector_id: str) -> DetectorSettings:
@@ -2651,6 +2697,61 @@ class JeolMicroscope(TemMicroscope):
             logger.error(f"[DET] ApplySettings({detector_id}) failed: {e}")
             raise
 
+    def perform_detector_action(self, action: str, **kwargs) -> None:
+        """
+        Override: Handles standard actions + STEM Automation.
+        """
+        act = action.upper().strip()
+        d_id = kwargs.get("detector_id", self.get_primary_detector_id())
+
+        # 1. Validation Logic (The "Brain")
+        is_stem = self._is_stem_detector(d_id)
+
+        if act == "AUTO_CONTRAST":
+            if not is_stem:
+                raise ValueError("Auto Contrast is only for STEM detectors. Use Auto Exposure for Cameras.")
+            logger.info(f"[DET] Action: Auto Contrast/Brightness on {d_id}")
+            # 2. Call Atomic Method (The "Hands")
+            self.execute_detector_auto_contrast(d_id)
+
+        elif act == "AUTO_FOCUS":
+            if not is_stem:
+                raise ValueError("Hardware Auto Focus is only for STEM mode.")
+            logger.info(f"[DET] Action: Auto Focus on {d_id}")
+            self.execute_detector_auto_focus(d_id)
+
+        elif act == "AUTO_STIGMATOR":
+            if not is_stem:
+                raise ValueError("Hardware Auto Stigmator is only for STEM mode.")
+            logger.info(f"[DET] Action: Auto Stigmator on {d_id}")
+            self.execute_detector_auto_stigmator(d_id)
+
+        elif act == "AUTO_Z":
+            if not is_stem:
+                raise ValueError("Hardware Auto Z is only for STEM mode.")
+            logger.info(f"[DET] Action: Auto Z on {d_id}")
+            self.execute_detector_auto_z(d_id)
+
+        elif act == "AUTO_ORIENTATION":
+            if not is_stem:
+                raise ValueError("Hardware Auto Orientation is only for STEM mode.")
+            logger.info(f"[DET] Action: Auto Orientation on {d_id}")
+            self.execute_detector_auto_orientation(d_id)
+
+        elif act == "SNAPSHOT_ALL":
+            if self.get_mode() != "STEM":
+                raise RuntimeError("SnapshotAll is only available in STEM mode.")
+            logger.info("[DET] Action: Snapshot All Detectors")
+            self.execute_snapshot_all()
+
+        elif act == "SET_ACCUMULATION":
+            active = bool(kwargs.get("active", True))
+            logger.info(f"[DET] Action: Set Accumulation/Averaging = {active}")
+            self.set_detector_accumulation(active)
+
+        else:
+            super().perform_detector_action(action, **kwargs)
+
     # =========================================================================
     # 7. Scan Control (STEM)
     # =========================================================================
@@ -2676,42 +2777,38 @@ class JeolMicroscope(TemMicroscope):
 
     def get_scan_active(self) -> bool:
         """Check if external scan control is active."""
+        # Check Scan Coils (Hardware Source of Truth)
         if self.scan and hasattr(self.scan, "GetExtScanMode"):
-            try:
-                return bool(int(self.scan.GetExtScanMode()) == 1)
-            except Exception:
-                pass
+            val = self._read_hw(self.scan, "GetExtScanMode", "SCAN", converter=lambda x: int(x) == 1)
+            if val is not None:
+                return val
+
+        # Fallback to internal state
         return bool(self._scan_cfg.get("active", False))
 
     def get_scan_width(self) -> Optional[int]:
-        """Get active scan width in pixels."""
         d = self._get_scan_controller_detector()
-        if d is not None and hasattr(d, "get_detectorsetting"):
-            try:
-                st = d.get_detectorsetting()
-                if isinstance(st, dict):
-                    w = self._first_int(st, ("Width", "ImagingAreaWidth"))
-                    if w is not None:
-                        self._scan_cfg["width_px"] = w
-                        return w
-            except Exception:
-                pass
-        return None
+
+        def _extract_w(st):
+            val = self._first_int(st, ("Width", "ImagingAreaWidth"))
+            if val is not None:
+                self._scan_cfg["width_px"] = val  # Update cache inside converter
+                return val
+            return None
+
+        return self._read_hw(d, "get_detectorsetting", "SCAN", converter=_extract_w)
 
     def get_scan_height(self) -> Optional[int]:
-        """Get active scan height in pixels."""
         d = self._get_scan_controller_detector()
-        if d is not None and hasattr(d, "get_detectorsetting"):
-            try:
-                st = d.get_detectorsetting()
-                if isinstance(st, dict):
-                    h = self._first_int(st, ("Height", "ImagingAreaHeight"))
-                    if h is not None:
-                        self._scan_cfg["height_px"] = h
-                        return h
-            except Exception:
-                pass
-        return None
+
+        def _extract_h(st):
+            val = self._first_int(st, ("Height", "ImagingAreaHeight"))
+            if val is not None:
+                self._scan_cfg["height_px"] = val
+                return val
+            return None
+
+        return self._read_hw(d, "get_detectorsetting", "SCAN", converter=_extract_h)
 
     def get_scan_pixel_dwell(self) -> Optional[Quantity]:
         """Get pixel dwell time (µs) from active STEM detector."""
@@ -2732,31 +2829,29 @@ class JeolMicroscope(TemMicroscope):
         return None
 
     def get_scan_rotation(self) -> Optional[Quantity]:
-        """Get scan rotation."""
-        if self.scan and hasattr(self.scan, "GetRotationAngleEx"):
-            try:
-                return Q_(float(self.scan.GetRotationAngleEx()), Units.DEG)
-            except Exception:
-                pass
+        """Get scan rotation (Tries Scan coils first, then Detector)."""
+        # 1. Try Scan Coils (Primary for rotation)
+        if self.scan:
+            # Try Ex first (ARM200F+)
+            if hasattr(self.scan, "GetRotationAngleEx"):
+                val = self._read_hw(self.scan, "GetRotationAngleEx", "SCAN",
+                                    converter=lambda x: Q_(float(x), Units.DEG))
+                if val is not None: return val
 
-        if self.scan and hasattr(self.scan, "GetRotationAngle"):
-            try:
-                return Q_(float(self.scan.GetRotationAngle()), Units.DEG)
-            except Exception:
-                pass
+            # Try Standard
+            if hasattr(self.scan, "GetRotationAngle"):
+                val = self._read_hw(self.scan, "GetRotationAngle", "SCAN",
+                                    converter=lambda x: Q_(float(x), Units.DEG))
+                if val is not None: return val
 
-        # Fallback to detector settings
+        # 2. Fallback to Active Detector Settings
         d = self._get_scan_controller_detector()
-        if d is not None and hasattr(d, "get_detectorsetting"):
-            try:
-                st = d.get_detectorsetting()
-                if isinstance(st, dict):
-                    ang = self._first_float(st, ("ScanRotation", "ScanRotationValue"))
-                    if ang is not None:
-                        return Q_(ang, Units.DEG)
-            except Exception:
-                pass
-        return None
+
+        def _extract_rot(st):
+            ang = self._first_float(st, ("ScanRotation", "ScanRotationValue"))
+            return Q_(ang, Units.DEG) if ang is not None else None
+
+        return self._read_hw(d, "get_detectorsetting", "SCAN", converter=_extract_rot)
 
     # --- Atomic Setters ---
 
@@ -2820,37 +2915,29 @@ class JeolMicroscope(TemMicroscope):
 
     def set_scan_rotation(self, angle: Quantity, **kwargs) -> None:
         deg = float(angle.to(Units.DEG).magnitude)
-        logger.debug(f"[SCAN] SetRotation({deg})")
-
         d = self._get_scan_controller_detector()
-        detector_success = False
 
-        # Try Detector First
+        # 1. Try Detector (Preferred for STEM)
         if d is not None and hasattr(d, "set_scanrotation"):
             try:
-                d.set_scanrotation(float(deg))
-                detector_success = True
+                # We use _write_hw here so we get the standard "[SCAN] set_scanrotation..." log
+                self._write_hw(d, "set_scanrotation", "SCAN", float(deg))
                 return
-            except Exception as e:
-                logger.warning(f"[SCAN] Detector SetRotation failed, attempting fallback: {e}")
+            except Exception:
+                logger.debug(f"[SCAN] Detector rotation failed, falling back to Coils.")
 
-        # Try Scan Coils Fallback
+        # 2. Try Scan Coils (Fallback)
         if self.scan:
-            try:
-                if hasattr(self.scan, "SetRotationAngleEx"):
-                    self.scan.SetRotationAngleEx(float(deg))
-                    return
-                if hasattr(self.scan, "SetRotationAngle"):
-                    self.scan.SetRotationAngle(int(round(deg)) % 360)
-                    return
-            except Exception as e:
-                logger.error(f"[SCAN] Hardware SetRotation failed: {e}")
-                raise
+            if hasattr(self.scan, "SetRotationAngleEx"):
+                self._write_hw(self.scan, "SetRotationAngleEx", "SCAN", float(deg))
+                return
+            elif hasattr(self.scan, "SetRotationAngle"):
+                self._write_hw(self.scan, "SetRotationAngle", "SCAN", int(round(deg)) % 360)
+                return
 
-        # If we reached here, neither worked
-        if not detector_success:
-            logger.error("[SCAN] SetRotation failed: No capable hardware found.")
-            raise RuntimeError("SetRotation failed on both detector and scan coils.")
+        # 3. Failure
+        logger.error("[SCAN] SetRotation failed: No capable hardware found.")
+        raise RuntimeError("SetRotation failed on both detector and scan coils.")
 
     # =========================================================================
     # 8. Vacuum Control
