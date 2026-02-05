@@ -170,10 +170,21 @@ class JeolMicroscope(TemMicroscope):
     """
 
     _APERTURE_MAP = {
-        "CLA": 1, "OLA": 2, "HCA": 3, "SAA": 4, "ENTA": 5,
-        "CL1": 0, "CL2": 1, "OL": 2, "HC": 3, "SA": 4,
-        "ENT": 5, "HX": 6, "BF": 7,
-        "AUX": 8, "AUX1": 8, "AUX2": 9, "AUX3": 10, "AUX4": 11
+        # --- Standard JEOL Indices (ARM/Exp) ---
+        "CLA": 0, "CL1": 0,    # Condenser 1
+        "CL2": 1,              # Condenser 2
+        "OLA": 2, "OL": 2,     # Objective
+        "HCA": 3, "HC": 3,     # High Contrast
+        "SAA": 4, "SA": 4,     # Selected Area
+        "ENTA": 5, "ENT": 5,   # Entry
+        "HX": 6,  "EDS": 6,    # Hard X-Ray / EDS
+        "BF": 7,               # Bright Field?
+
+        # --- Auxiliaries (Only used if in Config) ---
+        "AUX1": 8,
+        "AUX2": 9,
+        "AUX3": 10,
+        "AUX4": 11
     }
 
     # TEM Function Indices
@@ -556,7 +567,8 @@ class JeolMicroscope(TemMicroscope):
 
     def _read_hw(self, hardware: Any, method_name: str, tag: str,
                  converter: Optional[Callable[[Any], Any]] = None,
-                 default: Any = None) -> Any:
+                 default: Any = None,
+                 *args) -> Any:  # <--- Added *args support
         """
         Atomic Getter (Null means Unknown).
         Checks hardware existence -> Try/Catch -> Log -> Convert.
@@ -567,7 +579,8 @@ class JeolMicroscope(TemMicroscope):
 
         try:
             func = getattr(hardware, method_name)
-            val = func() if callable(func) else func
+            # Pass *args to the function call
+            val = func(*args) if callable(func) else func
             if converter and val is not None:
                 return converter(val)
             return val
@@ -853,7 +866,7 @@ class JeolMicroscope(TemMicroscope):
         Get speed settings for Motor(0) or Piezo(1).
         GetSpeedMode returns [xy, z, tiltxy] (0=slow, 1=normal, 2=fast)
         """
-        raw = self._read_hw(self.stage, "GetSpeedMode", "STAGE", args=(drive_mode,))
+        raw = self._read_hw(self.stage, "GetSpeedMode", "STAGE", None, None, drive_mode)
 
         speed_map = {0: "slow", 1: "normal", 2: "fast"}
         if raw and len(raw) >= 3:
@@ -2961,10 +2974,11 @@ class JeolMicroscope(TemMicroscope):
             if val == 0: return "CLOSED"
 
         # 2. Fallback to GUN3 (Thermionic)
-        # Cite: PyJEM_TEM3_reorganized_clean.docx (GUN3.GetBeamValve)
-        val = self._read_hw(self.gun, "GetBeamValve", "VAC")
-        if val == 1: return "OPEN"
-        if val == 0: return "CLOSED"
+        # CORRECTION: GUN3 uses GetBeamSw
+        if hasattr(self.gun, "GetBeamSw"):
+            val = self._read_hw(self.gun, "GetBeamSw", "VAC")
+            if val == 1: return "OPEN"
+            if val == 0: return "CLOSED"
 
         return "UNKNOWN"
 
@@ -3000,12 +3014,14 @@ class JeolMicroscope(TemMicroscope):
         """Atomic: Set V1 State (Open/Close). Handles FEG vs Thermionic."""
         is_open = 1 if state.upper() == "OPEN" else 0
 
-        # Prefer FEG3 if available
+        # Prefer FEG3 if available [cite: 3389]
         if hasattr(self.feg, "SetBeamValve"):
             self._write_hw(self.feg, "SetBeamValve", "VAC", is_open)
+        # CORRECTION: GUN3 uses SetBeamSw
+        elif hasattr(self.gun, "SetBeamSw"):
+            self._write_hw(self.gun, "SetBeamSw", "VAC", is_open)
         else:
-            # Cite: PyJEM_TEM3_reorganized_clean.docx (GUN3.SetBeamValve)
-            self._write_hw(self.gun, "SetBeamValve", "VAC", is_open)
+            logger.warning("No gun valve control found (FEG3 or GUN3).")
 
     def set_turbo_pump_state(self, state: str, **kwargs) -> None:
         raise NotImplementedError("Turbo Pump control not supported.")
@@ -3017,7 +3033,23 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def list_apertures(self) -> List[str]:
-        return list(self._APERTURE_MAP.keys())
+        """
+        Return list of available apertures based on the configuration settings.
+        """
+        # 1. Get the list of installed apertures from the config object
+        #    (This assumes your settings JSON/YAML defined 'aperture_system.available_aperture_ids')
+        configured_ids = []
+        if self.system_settings.aperture_system and self.system_settings.aperture_system.available_aperture_ids:
+            configured_ids = self.system_settings.aperture_system.available_aperture_ids
+
+        # 2. If config exists, return the intersection (Valid & Configured)
+        if configured_ids:
+            return [aid for aid in configured_ids if aid in self._APERTURE_MAP]
+
+        # 3. Fallback: If config is empty, return defaults (Safety net)
+        #    We exclude AUX/Unknowns to prevent errors on unconfigured systems.
+        defaults = ["CLA", "OLA", "HCA", "SAA", "ENTA"]
+        return [k for k in defaults if k in self._APERTURE_MAP]
 
     def get_aperture_inserted(self, aperture_id: str) -> bool:
         # Inferred from size index > 0
@@ -3029,8 +3061,7 @@ class JeolMicroscope(TemMicroscope):
         if kind is None: return None
 
         # Use helper for the state change and the read
-        self._write_hw(self.apt, "SelectExpKind", "APT", kind)
-        return self._read_hw(self.apt, "GetExpSize", "APT", self._to_int, args=(kind,))
+        return self._read_hw(self.apt, "GetExpSize", "APT", self._to_int, None, kind)
 
     def get_aperture_size_label(self, aperture_id: str) -> Optional[str]:
         return None
