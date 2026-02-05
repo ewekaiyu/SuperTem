@@ -253,6 +253,8 @@ class JeolMicroscope(TemMicroscope):
         # Load Tables: Start with Defaults, then Override with Config
         self.optical_tables = DEFAULT_TABLES.copy()
 
+        self._init_vacuum_map()
+
         if config:
             # Check for attribute first (Pydantic/Dataclass)
             val = getattr(config, 'defocus_scale', None)
@@ -535,6 +537,49 @@ class JeolMicroscope(TemMicroscope):
             # Fallback if ID lookup fails (unlikely)
             payload = {"ImagingArea": {"x": xx, "y": yy, "width": w, "height": h}}
             self._write_hw(d, "set_detectorsetting", "SCAN", payload)
+
+    def _init_vacuum_map(self):
+        """
+        Initialize the vacuum gauge map.
+        Priority:
+        1. User Configuration (system_settings.extras['vacuum_map'])
+        2. Default F200 Map (Fallback)
+        """
+        # Default Fallback (JEOL F200 Standard)
+        default_map = {
+            "COLUMN_PIG": 0,  # PIG1: Column Rough/Backing
+            "DETECTOR_PIG": 2,  # PIG3: Camera/Detector Chamber
+            "SPECIMEN_PIG": 3,  # PIG4: Specimen Chamber (Airlock)
+            "BUFFER_PIG": 4,  # PIG5: Buffer/Reservoir Tank
+            "COLUMN_PEG": 0  # PEG1: Column High Vacuum
+        }
+
+        # Try to load overrides from system_settings
+        # Structure expects: settings.extras = {"vendor": {"JEOL": {"vacuum_map": {...}}}}
+        try:
+            if self.system_settings.extras and \
+                    "vacuum_map" in self.system_settings.extras.get("vendor", {}).get("JEOL", {}):
+                custom_map = self.system_settings.extras["vendor"]["JEOL"]["vacuum_map"]
+                # Update defaults with custom values
+                default_map.update(custom_map)
+                logger.info(f"Loaded custom vacuum map: {default_map}")
+        except Exception as e:
+            logger.warning(f"Failed to load custom vacuum map, using defaults: {e}")
+
+        self.vacuum_map = default_map
+
+    def _get_gauge_value(self, gauge_type: str, map_key: str, unit: str) -> Optional[Quantity]:
+        idx = self.vacuum_map.get(map_key, 0)
+        method = "GetPegInfo" if gauge_type == "PEG" else "GetPigInfo"
+
+        def _extract(val_list):
+            # [cite_start]PyJEM returns [value, status] [cite: 2254, 2263]
+            if isinstance(val_list, (list, tuple)) and len(val_list) >= 1:
+                return Q_(float(val_list[0]), unit)
+            return None
+
+        # Pass the gauge index as *args
+        return self._read_hw(self.vac, method, "VAC", _extract, None, idx)
 
     @staticmethod
     def _first_int(d: dict, keys: Tuple[str, ...]) -> Optional[int]:
@@ -2959,22 +3004,24 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def get_column_valve_state(self) -> str:
-        # Logic retention: Bitfield 0 check
+        """Check Column Valve (V2) status via GetValveStatus."""
+        # [cite: 2294] GetValveStatus returns [count, v1, v2]
         res = self._read_hw(self.vac, "GetValveStatus", "VAC")
         if res and isinstance(res, (list, tuple)) and len(res) > 1:
-            return "OPEN" if (res[1] & 1) else "CLOSED"
+            # Bitmask logic is standard JEOL, though specific bits vary.
+            # Usually Bit 0 of V2 indicates Open.
+            return "OPEN" if (res[2] & 1) else "CLOSED"
         return "UNKNOWN"
 
     def get_gun_valve_state(self) -> str:
         """Atomic: Robust check for V1 (FEG or Thermionic)."""
-        # 1. Try FEG3 (Modern/FEG)
+        # 1. Try FEG3 [cite: 1032]
         if hasattr(self.feg, "GetBeamValve"):
             val = self._read_hw(self.feg, "GetBeamValve", "VAC")
             if val == 1: return "OPEN"
             if val == 0: return "CLOSED"
 
-        # 2. Fallback to GUN3 (Thermionic)
-        # CORRECTION: GUN3 uses GetBeamSw
+        # 2. Fallback to GUN3 [cite: 1211]
         if hasattr(self.gun, "GetBeamSw"):
             val = self._read_hw(self.gun, "GetBeamSw", "VAC")
             if val == 1: return "OPEN"
@@ -2989,21 +3036,72 @@ class JeolMicroscope(TemMicroscope):
         return "UNKNOWN"
 
     def get_column_pressure(self) -> Optional[Quantity]:
-        # Logic retention: GetPegInfo()[0]
-        res = self._read_hw(self.vac, "GetPegInfo", "VAC")
-        if res and len(res) > 0:
-            return Q_(float(res[0]), Units.PA)
-        return None
+        # FIX: Added Units.PASCAL
+        return self._get_gauge_value("PEG", "COLUMN_PEG", Units.PASCAL)
 
     def get_gun_pressure(self) -> Optional[Quantity]:
         # Usually not exposed in basic PyJEM
         return None
 
     def get_buffer_tank_pressure(self) -> Optional[Quantity]:
-        res = self._read_hw(self.vac, "GetPigInfo", "VAC")
-        if res and len(res) > 0:
-            return Q_(float(res[0]), Units.PA)
-        return None
+        # FIX: Added Units.MICRO_AMPERE
+        return self._get_gauge_value("PIG", "BUFFER_PIG", Units.MICRO_AMPERE)
+
+    # --- Atomic Getters (Vendor Specific) ---
+
+    def get_column_vacuum_ready(self) -> bool:
+        """
+        Check if Column is ready (VACUUM3.GetColumnReady).
+        Returns True if Ready (1), False if Not Ready (0).
+        """
+        # [cite: 2240] GetColumnReady returns 1=Ready, 0=Not Ready
+        val = self._read_hw(self.vac, "GetColumnReady", "VAC", self._to_int)
+        return (val == 1)
+
+    def get_camera_vacuum_ready(self) -> bool:
+        """
+        Check if Camera chamber is ready (VACUUM3.GetCameraReady).
+        Returns True if Ready (1), False if Not Ready (0).
+        """
+        # [cite: 2222] GetCameraReady returns 1=Ready, 0=Not Ready
+        val = self._read_hw(self.vac, "GetCameraReady", "VAC", self._to_int)
+        return (val == 1)
+
+    def get_specimen_ready_state(self) -> str:
+        """Check if specimen is ready for insertion (VACUUM3.GetSpecimenReady)."""
+        # [cite: 2285] GetSpecimenReady: 0=Not Ready, 1=Ready
+        val = self._read_hw(self.vac, "GetSpecimenReady", "VAC", self._to_int)
+        if val == 1: return "READY"
+        if val == 0: return "NOT_READY"
+        return "UNKNOWN"
+
+    def get_specimen_air_state(self) -> str:
+        """Check if specimen chamber is vented (VACUUM3.GetSpecimenAir)."""
+        # [cite: 2267] GetSpecimenAir: 0=Not Air, 1=Air
+        val = self._read_hw(self.vac, "GetSpecimenAir", "VAC", self._to_int)
+        if val == 1: return "AIR"
+        if val == 0: return "VACUUM"
+        return "UNKNOWN"
+
+    def get_specimen_pre_evac_state(self) -> str:
+        """Check if specimen pumping has started (VACUUM3.GetSpecimenPreEvacStart)."""
+        # [cite: 2276] GetSpecimenPreEvacStart: 0=Not start, 1=Start
+        val = self._read_hw(self.vac, "GetSpecimenPreEvacStart", "VAC", self._to_int)
+        if val == 1: return "PUMPING"
+        if val == 0: return "IDLE"
+        return "UNKNOWN"
+
+    def get_column_rough_pressure(self) -> Optional[Quantity]:
+        # FIX: Added Units.MICRO_AMPERE
+        return self._get_gauge_value("PIG", "COLUMN_PIG", Units.MICRO_AMPERE)
+
+    def get_specimen_chamber_pressure(self) -> Optional[Quantity]:
+        # FIX: Added Units.MICRO_AMPERE
+        return self._get_gauge_value("PIG", "SPECIMEN_PIG", Units.MICRO_AMPERE)
+
+    def get_detector_chamber_pressure(self) -> Optional[Quantity]:
+        # FIX: Added Units.MICRO_AMPERE
+        return self._get_gauge_value("PIG", "DETECTOR_PIG", Units.MICRO_AMPERE)
 
     # --- Atomic Setters ---
 
@@ -3011,17 +3109,21 @@ class JeolMicroscope(TemMicroscope):
         raise NotImplementedError("Column Valve control not supported.")
 
     def set_gun_valve_state(self, state: str, **kwargs) -> None:
-        """Atomic: Set V1 State (Open/Close). Handles FEG vs Thermionic."""
         is_open = 1 if state.upper() == "OPEN" else 0
 
-        # Prefer FEG3 if available [cite: 3389]
+        # FEG3 priority [cite: 1060]
         if hasattr(self.feg, "SetBeamValve"):
-            self._write_hw(self.feg, "SetBeamValve", "VAC", is_open)
-        # CORRECTION: GUN3 uses SetBeamSw
-        elif hasattr(self.gun, "SetBeamSw"):
+            gun_type = self.get_gun_type_index()
+            # FEG/CFEG/TFEG Types: 3, 11-16, 19-22 [cite: 1259]
+            if gun_type in (3, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22):
+                self._write_hw(self.feg, "SetBeamValve", "VAC", is_open)
+                return
+
+        # GUN3 fallback [cite: 1321]
+        if hasattr(self.gun, "SetBeamSw"):
             self._write_hw(self.gun, "SetBeamSw", "VAC", is_open)
         else:
-            logger.warning("No gun valve control found (FEG3 or GUN3).")
+            logger.warning("[VAC] No gun valve control found.")
 
     def set_turbo_pump_state(self, state: str, **kwargs) -> None:
         raise NotImplementedError("Turbo Pump control not supported.")
