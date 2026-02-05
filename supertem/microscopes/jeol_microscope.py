@@ -1189,7 +1189,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_brightness_value(self) -> Optional[int]:
         """Vendor: Get CL3 Lens Value (0-65535). Controls Brightness."""
-        return self._read_hw(self.lens, "GetCL3", "BEAM", self._to_int)
+        return self.get_condenser_lens_3()
 
     def get_mds_mode(self) -> str:
         """
@@ -1215,6 +1215,10 @@ class JeolMicroscope(TemMicroscope):
     def get_condenser_lens_2(self) -> Optional[int]:
         """Atomic: Get CL2 (Convergence Lens)."""
         return self._read_hw(self.lens, "GetCL2", "BEAM", self._to_int)
+
+    def get_condenser_lens_3(self) -> Optional[int]:
+        """Atomic: Get CL3 (Convergence Lens)."""
+        return self._read_hw(self.lens, "GetCL3", "BEAM", self._to_int)
 
     def get_gun_type_index(self) -> Optional[int]:
         """
@@ -1336,7 +1340,7 @@ class JeolMicroscope(TemMicroscope):
 
     def set_brightness_value(self, val: int, **kwargs) -> None:
         """Vendor: Set CL3 Lens (Brightness) Value (0-65535)."""
-        self._write_hw(self.lens, "SetCL3", "BEAM", int(val))
+        self.set_condenser_lens_3(val)
 
     def set_mds_mode(self, mode: str) -> None:
         """
@@ -1369,6 +1373,10 @@ class JeolMicroscope(TemMicroscope):
         """Atomic: Set CL2."""
         self._write_hw(self.lens, "SetCL2", "BEAM", int(dac))
 
+    def set_condenser_lens_3(self, dac: int) -> None:
+        """Atomic: Set CL3."""
+        self._write_hw(self.lens, "SetCL3", "BEAM", int(dac))
+
     def set_ht_wobbler(self, active: bool) -> None:
         """Vendor: Control HT Wobbler (Voltage Center)."""
         state = 1 if active else 0
@@ -1381,10 +1389,19 @@ class JeolMicroscope(TemMicroscope):
 
     def set_feg_emission_state(self, active: bool) -> None:
         """Turn FEG Emission ON or OFF. (FEG3 Only)"""
+        # 1. Hardware Module Check
         if not self.feg:
             logger.error("[BEAM] SetEmission failed: FEG3 module missing.")
             raise RuntimeError("FEG hardware not connected.")
 
+        # 2. Gun Type Safety Check
+        # 1=W, 2=LaB6, 3=FEG, 11=TFEG, 12=CFEG
+        gun_type = self.get_gun_type_index()
+        if gun_type not in (3, 11, 12):
+             logger.error(f"[BEAM] Aborting FEG command. Detected GunType={gun_type} (Not a FEG).")
+             raise RuntimeError(f"Cannot control FEG Emission: Instrument is not a FEG (Type {gun_type}).")
+
+        # 3. Execution
         if active:
             logger.info("[BEAM] Executing FEG Emission ON...")
             self._write_hw(self.feg, "ExecEmissionOn", "BEAM", 1)
@@ -1395,7 +1412,7 @@ class JeolMicroscope(TemMicroscope):
     def set_feg_flashing_execution(self, active: bool) -> None:
         """
         Atomic: Execute FEG Auto-Flashing.
-        [cite_start]Source: PyJEM.TEM3.FEG3.ExecAutoFlashing [cite: 1001]
+        Source: PyJEM.TEM3.FEG3.ExecAutoFlashing
         """
         if not self.feg:
             logger.error("[BEAM] Flash failed: FEG hardware not connected.")
@@ -1404,11 +1421,16 @@ class JeolMicroscope(TemMicroscope):
         if not hasattr(self.feg, "ExecAutoFlashing"):
             raise RuntimeError("FEG Flashing not supported (FEG3 module missing or incompatible).")
 
+        # Gun Type Safety Check
+        gun_type = self.get_gun_type_index()
+        if gun_type not in (3, 11, 12):
+             logger.error(f"[BEAM] Aborting FEG Flash. Detected GunType={gun_type} (Not a FEG).")
+             raise RuntimeError(f"Cannot execute FEG Flashing: Instrument is not a FEG (Type {gun_type}).")
+
         val = 1 if active else 0
         tag = "Start" if active else "Stop"
         logger.info(f"[BEAM] Executing FEG Auto-Flash ({tag})...")
 
-        # Atomic write
         self._write_hw(self.feg, "ExecAutoFlashing", "BEAM", val)
 
     def set_spot_alignment(self, x: int, y: int) -> None:
@@ -1449,6 +1471,7 @@ class JeolMicroscope(TemMicroscope):
         if (v := self.get_brightness_value()) is not None: vendor_extras["brightness_value"] = v
         if (v := self.get_condenser_lens_1()) is not None: vendor_extras["condenser_lens_1"] = v
         if (v := self.get_condenser_lens_2()) is not None: vendor_extras["condenser_lens_2"] = v
+        if (v := self.get_condenser_lens_3()) is not None: vendor_extras["condenser_lens_3"] = v
 
         # Alignments
         if (v := self.get_spot_alignment()) != (None, None): vendor_extras["spot_alignment"] = v
@@ -1502,6 +1525,7 @@ class JeolMicroscope(TemMicroscope):
             if 'brightness_value' in jeol_v: self.set_brightness_value(int(jeol_v['brightness_value']))
             if 'condenser_lens_1' in jeol_v: self.set_condenser_lens_1(int(jeol_v['condenser_lens_1']))
             if 'condenser_lens_2' in jeol_v: self.set_condenser_lens_2(int(jeol_v['condenser_lens_2']))
+            if 'condenser_lens_3' in jeol_v: self.set_condenser_lens_3(int(jeol_v['condenser_lens_3']))
 
             # C. FEG Control
             if 'feg_emission_state' in jeol_v:
@@ -2097,7 +2121,7 @@ class JeolMicroscope(TemMicroscope):
             if "projector_lens_2" in jeol_v:
                 self.set_projector_lens_2(jeol_v["projector_lens_2"])
             if "projector_lens_3" in jeol_v:
-                self.set_projector_lens_2(jeol_v["projector_lens_3"])
+                self.set_projector_lens_3(jeol_v["projector_lens_3"])
             if "image_shift_2" in jeol_v:
                 val = jeol_v["image_shift_2"]
                 if isinstance(val, (list, tuple)) and len(val) >= 2:
