@@ -428,6 +428,32 @@ class JeolMicroscope(TemMicroscope):
                 self._primary_detector_id = detector_id
         return d
 
+    def _is_stem_detector(self, detector_id: str) -> bool:
+        """Determine if the detector is a STEM detector."""
+        u_id = detector_id.upper()
+        if any(x in u_id for x in ["DFI", "BFI", "BEI", "SEI", "EXT"]):
+            return True
+        if any(x in u_id for x in ["CAM", "US", "RIO", "ONEVIEW", "TVCAM"]):
+            return False
+
+        sys_det = self.system_settings.detector_system
+        if sys_det and sys_det.capabilities_by_id:
+            caps = sys_det.capabilities_by_id.get(detector_id)
+            if caps and caps.extra and caps.extra.vendor and "JEOL" in caps.extra.vendor:
+                val = caps.extra.vendor["JEOL"].get("is_stem_detector")
+                if val is not None: return bool(val)
+
+        return (self.get_mode() == "STEM")
+
+    def _get_scan_controller_detector(self):
+        det_id = self.get_primary_detector_id()
+        if det_id and self._is_stem_detector(det_id):
+            return self._get_detector(det_id)
+        for d_id in self.list_detectors():
+            if self._is_stem_detector(d_id):
+                return self._get_detector(d_id)
+        return None
+
     def _coerce_xy(self, xy: Any) -> Optional[Tuple[float, float]]:
         """
         Safely convert PyJEM return values (often list [x, y]) into a float tuple.
@@ -464,21 +490,6 @@ class JeolMicroscope(TemMicroscope):
 
         logger.warning(f"Stage move timed out after {timeout}s (GetStatus never settled).")
 
-    def _get_scan_controller_detector(self):
-        """Helper to find the Detector instance that controls scanning (STEM)."""
-        if self.det_mod is None:
-            return None
-        try:
-            det_id = self.get_primary_detector_id()
-            if det_id is None:
-                ids = self.list_detectors()
-                det_id = ids[0] if ids else None
-            if det_id is None:
-                return None
-            return self._get_detector(det_id)
-        except Exception:
-            return None
-
     def _set_imaging_area(self, *, width=None, height=None, x=None, y=None) -> None:
         """Set scanning sub-region (Imaging Area)."""
         d = self._get_scan_controller_detector()
@@ -486,19 +497,33 @@ class JeolMicroscope(TemMicroscope):
             logger.error("[SCAN] SetImagingArea failed: No scan controller detector found.")
             raise RuntimeError("Scan detector hardware not connected.")
 
+        # Update local config
         w = int(width if width is not None else self._scan_cfg.get("width_px", 512))
         h = int(height if height is not None else self._scan_cfg.get("height_px", 512))
         xx = int(x if x is not None else self._scan_cfg.get("x_px", 0))
         yy = int(y if y is not None else self._scan_cfg.get("y_px", 0))
 
-        if hasattr(d, "set_imaging_area"):
-            logger.debug(f"[SCAN] SetImagingArea({w}x{h} @ {xx},{yy})")
-            try:
-                d.set_imaging_area(w, h, xx, yy)
-                self._scan_cfg.update({"width_px": w, "height_px": h, "x_px": xx, "y_px": yy})
-            except Exception as e:
-                logger.error(f"[SCAN] SetImagingArea failed: {e}")
-                raise
+        # Determine strict ROI object
+        target_roi = ROI(x=xx, y=yy, width=w, height=h)
+
+        # Reuse the robust logic from set_detector_roi to handle AreaMode vs Standard Mode
+        # We need to find the detector ID to call the public setter
+        d_id = None
+        for k, v in self._active_detectors.items():
+            if v == d:
+                d_id = k
+                break
+
+        if d_id:
+            logger.debug(f"[SCAN] SetImagingArea delegating to set_detector_roi for {d_id}")
+            self.set_detector_roi(d_id, target_roi)
+
+            # Update internal cache if successful
+            self._scan_cfg.update({"width_px": w, "height_px": h, "x_px": xx, "y_px": yy})
+        else:
+            # Fallback if ID lookup fails (unlikely)
+            payload = {"ImagingArea": {"x": xx, "y": yy, "width": w, "height": h}}
+            self._write_hw(d, "set_detectorsetting", "SCAN", payload)
 
     @staticmethod
     def _first_int(d: dict, keys: Tuple[str, ...]) -> Optional[int]:
@@ -2210,17 +2235,22 @@ class JeolMicroscope(TemMicroscope):
         return True
 
     def get_detector_exposure(self, detector_id: str) -> Optional[Quantity]:
-        """Get detector exposure time."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetExposure failed: Hardware not connected.")
+        """
+        Get detector physical exposure time (Integration Time).
+        Returns None for STEM detectors (Strict Separation).
+        """
+        if self._is_stem_detector(detector_id):
             return None
-        try:
-            d = self._get_detector(detector_id)
-            res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
-            return res.exposure
-        except Exception as e:
-            logger.debug(f"[DET] GetExposure({detector_id}) failed: {e}")
-            return None
+
+        d = self._get_detector(detector_id)
+
+        # Helper lambda to use with _read_hw for consistent logging
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.exposure
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_binning_index(self, detector_id: str) -> Optional[int]:
         """Get binning index."""
@@ -2240,17 +2270,15 @@ class JeolMicroscope(TemMicroscope):
         return (b, b) if b is not None else None
 
     def get_detector_roi(self, detector_id: str) -> Optional[ROI]:
-        """Get Region of Interest."""
-        if self.det_mod is None:
-            logger.debug("[DET] GetROI failed: Hardware not connected.")
-            return None
-        try:
-            d = self._get_detector(detector_id)
-            res, _ = jeol_adapter.from_jeol_detector_response(d.get_detectorsetting(), detector_id)
-            return res.roi
-        except Exception as e:
-            logger.debug(f"[DET] GetROI({detector_id}) failed: {e}")
-            return None
+        """Get Region of Interest (Aware of Scan Mode for STEM)."""
+        d = self._get_detector(detector_id)
+
+        def _fetch(hw):
+            raw = hw.get_detectorsetting()
+            settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+            return settings.roi
+
+        return self._read_hw(d, "get_detectorsetting", "DET", converter=lambda x: _fetch(d))
 
     def get_detector_gain_index(self, detector_id: str) -> Optional[int]:
         d = self._get_detector(detector_id)
@@ -2322,38 +2350,26 @@ class JeolMicroscope(TemMicroscope):
             raise
 
     def set_detector_exposure(self, detector_id: str, exposure: Quantity, **kwargs) -> None:
-        """Set detector exposure time."""
-        if self.det_mod is None:
-            logger.error("[DET] SetExposure failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
+        """Set detector physical exposure time (Cameras Only)."""
+        if self._is_stem_detector(detector_id):
+            msg = (f"Detector '{detector_id}' is a STEM detector. "
+                   f"Use 'set_scan_pixel_dwell' to control timing.")
+            logger.error(f"[DET] {msg}")
+            raise ValueError(msg)
 
-        try:
-            d = self._get_detector(detector_id)
-            us = int(exposure.to(Units.US).magnitude)
-            logger.debug(f"[DET] SetExposure({detector_id}, {us}us)")
+        val_ms = float(exposure.to(Units.MS).magnitude)
+        d = self._get_detector(detector_id)
 
-            if hasattr(d, "set_exposuretime_value"):
-                d.set_exposuretime_value(us)
-            elif hasattr(d, "set_exposuretime_index"):
-                d.set_exposuretime_index(us)
-        except Exception as e:
-            logger.error(f"[DET] SetExposure failed: {e}")
-            raise
+        if hasattr(d, "set_exposuretime_value"):
+            self._write_hw(d, "set_exposuretime_value", "DET", val_ms)
+        elif hasattr(d, "set_exposuretime_index"):
+            self._write_hw(d, "set_exposuretime_index", "DET", val_ms)
+        else:
+            self._write_hw(d, "set_detectorsetting", "DET", {"ExposureTimeValue": val_ms})
 
     def set_detector_binning_index(self, detector_id: str, index: int, **kwargs) -> None:
-        """Set detector binning."""
-        if self.det_mod is None:
-            logger.error("[DET] SetBinning failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
-
-        try:
-            d = self._get_detector(detector_id)
-            logger.debug(f"[DET] SetBinning({detector_id}, {index})")
-            if hasattr(d, "set_binningindex"):
-                d.set_binningindex(int(index))
-        except Exception as e:
-            logger.error(f"[DET] SetBinning failed: {e}")
-            raise
+        d = self._get_detector(detector_id)
+        self._write_hw(d, "set_binningindex", "DET", int(index))
 
     def set_detector_binning_xy(self, detector_id: str, binning: Tuple[int, int], **kwargs) -> None:
         if binning[0] != binning[1]:
@@ -2361,20 +2377,38 @@ class JeolMicroscope(TemMicroscope):
         self.set_detector_binning_index(detector_id, binning[0])
 
     def set_detector_roi(self, detector_id: str, roi: Optional[ROI], **kwargs) -> None:
-        """Set detector ROI."""
-        if self.det_mod is None:
-            logger.error("[DET] SetROI failed: Detector hardware not connected.")
-            raise RuntimeError("Detector hardware not connected.")
+        """
+        Set detector ROI.
+        Handles key mapping:
+        - STEM + Area Mode -> 'AreaModeImagingArea' (Sub-scan)
+        - STEM + Scan Mode -> 'ImagingArea' (Resolution)
+        - TEM -> 'ImagingArea' (Binning/Crop)
+        """
+        if roi is None: return
 
-        try:
-            d = self._get_detector(detector_id)
-            if roi:
-                logger.debug(f"[DET] SetROI({detector_id}, {roi})")
-                if hasattr(d, "set_areamode_imagingarea"):
-                    d.set_areamode_imagingarea(int(roi.width), int(roi.height), int(roi.x), int(roi.y))
-        except Exception as e:
-            logger.error(f"[DET] SetROI failed: {e}")
-            raise
+        d = self._get_detector(detector_id)
+        is_stem = self._is_stem_detector(detector_id)
+
+        # 1. Determine correct setter/key
+        use_area_mode = False
+        if is_stem:
+            mode = self.get_scan_mode()  # Returns "Scan", "Spot", "Area"
+            if mode == "Area":
+                use_area_mode = True
+
+        # 2. Execute
+        if use_area_mode:
+            # STEM Area Mode: Sets sub-scan region
+            logger.debug(f"[DET] Setting AreaMode ROI for {detector_id} (STEM AREA): {roi}")
+            # Note: set_areamode_imagingarea(width, height, x, y)
+            self._write_hw(d, "set_areamode_imagingarea", "DET",
+                           int(roi.width), int(roi.height), int(roi.x), int(roi.y))
+        else:
+            # Standard Mode: Sets Resolution (STEM) or Crop (TEM)
+            # Typically using ImagingArea dict
+            logger.debug(f"[DET] Setting Standard ROI for {detector_id}: {roi}")
+            payload = {"ImagingArea": jeol_adapter._struct_to_jeol_roi(roi)}
+            self._write_hw(d, "set_detectorsetting", "DET", payload)
 
     def set_detector_gain_index(self, detector_id: str, index: int, **kwargs) -> None:
         # Atomic simulation via bulk update
@@ -2624,20 +2658,20 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Getters ---
 
     def get_scan_mode(self) -> str:
-        """Get scan mode (e.g. 'Spot', 'Area'). Querying detector first."""
+        """Get scan mode ('Scan', 'Spot', 'Area')."""
         d = self._get_scan_controller_detector()
-        if d is not None and hasattr(d, "get_detectorsetting"):
-            try:
-                st = d.get_detectorsetting()
+        if d:
+            def _extract_mode(st):
                 if isinstance(st, dict):
-                    raw = self._first_int(st, ("ScanMode", "ScanModeValue", "ScanModeIndex"))
+                    raw = st.get("ScanMode") or st.get("ScanModeValue")
                     if raw is not None:
-                        return {0: "Scan", 1: "Spot", 3: "Area"}.get(raw, str(raw))
-                    raw_s = st.get("ScanModeStr") or st.get("ScanModeString")
-                    if isinstance(raw_s, str) and raw_s.strip():
-                        return raw_s.strip()
-            except Exception:
-                pass
+                        # 0=Scan, 1=Spot, 3=Area
+                        return {0: "Scan", 1: "Spot", 2: "Scan", 3: "Area"}.get(raw, str(raw))
+                return "UNKNOWN"
+
+            val = self._read_hw(d, "get_detectorsetting", "SCAN", converter=_extract_mode)
+            if val: return val
+
         return str(self._scan_cfg.get("mode", "Scan"))
 
     def get_scan_active(self) -> bool:
@@ -2680,8 +2714,18 @@ class JeolMicroscope(TemMicroscope):
         return None
 
     def get_scan_pixel_dwell(self) -> Optional[Quantity]:
-        """Get pixel dwell time (cached from config, as HW read is unreliable)."""
-        return None
+        """Get pixel dwell time (µs) from active STEM detector."""
+        d_obj = self._get_scan_controller_detector()
+
+        def _extract_dwell(st):
+            # Known to be STEM here, so raw ExposureTimeValue is µs
+            if isinstance(st, dict):
+                raw = st.get("ExposureTimeValue") or st.get("Exposure") or st.get("ExposureTime")
+                if raw is not None:
+                    return Q_(float(raw), Units.US)
+            return None
+
+        return self._read_hw(d_obj, "get_detectorsetting", "SCAN", converter=_extract_dwell)
 
     def get_scan_flyback(self) -> Optional[Quantity]:
         """Get flyback time (cached from config)."""
@@ -2717,63 +2761,38 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Setters ---
 
     def set_scan_mode(self, mode: str, **kwargs) -> None:
-        """Set scan mode (e.g. 'Spot', 'Area')."""
         m = (mode or "").strip().lower()
-        mapping = {"scan": 0, "full": 0, "full frame": 0, "spot": 1, "area": 3}
-        if m not in mapping and m.isdigit():
-            mapping[m] = int(m)
-        val = mapping.get(m)
-        if val is None:
+        mapping = {"scan": 0, "full": 0, "spot": 1, "area": 3}
+
+        if m not in mapping:
             raise ValueError(f"Unsupported scan mode: {mode}")
 
-        logger.debug(f"[SCAN] Setting Mode: {val}")
-
+        val = mapping[m]
         d = self._get_scan_controller_detector()
-        if d is None:
-            logger.error("[SCAN] SetMode failed: No scan controller detector found.")
+
+        if d:
+            # Most STEM detectors support set_scanmode
+            if hasattr(d, "set_scanmode"):
+                self._write_hw(d, "set_scanmode", "SCAN", int(val))
+                self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
+            else:
+                # Fallback to dict update
+                self._write_hw(d, "set_detectorsetting", "SCAN", {"ScanMode": int(val)})
+        else:
             raise RuntimeError("Scan detector hardware not connected.")
 
-        if hasattr(d, "set_scanmode"):
-            try:
-                d.set_scanmode(int(val))
-                self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
-                return
-            except Exception as e:
-                logger.error(f"[SCAN] SetMode failed: {e}")
-                raise
-
-        self._scan_cfg["mode"] = {0: "Scan", 1: "Spot", 3: "Area"}.get(int(val), str(val))
-
     def set_scan_active(self, active: bool, **kwargs) -> None:
-        """Start or stop the scan engine."""
-        detector_handled = False
         d = self._get_scan_controller_detector()
-        logger.debug(f"[SCAN] SetActive({active})")
+        if d is None:
+            raise RuntimeError("Scan detector hardware not connected.")
 
-        # Detector-specific logic (Preferred)
-        if d is not None:
-            try:
-                if active and hasattr(d, "livestart"):
-                    d.livestart()
-                    detector_handled = True
-                elif (not active) and hasattr(d, "livestop"):
-                    d.livestop()
-                    detector_handled = True
-            except Exception as e:
-                logger.warning(f"[SCAN] Detector Live Control failed, attempting fallback: {e}")
-
-        # Fallback to internal scan generator
-        if not detector_handled:
-            if self.scan and hasattr(self.scan, "SetExtScanMode"):
-                try:
-                    self.scan.SetExtScanMode(1 if active else 0)
-                except Exception as e:
-                    logger.error(f"[SCAN] SetExtScanMode failed: {e}")
-                    raise
-            else:
-                # If detector failed and no fallback exists
-                logger.error("[SCAN] SetActive failed: Detector failed and no internal scan control.")
-                raise RuntimeError("Scan control failed.")
+        logger.debug(f"[SCAN] SetActive: {active}")
+        if active:
+            if hasattr(d, "livestart"):
+                self._write_hw(d, "livestart", "SCAN")
+        else:
+            if hasattr(d, "livestop"):
+                self._write_hw(d, "livestop", "SCAN")
 
     def set_scan_width(self, width: int, **kwargs) -> None:
         self._set_imaging_area(width=int(width))
@@ -2782,8 +2801,18 @@ class JeolMicroscope(TemMicroscope):
         self._set_imaging_area(height=int(height))
 
     def set_scan_pixel_dwell(self, time: Quantity, **kwargs) -> None:
-        logger.error("[SCAN] set_scan_pixel_dwell not supported by JEOL driver IO.")
-        raise NotImplementedError("Hardware dwell time control not supported.")
+        """Set pixel dwell time (µs)."""
+        d_obj = self._get_scan_controller_detector()
+        if not d_obj:
+            logger.error("[SCAN] SetDwell failed: No active STEM detector found.")
+            raise RuntimeError("No STEM detector available.")
+
+        val_us = float(time.to(Units.US).magnitude)
+
+        if hasattr(d_obj, "set_exposuretime_value"):
+            self._write_hw(d_obj, "set_exposuretime_value", "SCAN", val_us)
+        else:
+            self._write_hw(d_obj, "set_detectorsetting", "SCAN", {"ExposureTimeValue": val_us})
 
     def set_scan_flyback(self, time: Quantity, **kwargs) -> None:
         logger.error("[SCAN] set_scan_flyback not supported by JEOL driver IO.")

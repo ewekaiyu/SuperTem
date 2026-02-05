@@ -19,10 +19,6 @@ from supertem.structures.base import (
     DetectorCapabilities,
     ROI,
     StagePosition,
-    Aperture,
-    VacuumSettings,
-    BeamSettings,
-    ScanSettings,
     Extras,
     Q_,
     Units,
@@ -103,23 +99,52 @@ def _parse_jeol_roi_limit(val: Any) -> Optional[Tuple[int, int]]:
 # 1. Detector Adapters
 # =============================================================================
 
-def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tuple[DetectorSettings, DetectorCapabilities]:
+def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tuple[
+    DetectorSettings, DetectorCapabilities]:
     """
     Parses dictionary from Detector.get_detectorsetting().
+    Handles dynamic ROI source (ImagingArea vs AreaModeImagingArea) based on Scan Mode.
+    Strictly separates Camera Exposure (ms) from STEM Dwell (us).
     """
     p = copy.deepcopy(payload)
 
-    # 1. Robust Key Extraction (Handles PascalCase and camelCase variations)
     def _pop_any(keys, default=None):
         for k in keys:
             if k in p: return p.pop(k)
         return default
 
-    # Extract Settings
-    roi_data = _pop_any(["ImagingArea", "imagingArea"])
-    bin_size_data = _pop_any(["BinningSize", "binningSize"])
+    # --- 1. Detect Detector Type (STEM vs TEM) ---
+    is_stem = False
+    if "AreaModeImagingArea" in payload or "SpotPosition" in payload:
+        is_stem = True
+    elif "BinningSize" in payload:
+        is_stem = False
+    elif any(x in detector_id.upper() for x in ["DFI", "BFI", "BEI", "SEI", "EXT"]):
+        is_stem = True
 
-    # Exposure key is notoriously inconsistent across versions
+    # --- 2. Determine Active ROI Source ---
+    # Default to ImagingArea (standard for TEM and STEM Full Scan)
+    roi_source_key = "ImagingArea"
+
+    if is_stem:
+        # Check Scan Mode to see if we should use AreaModeImagingArea
+        # JEOL Code 3 usually denotes 'Area' (Sub-scan)
+        scan_mode = p.get("ScanMode") or p.get("scanMode") or p.get("ScanModeValue")
+
+        is_area_mode = False
+        if isinstance(scan_mode, int) and scan_mode == 3:
+            is_area_mode = True
+        elif isinstance(scan_mode, str) and "AREA" in scan_mode.upper():
+            is_area_mode = True
+
+        if is_area_mode and "AreaModeImagingArea" in p:
+            roi_source_key = "AreaModeImagingArea"
+
+    # --- 3. Extract Settings ---
+    # Use the dynamically selected key for the primary ROI
+    roi_data = _pop_any([roi_source_key, "ImagingArea", "imagingArea"])
+
+    bin_size_data = _pop_any(["BinningSize", "binningSize"])
     exp_val = _pop_any(["ExposureTimeValue", "Exposure", "ExposureTime", "exposureTime"], 0.0)
 
     settings_kwargs = {
@@ -128,11 +153,15 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
         "frame_integration": _pop_any(["frameIntegration", "AccumulationCount", "accumulationCount"]),
         "gain_index": _pop_any(["GainIndex", "gainIndex"]),
         "offset_index": _pop_any(["OffsetIndex", "offsetIndex"]),
-        "exposure": Q_(float(exp_val), Units.MS), # Assuming MS based on typical PyJEM
         "_mode": "lenient"
     }
 
-    # OPTIONAL: Try to parse frame rate if available
+    # Strict Exposure Logic
+    if is_stem:
+        settings_kwargs["exposure"] = None
+    else:
+        settings_kwargs["exposure"] = Q_(float(exp_val), Units.MS)
+
     fr_val = _pop_any(["FrameRate", "frameRate"])
     if fr_val:
         try:
@@ -141,7 +170,7 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
             elif isinstance(fr_val, str) and fr_val.strip():
                 clean_fr = fr_val.lower().replace("fps", "").replace("hz", "").strip()
                 if clean_fr:
-                     settings_kwargs["frame_rate"] = Q_(float(clean_fr), Units.HZ)
+                    settings_kwargs["frame_rate"] = Q_(float(clean_fr), Units.HZ)
         except Exception:
             pass
 
@@ -155,10 +184,9 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
     if bin_size_data:
         settings_kwargs["binning_xy"] = _jeol_bin_to_tuple(bin_size_data)
 
-    # Cleanup redundant keys often returned by hardware
     _pop_any(["ExposureTimeIndex", "ExposureTimeString"])
 
-    # Extract Capabilities
+    # --- 4. Extract Capabilities ---
     caps_kwargs = {
         "can_binning": bool(_pop_any(["CanBinning", "canBinning"], False)),
         "binning_index_min": _pop_any(["BinningIndexMinimum"]),
@@ -175,27 +203,25 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
         "_mode": "lenient"
     }
 
-    # Exposure Limits (Missing in previous version)
-    # Check both Value limits and Index limits (fallback)
+    # Exposure Limits (Only for Camera)
     exp_min = _pop_any(["ExposureTimeMinimum", "ExposureTimeMin", "ExposureTimeIndexMinimum"])
-    if exp_min is not None:
-        try:
-             caps_kwargs["exposure_min"] = Q_(float(exp_min), Units.MS)
-        except Exception:
-             pass
-
     exp_max = _pop_any(["ExposureTimeMaximum", "ExposureTimeMax", "ExposureTimeIndexMaximum"])
-    if exp_max is not None:
-        try:
-            caps_kwargs["exposure_max"] = Q_(float(exp_max), Units.MS)
-        except Exception:
-            pass
+    if not is_stem:
+        if exp_min is not None:
+            try:
+                caps_kwargs["exposure_min"] = Q_(float(exp_min), Units.MS)
+            except Exception:
+                pass
+        if exp_max is not None:
+            try:
+                caps_kwargs["exposure_max"] = Q_(float(exp_max), Units.MS)
+            except Exception:
+                pass
 
     # Rotation Limits
     rot_min = _pop_any(["DigitalRotationMinimum", "RotationAngleMinimum"])
     if rot_min is not None:
         caps_kwargs["digital_rotation_min"] = Q_(float(rot_min), Units.DEG)
-
     rot_max = _pop_any(["DigitalRotationMaximum", "RotationAngleMaximum"])
     if rot_max is not None:
         caps_kwargs["digital_rotation_max"] = Q_(float(rot_max), Units.DEG)
@@ -204,36 +230,30 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
     fi_min = _pop_any(["frameIntegrationMinimum", "FrameIntegrationMinimum"])
     if fi_min is not None:
         caps_kwargs["frame_integration_min"] = int(fi_min)
-
     fi_max = _pop_any(["frameIntegrationMaximum", "FrameIntegrationMaximum"])
     if fi_max is not None:
         caps_kwargs["frame_integration_max"] = int(fi_max)
 
-    # ROI Limits (Using robust parser)
+    # ROI Limits (Always use global Maximum for capabilities)
     roi_max_raw = _pop_any(["ImagingAreaMaximum", "imagingAreaMaximum"])
     roi_size_max = _parse_jeol_roi_limit(roi_max_raw)
     if roi_size_max:
         caps_kwargs["roi_size_max"] = roi_size_max
 
-    roi_min_raw = _pop_any(["ImagingAreaMinimum", "imagingAreaMinimum"])
-    roi_size_min = _parse_jeol_roi_limit(roi_min_raw)
-    if roi_size_min:
-        caps_kwargs["roi_size_min"] = roi_size_min
+    # Pack Leftovers
+    settings_extra_dict = {"is_stem_detector": is_stem}
+    if is_stem:
+        settings_extra_dict["dwell_time_us"] = float(exp_val)
+        settings_extra_dict["active_roi_source"] = roi_source_key
 
-    # Pack leftovers into Extras
     caps_extra_dict = {}
-    settings_extra_dict = {}
-
-    # OPTIONAL: Pre-calculate Pixel Size from 'OutputImageInformation'
     out_info = p.get("OutputImageInformation")
     if isinstance(out_info, dict):
         ppm = out_info.get("PixelsPerMeter")
         if isinstance(ppm, dict):
-            # Usually symmetric, take Horizontal
             hz = ppm.get("Horizontal")
             if hz and float(hz) > 0:
-                pixel_nm = 1e9 / float(hz)
-                settings_extra_dict["calculated_pixel_size_nm"] = pixel_nm
+                settings_extra_dict["calculated_pixel_size_nm"] = 1e9 / float(hz)
 
     for k, v in list(p.items()):
         if any(x in k for x in ["Max", "Min", "Can", "Information"]):
@@ -253,12 +273,9 @@ def from_jeol_detector_response(payload: Dict[str, Any], detector_id: str) -> Tu
 
 
 def to_jeol_detector_config(settings: DetectorSettings) -> Dict[str, Any]:
-    """
-    Convert to dict for Detector.set_detectorsetting().
-    """
+    """Convert to dict for Detector.set_detectorsetting()."""
     out = {}
 
-    # 1. Standard Fields
     if settings.binning_index is not None:
         out["BinningIndex"] = int(settings.binning_index)
 
@@ -277,10 +294,9 @@ def to_jeol_detector_config(settings: DetectorSettings) -> Dict[str, Any]:
     if settings.digital_rotation is not None:
         out["DigitalRotation"] = float(settings.digital_rotation.to(Units.DEG).magnitude)
 
-    if settings.roi is not None:
-        out["ImagingArea"] = _struct_to_jeol_roi(settings.roi)
+    # NOTE: ROI is not mapped here because it requires context (ScanMode)
+    # The 'jeol_microscope' layer handles the key selection ('ImagingArea' vs 'AreaModeImagingArea')
 
-    # 2. Vendor Extras (Pass-through)
     if settings.extra and settings.extra.vendor:
         jeol_extras = settings.extra.vendor.get("JEOL", {})
         out.update(jeol_extras)
@@ -328,154 +344,5 @@ def to_jeol_stage_args(pos: StagePosition) -> Dict[str, float]:
     if pos.z is not None: out['z'] = pos.z.to(Units.NM).magnitude
     if pos.tilt_x is not None: out['tx'] = pos.tilt_x.to(Units.DEG).magnitude
     if pos.tilt_y is not None: out['ty'] = pos.tilt_y.to(Units.DEG).magnitude
+    if pos.r is not None: out['r'] = pos.r.to(Units.DEG).magnitude
     return out
-
-
-# =============================================================================
-# 3. Vacuum Adapters
-# =============================================================================
-
-def from_jeol_vacuum_stats(
-    p_values: List[float],
-    valve_status_flags: Optional[Dict[str, int]] = None,
-) -> VacuumSettings:
-    """
-    Maps P1-P5 from vacuum3.py to semantic pressure fields.
-    """
-    p = list(p_values) + [0.0] * (5 - len(p_values))
-
-    valves_mapped = {}
-    if valve_status_flags:
-        for k, v in valve_status_flags.items():
-            valves_mapped[k] = "OPEN" if v == 1 else "CLOSED"
-
-    return VacuumSettings(
-        gun_pressure=Q_(p[0], Units.PA),      # P1
-        column_pressure=Q_(p[1], Units.PA),   # P2
-        # 'chamber_pressure' is not in base.py VacuumSettings, mapping P3 to extra or dropping?
-        # base.py has: column, gun, buffer_tank.
-        # JEOL P3 is usually Chamber. P4/P5 vary.
-        # We will map P4 to buffer based on typical configs, or leave P3 in extras.
-        buffer_tank_pressure=Q_(p[3], Units.PA), # Attempt mapping P4 to buffer
-
-        column_valve_state=valves_mapped.get("V4") or valves_mapped.get("V7"), # Heuristic
-        gun_valve_state=valves_mapped.get("V1"),
-
-        extra=_pack_vendor_extras({
-            "raw_pressures_P1_to_P5": p_values,
-            "raw_valves": valve_status_flags,
-            "chamber_pressure_P3_Pa": p[2]
-        }),
-        _mode="lenient"
-    )
-
-
-# =============================================================================
-# 4. Beam Adapters
-# =============================================================================
-
-def from_jeol_beam_stats(
-    voltage_val: float,
-    current_ua: float,
-    spot_size_idx: int,
-    alpha_idx: int,
-    beam_shift_dac: Optional[Tuple[int, int]] = None,
-    raw_flags: Optional[Dict[str, Any]] = None
-) -> BeamSettings:
-
-    # Heuristic: PyJEM might return V or kV.
-    # Offline ht3.py typically suggests V, but safe to check magnitude.
-    if voltage_val > 5000:
-        v_qty = Q_(voltage_val, "V").to(Units.KV)
-    else:
-        v_qty = Q_(voltage_val, Units.KV)
-
-    shift_pt = None
-    if beam_shift_dac:
-        shift_pt = Point(x=float(beam_shift_dac[0]), y=float(beam_shift_dac[1]))
-
-    vendor_data = {
-        "raw_voltage": voltage_val,
-        "raw_current_ua": current_ua,
-        "spot_size_index": spot_size_idx,
-        "alpha_index": alpha_idx,
-        "beam_shift_dac": beam_shift_dac
-    }
-    if raw_flags:
-        vendor_data.update(raw_flags)
-
-    return BeamSettings(
-        voltage=v_qty,
-        beam_current=Q_(current_ua, Units.UA).to(Units.NA),
-        spot_size=spot_size_idx,
-        # COMPLIANCE FIX: base.py BeamSettings uses 'convergence_angle' (Quantity).
-        # We cannot map an index (alpha_idx) to a Quantity without a table.
-        # We store the index in extras and leave the quantity None.
-        convergence_angle=None,
-        beam_shift=shift_pt,
-        extra=_pack_vendor_extras(vendor_data),
-        _mode="lenient"
-    )
-
-
-# =============================================================================
-# 5. Scan Adapters
-# =============================================================================
-
-def from_jeol_scan_stats(
-    rotation_deg: float,
-    mag_correction: Optional[Tuple[float, float]] = None,
-    scan_mode_int: Optional[int] = None
-) -> ScanSettings:
-    """
-    Adapter for scan3.py.
-    Scan3 only provides Rotation, MagCorrection, and Mode.
-    """
-    vendor_data = {}
-    if mag_correction:
-        vendor_data["MagCorrection"] = mag_correction
-    if scan_mode_int is not None:
-        vendor_data["ScanModeInt"] = scan_mode_int
-
-    return ScanSettings(
-        scan_rotation=Q_(rotation_deg, Units.DEG),
-        scan_mode=str(scan_mode_int) if scan_mode_int is not None else None,
-        # Fields not available in scan3.py:
-        width_px=None,
-        height_px=None,
-        pixel_dwell_time=None,
-        extra=_pack_vendor_extras(vendor_data) if vendor_data else None,
-        _mode="lenient"
-    )
-
-
-# =============================================================================
-# 6. Aperture Adapters
-# =============================================================================
-
-def from_jeol_aperture(
-    aperture_id: str,
-    size_index: int,
-    pos_xy: List[int]
-) -> Aperture:
-    """
-    Combine separate JEOL calls (GetExpSize, GetPosition) into an Aperture object.
-    """
-    is_inserted = (size_index > 0)
-    point = None
-    if pos_xy and len(pos_xy) >= 2:
-        point = Point(x=float(pos_xy[0]), y=float(pos_xy[1]))
-
-    vendor_data = {
-        "raw_size_index": size_index,
-        "raw_pos_dac": pos_xy
-    }
-
-    return Aperture(
-        aperture_id=aperture_id,
-        inserted=is_inserted,
-        size_index=size_index,
-        position=point,
-        extra=_pack_vendor_extras(vendor_data),
-        _mode="lenient"
-    )
