@@ -260,14 +260,14 @@ class TemMicroscope(ABC):
         if isinstance(vend, dict):
             for vname, payload in vend.items():
                 if isinstance(payload, dict):
-                    keys = [k for k, v in payload.items() if v is not None]
+                    keys = [f"{k}={v}" for k, v in payload.items() if v is not None]
                     if keys:
                         parts.append(f"vendor.{vname}({', '.join(keys)})")
                 elif payload is not None:
                     parts.append(f"vendor.{vname}")
         unk = getattr(extra, "unknown", None)
         if isinstance(unk, dict):
-            keys = [k for k, v in unk.items() if v is not None]
+            keys = [f"{k}={v}" for k, v in unk.items() if v is not None]
             if keys:
                 parts.append(f"unknown({', '.join(keys)})")
         return "; ".join(parts)
@@ -282,7 +282,7 @@ class TemMicroscope(ABC):
             if name.startswith("_") or name == "extra":
                 continue
             if val is not None:
-                fields.append(name)
+                fields.append(f"{name}={val}")
         extra_s = cls._summarize_extras(getattr(target, "extra", None))
         if extra_s:
             fields.append(extra_s)

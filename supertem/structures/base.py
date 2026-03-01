@@ -537,6 +537,7 @@ class Units:
     NM = "nm"
     UM = "um"
     MM = "mm"
+    V = "V"
     KV = "kV"
     NA = "nA"
     UA = "uA"
@@ -1729,8 +1730,8 @@ class StageSystemSettings:
         "max_step_distance": Units.NM,
         "max_step_deg": Units.DEG,
         "eucentric_z": Units.NM,
-        "settle_time": Units.S,
-        "timeout": Units.S
+        "settle_time": Units.SEC,
+        "timeout": Units.SEC
     }
 
     def __post_init__(self):
@@ -1755,8 +1756,8 @@ class StageSystemSettings:
         self.max_step_distance = p.qty(self.max_step_distance, "max_step_distance", Units.NM)
         self.max_step_deg = p.qty(self.max_step_deg, "max_step_deg", Units.DEG)
         self.eucentric_z = p.qty(self.eucentric_z, "eucentric_z", Units.NM)
-        self.settle_time = p.qty(self.settle_time, "settle_time", Units.S)
-        self.timeout = p.qty(self.timeout, "timeout", Units.S)
+        self.settle_time = p.qty(self.settle_time, "settle_time", Units.SEC)
+        self.timeout = p.qty(self.timeout, "timeout", Units.SEC)
 
         self.active_holder_id = p.id(self.active_holder_id, "active_holder_id")
         self.available_holders = p.map_model(HolderCapabilities, self.available_holders, "available_holders",

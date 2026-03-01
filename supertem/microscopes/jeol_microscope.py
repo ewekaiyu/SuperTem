@@ -51,7 +51,7 @@ III. Hardware Quirks & Workarounds
     retry loop that waits for *stable* idle status.
 
   - **Detector Sync:** If the active detector is offline, `set_scan_active` will
-    fallback to the internal scan generator to prevent beam damage (static beam).
+    fall back to the internal scan generator to prevent beam damage (static beam).
 
   - **Lazy Loading:** `PyJEM` is imported only upon instantiation. This allows
     the class to be imported in simulation/offline environments without crashing.
@@ -154,7 +154,8 @@ from supertem.structures.base import (
     Quantity,
     Extras,
     Point,
-    ROI, DetectorCapabilities
+    ROI, DetectorCapabilities,
+    ParseMode
 )
 
 # Import Vendor Adapters
@@ -557,9 +558,9 @@ class JeolMicroscope(TemMicroscope):
         # Try to load overrides from system_settings
         # Structure expects: settings.extras = {"vendor": {"JEOL": {"vacuum_map": {...}}}}
         try:
-            if self.system_settings.extras and \
-                    "vacuum_map" in self.system_settings.extras.get("vendor", {}).get("JEOL", {}):
-                custom_map = self.system_settings.extras["vendor"]["JEOL"]["vacuum_map"]
+            if self.system_settings.extra and \
+                    "vacuum_map" in self.system_settings.extra.vendor.get("JEOL", {}):
+                custom_map = self.system_settings.extra.vendor["JEOL"]["vacuum_map"]
                 # Update defaults with custom values
                 default_map.update(custom_map)
                 logger.info(f"Loaded custom vacuum map: {default_map}")
@@ -749,7 +750,7 @@ class JeolMicroscope(TemMicroscope):
 
     def connect(self, host: str, port: Optional[int] = None, **kwargs) -> None:
         """
-        Connect to the JEOL TEM3 interface and initialize sub-modules.
+        Connect to the JEOL TEM3 interface and initialize submodules.
         """
         if not self.tem3_mod:
             logger.error("[CONN] Cannot connect: PyJEM library not found.")
@@ -2656,7 +2657,7 @@ class JeolMicroscope(TemMicroscope):
             created_at=datetime.now(timezone.utc).isoformat(),
             image_size_px=(arr.shape[1], arr.shape[0]),
             extra=Extras(vendor={"JEOL": jeol_vendor}),
-            _mode="lenient"
+            _mode=ParseMode.LENIENT
         )
 
         return MicroscopeImage(data=arr, metadata=metadata)
@@ -2706,7 +2707,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_settings(self, detector_id: str) -> DetectorSettings:
         """
-        Override: Get full detector state including vendor extras (Gain, Offset, etc).
+        Override: Get full detector state including vendor extras (Gain, Offset, etc.).
         Fetches the complete settings payload from hardware via `get_detectorsetting`
         and uses the adapter to populate standard fields and extras.
         """
@@ -3017,9 +3018,13 @@ class JeolMicroscope(TemMicroscope):
         """Atomic: Robust check for V1 (FEG or Thermionic)."""
         # 1. Try FEG3 [cite: 1032]
         if hasattr(self.feg, "GetBeamValve"):
-            val = self._read_hw(self.feg, "GetBeamValve", "VAC")
-            if val == 1: return "OPEN"
-            if val == 0: return "CLOSED"
+            gun_type = self.get_gun_type_index()
+            # FEG/CFEG/TFEG Types: 3, 11-16, 19-22 [cite: 1259]
+            if gun_type in (3, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22):
+                val = self._read_hw(self.feg, "GetBeamValve", "VAC")
+                if val == 1: return "OPEN"
+                if val == 0: return "CLOSED"
+                return "UNKNOWN"
 
         # 2. Fallback to GUN3 [cite: 1211]
         if hasattr(self.gun, "GetBeamSw"):
@@ -3037,7 +3042,7 @@ class JeolMicroscope(TemMicroscope):
 
     def get_column_pressure(self) -> Optional[Quantity]:
         # FIX: Added Units.PASCAL
-        return self._get_gauge_value("PEG", "COLUMN_PEG", Units.PASCAL)
+        return self._get_gauge_value("PEG", "COLUMN_PEG", Units.PA)
 
     def get_gun_pressure(self) -> Optional[Quantity]:
         # Usually not exposed in basic PyJEM
@@ -3045,27 +3050,29 @@ class JeolMicroscope(TemMicroscope):
 
     def get_buffer_tank_pressure(self) -> Optional[Quantity]:
         # FIX: Added Units.MICRO_AMPERE
-        return self._get_gauge_value("PIG", "BUFFER_PIG", Units.MICRO_AMPERE)
+        return self._get_gauge_value("PIG", "BUFFER_PIG", Units.UA)
 
     # --- Atomic Getters (Vendor Specific) ---
 
-    def get_column_vacuum_ready(self) -> bool:
+    def get_column_ready_state(self) -> str:
         """
         Check if Column is ready (VACUUM3.GetColumnReady).
-        Returns True if Ready (1), False if Not Ready (0).
         """
         # [cite: 2240] GetColumnReady returns 1=Ready, 0=Not Ready
         val = self._read_hw(self.vac, "GetColumnReady", "VAC", self._to_int)
-        return (val == 1)
+        if val == 1: return "READY"
+        if val == 0: return "NOT_READY"
+        return "UNKNOWN"
 
-    def get_camera_vacuum_ready(self) -> bool:
+    def get_camera_ready_state(self) -> str:
         """
         Check if Camera chamber is ready (VACUUM3.GetCameraReady).
-        Returns True if Ready (1), False if Not Ready (0).
         """
         # [cite: 2222] GetCameraReady returns 1=Ready, 0=Not Ready
         val = self._read_hw(self.vac, "GetCameraReady", "VAC", self._to_int)
-        return (val == 1)
+        if val == 1: return "READY"
+        if val == 0: return "NOT_READY"
+        return "UNKNOWN"
 
     def get_specimen_ready_state(self) -> str:
         """Check if specimen is ready for insertion (VACUUM3.GetSpecimenReady)."""
@@ -3073,6 +3080,22 @@ class JeolMicroscope(TemMicroscope):
         val = self._read_hw(self.vac, "GetSpecimenReady", "VAC", self._to_int)
         if val == 1: return "READY"
         if val == 0: return "NOT_READY"
+        return "UNKNOWN"
+
+    def get_column_air_state(self) -> str:
+        """Check if specimen chamber is vented (VACUUM3.GetSpecimenAir)."""
+        # [cite: 2267] GetSpecimenAir: 0=Not Air, 1=Air
+        val = self._read_hw(self.vac, "GetColumnAir", "VAC", self._to_int)
+        if val == 1: return "AIR"
+        if val == 0: return "VACUUM"
+        return "UNKNOWN"
+
+    def get_camera_air_state(self) -> str:
+        """Check if specimen chamber is vented (VACUUM3.GetSpecimenAir)."""
+        # [cite: 2267] GetSpecimenAir: 0=Not Air, 1=Air
+        val = self._read_hw(self.vac, "GetCameraAir", "VAC", self._to_int)
+        if val == 1: return "AIR"
+        if val == 0: return "VACUUM"
         return "UNKNOWN"
 
     def get_specimen_air_state(self) -> str:
@@ -3093,15 +3116,15 @@ class JeolMicroscope(TemMicroscope):
 
     def get_column_rough_pressure(self) -> Optional[Quantity]:
         # FIX: Added Units.MICRO_AMPERE
-        return self._get_gauge_value("PIG", "COLUMN_PIG", Units.MICRO_AMPERE)
+        return self._get_gauge_value("PIG", "COLUMN_PIG", Units.UA)
 
     def get_specimen_chamber_pressure(self) -> Optional[Quantity]:
         # FIX: Added Units.MICRO_AMPERE
-        return self._get_gauge_value("PIG", "SPECIMEN_PIG", Units.MICRO_AMPERE)
+        return self._get_gauge_value("PIG", "SPECIMEN_PIG", Units.UA)
 
     def get_detector_chamber_pressure(self) -> Optional[Quantity]:
         # FIX: Added Units.MICRO_AMPERE
-        return self._get_gauge_value("PIG", "DETECTOR_PIG", Units.MICRO_AMPERE)
+        return self._get_gauge_value("PIG", "DETECTOR_PIG", Units.UA)
 
     # --- Atomic Setters ---
 
