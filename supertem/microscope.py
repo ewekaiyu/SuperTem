@@ -158,7 +158,8 @@ Usage
 
   # 2. Control (Use Orchestrators)
   req = StageMoveRequest(target=StagePosition(x=Q_(10, 'um')))
-  scope.execute_stage_move(req)  # -> Checks limits -> Calls move_stage_absolute
+  scope.execute_stage_move(req)  # -> Checks limits -> Delegates to safe_move_stage
+  -> Breaks into linear interpolations -> Calls apply_stage_position
 
 """
 

@@ -161,7 +161,7 @@ DEFAULT_MICROSCOPE_CONFIGURATION_YAML = {
             "r_limits_deg": [-180.0, 180.0],
             "tilt_x_limits_deg": [-70.0, 70.0],
             "tilt_y_limits_deg": [-70.0, 70.0],
-            "max_step_nm": 50000.0,
+            "max_step_distance_nm": 50000.0,
             "max_step_deg": 5.0,
             "settle_time_s": 0.5,
             "timeout_s": 30.0,

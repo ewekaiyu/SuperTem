@@ -418,7 +418,7 @@ Interaction is divided into "Nouns" (Data/State) and "Verbs" (Intents/Requests).
    -----------------------------------------------------------------------------
    Vacuum                | VacuumSettings         | VacuumControlRequest
    -----------------------------------------------------------------------------
-   Aperture              | Aperture               | ApertureControlRequest
+   Aperture              | ApertureSettings       | ApertureControlRequest
    -----------------------------------------------------------------------------
 
 ===============================================================================
@@ -438,6 +438,7 @@ and Telemetry (Dynamic/Snapshot).
    │   ├── projection_system: ProjectionSystemSettings (Mag ranges, Cam lengths)
    │   ├── scan_system: ScanSystemSettings (Dwell time limits, Scan modes)
    │   ├── detector_system: DetectorSystemSettings (Registry of cameras)
+   │   ├── aperture_system: ApertureSystemSettings (Registry of apertures)
    │   └── info: SystemInfo (Static hardware IDs, IP addresses)
    ├── image: ImageOutputSettings (File formats, Save paths)
    └── protocol: Dict (User-defined automation scripts)
@@ -451,7 +452,7 @@ and Telemetry (Dynamic/Snapshot).
    ├── projection: ProjectionSettings (Defocus, magnification, optical mode)
    ├── scan: ScanSettings (Active dwell time, grid resolution)
    ├── vacuum: VacuumSettings (Valve states, pressures)
-   ├── apertures: Dict[str, Aperture] (State of all inserted apertures)
+   ├── apertures: Dict[str, ApertureSettings] (State of all inserted apertures)
    └── detectors: Dict[str, DetectorSettings] (State of all active cameras)
 
 ===============================================================================
