@@ -67,7 +67,7 @@ Safety is handled via a "Dual-Gatekeeper" model:
 III. Data Integrity & Parse Modes
 ===============================================================================
 
-Drivers must implement the "Ingress/Egress" policy using `base.py` ParseModes:
+Drivers must implement the "Ingress/Egress" policy using `base_structures.py` ParseModes:
 
   A. Egress (Control Plane / Writing to Hardware) -> ParseMode.STRICT
      - Context: `apply_...` methods and `move_stage...`.
@@ -171,8 +171,8 @@ import datetime
 import os
 from pathlib import Path
 
-# Import strictly typed structures from base.py
-from supertem.structures.base import (
+# Import strictly typed structures from base_structures.py
+from supertem.structures.base_structures import (
     # Configuration & Safety
     MicroscopeSettings,
     SystemSettings,
@@ -367,7 +367,7 @@ class TemMicroscope(ABC):
         Capture a comprehensive snapshot of the entire microscope state.
 
         Aggregates data from all subsystems (Stage, Beam, Optics, etc.) into
-        a single timestamped structure matching base.py definition.
+        a single timestamped structure matching base_structures.py definition.
         """
         return MicroscopeState(
             timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),

@@ -24,7 +24,7 @@ On instantiation, the RegistryManager executes a self-healing initialization seq
 
   3) Registry Loading
      - Loads Index files (microscope-config-index.yaml & protocol-index.yaml).
-     - Resolves the "Active" paths to feed the base.py ingestion lifecycle.
+     - Resolves the "Active" paths to feed the base_structures.py ingestion lifecycle.
 
 ===============================================================================
 II. Registry Management (Hardware vs. Protocols)
@@ -40,7 +40,7 @@ III. Safety & Atomic I/O
 
 - Atomic Writes: Updates use a write-to-tmp -> OS-replace sequence.
 - Separation of Concerns: This module handles *storage* (The Registry),
-  while base.py handles *structure* (The Typing).
+  while base_structures.py handles *structure* (The Typing).
 
 ===============================================================================
 IV. Usage Patterns (The Context Architecture)
@@ -135,7 +135,7 @@ class SuperTEMContext:
 # Constants & Defaults
 # =============================================================================
 
-from supertem.structures.base import SCHEMA_VERSION
+from supertem.structures.base_structures import SCHEMA_VERSION
 __DEFAULT_MANUFACTURER__ = "JEOL"
 __DEFAULT_IP_ADDRESS__ = "192.168.0.1"
 
@@ -335,16 +335,16 @@ class RegistryManager:
         self.active_protocol_name = p_idx.get("default", "default-protocol")
         self.protocol_index = p_idx.get("protocols", {})
 
-        # Verify active profile health using base.py logic
+        # Verify active profile health using base_structures.py logic
         self.validate_profile(self.active_config_name, mode="lenient")
 
     def validate_profile(self, name: str, mode: str = "strict") -> bool:
-        """Integration: Validates a config against base.py via deferred import."""
+        """Integration: Validates a config against base_structures.py via deferred import."""
         try:
-            from supertem.structures.base import MicroscopeSettings
+            from supertem.structures.base_structures import MicroscopeSettings
         except ImportError:
             # Fallback to relative import if the absolute path fails in certain environments
-            from .structures.base import MicroscopeSettings
+            from .structures.base_structures import MicroscopeSettings
 
         path_str = self.microscope_index.get(name, {}).get("path")
         if not path_str:

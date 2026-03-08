@@ -1,1 +1,1 @@
-from .base import MicroscopeSettings, SystemSettings, ParseMode
+from .base_structures import MicroscopeSettings, SystemSettings, ParseMode

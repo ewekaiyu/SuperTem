@@ -14,7 +14,7 @@ All unmapped data is preserved in the `extra.vendor['JEOL']` dictionary.
 import copy
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from supertem.structures.base import (
+from supertem.structures.base_structures import (
     DetectorSettings,
     DetectorCapabilities,
     ROI,

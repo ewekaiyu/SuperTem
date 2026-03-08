@@ -1,12 +1,12 @@
 from supertem.config import SuperTEMContext
 from supertem.utils import setup_session
-from supertem.structures.base import *
+from supertem.structures.base_structures import *
 
 # 1. Create the Context
-ctx = SuperTEMContext.testing(tmp_path=Path("C:\\Users\Acer\PycharmProjects\SuperTem\offline_testing"))
+ctx = SuperTEMContext.testing(tmp_path=Path("C:\\Users\eweka\PycharmProjects\SuperTem\offline_testing"))
 
 # 2. Initialize the Session
-scope, settings = setup_session(context=ctx, manufacturer="JEOL", profile_name="pyjem_offline", offline=True)
+scope, settings = setup_session(context=ctx, manufacturer="JEOL", offline=True)
 
 print(scope.get_beam_settings().mode)
 target = BeamSettings(mode='STEM')

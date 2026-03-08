@@ -4,7 +4,7 @@ supertem.utils
 Operational Utilities, Session Lifecycle Management, and Unit-Aware I/O.
 
 This module acts as the "Glue Layer" between the abstract data structures defined
-in base.py and the physical microscope hardware. It provides the high-level
+in base_structures.py and the physical microscope hardware. It provides the high-level
 orchestration required to initialize sessions, manage persistent storage, and
 handle media generation.
 
@@ -79,9 +79,7 @@ global state.
 import datetime
 import glob
 import logging
-import os
 import sys
-import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Any
 from copy import deepcopy
@@ -90,8 +88,8 @@ import yaml
 from PIL import Image
 
 from supertem.config import RegistryManager, SuperTEMContext
-from supertem.microscope import TemMicroscope
-from supertem.structures.base import (
+from supertem.microscopes.base_microscope import TemMicroscope
+from supertem.structures.base_structures import (
     MicroscopeImage,
     MicroscopeSettings,
     StagePosition,
@@ -171,7 +169,7 @@ def setup_session(
             raise ValueError(f"Profile '{profile_name}' not found in registry.")
         registry.active_config_name = profile_name
 
-    # 2. Load settings (Uses base.py STRICT mode for control-plane safety)
+    # 2. Load settings (Uses base_structures.py STRICT mode for control-plane safety)
     settings = load_microscope(registry, config_path, protocol_path, mode=ParseMode.STRICT)
 
     # 3. Create session directories
@@ -250,7 +248,7 @@ def load_microscope(
     config_dict = load_yaml(Path(c_path), default=DEFAULT_MICROSCOPE_CONFIGURATION_YAML)
     protocol_dict = load_yaml(Path(p_path), default=DEFAULT_PROTOCOL_YAML)
 
-    # Ingest using base.py logic
+    # Ingest using base_structures.py logic
     if isinstance(config_dict, dict):
         embedded_protocol = config_dict.get("protocol")
         if protocol_dict not in (None, {}, [], ""):
@@ -345,7 +343,7 @@ def save_live_config(
     filename = f"{name}.yaml"
     full_path = context.config_path / filename
 
-    # Use base.py's serialization to handle units
+    # Use base_structures.py's serialization to handle units
     save_yaml(full_path, new_settings.to_dict())
     print(f"Configuration saved to {full_path}")
 
@@ -389,7 +387,7 @@ def save_positions(context: SuperTEMContext, positions: Any, overwrite: bool = F
     # Load existing if not overwriting
     current_data = [] if overwrite else load_yaml(target_path, default=[])
 
-    # Add new positions using base.py serialization (handles units -> floats)
+    # Add new positions using base_structures.py serialization (handles units -> floats)
     for pos in positions:
         if isinstance(pos, StagePosition):
             current_data.append(pos.to_dict())

@@ -129,13 +129,13 @@ do not map to standard physics (e.g. Alpha Selector, OLc DAC).
 """
 import time
 import logging
-from typing import Dict, List, Optional, Tuple, Any, Callable, Union
+from typing import Dict, List, Optional, Tuple, Any, Callable
 import numpy as np
 from datetime import datetime, timezone
 
 # Import Abstract Base and Strict Structures
-from supertem.microscope import TemMicroscope
-from supertem.structures.base import (
+from supertem.microscopes.base_microscope import TemMicroscope
+from supertem.structures.base_structures import (
     MicroscopeSettings,
     SystemInfo,
     StagePosition,
@@ -143,9 +143,6 @@ from supertem.structures.base import (
     ProjectionSettings,
     DetectorSettings,
     DetectorSystemSettings,
-    ScanSettings,
-    VacuumSettings,
-    ApertureSettings,
     MicroscopeImage,
     MicroscopeImageMetadata,
     AcquisitionRequest,
