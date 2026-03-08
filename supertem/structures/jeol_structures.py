@@ -30,22 +30,22 @@ class JeolBeamExtras:
     condenser_lens_2: Optional[int] = None
     condenser_lens_3: Optional[int] = None
 
-    # Alignment Coils
-    spot_alignment: Optional[Tuple[int, int]] = None
-    condenser_alignment_1: Optional[Tuple[int, int]] = None
-    condenser_alignment_2: Optional[Tuple[int, int]] = None
-    gun_alignment_1: Optional[Tuple[int, int]] = None
-    gun_alignment_2: Optional[Tuple[int, int]] = None
+    # Alignment Coils (Must be floats to preserve PyJEM telemetry precision)
+    spot_alignment: Optional[Tuple[float, float]] = None
+    condenser_alignment_1: Optional[Tuple[float, float]] = None
+    condenser_alignment_2: Optional[Tuple[float, float]] = None
+    gun_alignment_1: Optional[Tuple[float, float]] = None
+    gun_alignment_2: Optional[Tuple[float, float]] = None
 
     # Source Control & Diagnostics
     feg_emission_state: Optional[str] = None
     gun_type_index: Optional[int] = None
 
     # Quantities require _UNITS mapping for JSON serialization
-    gun_anode_1: Optional["Quantity"] = None
-    gun_anode_2: Optional["Quantity"] = None
-    gun_bias: Optional["Quantity"] = None
-    gun_filament: Optional["Quantity"] = None
+    gun_anode_1: Optional[Quantity] = None
+    gun_anode_2: Optional[Quantity] = None
+    gun_bias: Optional[Quantity] = None
+    gun_filament: Optional[Quantity] = None
 
     # Recursion-Safe Data Plane Extra Bucket
     extra: ParserExtras = field(default_factory=ParserExtras)
@@ -67,11 +67,12 @@ class JeolBeamExtras:
         self.condenser_lens_2 = p.int(self.condenser_lens_2, "condenser_lens_2")
         self.condenser_lens_3 = p.int(self.condenser_lens_3, "condenser_lens_3")
 
-        self.spot_alignment = p.pair_int(self.spot_alignment, "spot_alignment")
-        self.condenser_alignment_1 = p.pair_int(self.condenser_alignment_1, "condenser_alignment_1")
-        self.condenser_alignment_2 = p.pair_int(self.condenser_alignment_2, "condenser_alignment_2")
-        self.gun_alignment_1 = p.pair_int(self.gun_alignment_1, "gun_alignment_1")
-        self.gun_alignment_2 = p.pair_int(self.gun_alignment_2, "gun_alignment_2")
+        # FIX: Coils parsed as floats
+        self.spot_alignment = p.pair_float(self.spot_alignment, "spot_alignment")
+        self.condenser_alignment_1 = p.pair_float(self.condenser_alignment_1, "condenser_alignment_1")
+        self.condenser_alignment_2 = p.pair_float(self.condenser_alignment_2, "condenser_alignment_2")
+        self.gun_alignment_1 = p.pair_float(self.gun_alignment_1, "gun_alignment_1")
+        self.gun_alignment_2 = p.pair_float(self.gun_alignment_2, "gun_alignment_2")
 
         self.feg_emission_state = p.str(self.feg_emission_state, "feg_emission_state")
         self.gun_type_index = p.int(self.gun_type_index, "gun_type_index")
@@ -132,7 +133,7 @@ class JeolProjectionExtras:
     projector_lens_2: Optional[int] = None
     projector_lens_3: Optional[int] = None
 
-    image_shift_2: Optional[Tuple[int, int]] = None
+    image_shift_2: Optional[Tuple[float, float]] = None # FIX: Coils parsed as floats
     diffraction_focus_index: Optional[int] = None
 
     extra: ParserExtras = field(default_factory=ParserExtras)
@@ -151,7 +152,7 @@ class JeolProjectionExtras:
         ]:
             setattr(self, lens, p.int(getattr(self, lens), lens))
 
-        self.image_shift_2 = p.pair_int(self.image_shift_2, "image_shift_2")
+        self.image_shift_2 = p.pair_float(self.image_shift_2, "image_shift_2")
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
@@ -175,8 +176,6 @@ class JeolDetectorExtras:
     """
     is_stem_detector: Optional[bool] = None
 
-    # Note: These are primitive floats defined by the adapter, not Pint Quantities.
-    # Therefore, they don't require _UNITS mapping.
     dwell_time_us: Optional[float] = None
     active_roi_source: Optional[str] = None
     calculated_pixel_size_nm: Optional[float] = None
