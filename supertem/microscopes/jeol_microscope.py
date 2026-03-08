@@ -155,6 +155,13 @@ from supertem.structures.base_structures import (
     ParseMode
 )
 
+# Import Vendor Structures (Add this near the top)
+from supertem.structures.jeol_structures import (
+    JeolBeamExtras,
+    JeolProjectionExtras,
+    JeolDetectorExtras
+)
+
 # Import Vendor Adapters
 from supertem.vendor.JEOL import jeol_adapter
 from supertem.vendor.JEOL.jeol_eos_tables import DEFAULT_TABLES
@@ -277,6 +284,46 @@ class JeolMicroscope(TemMicroscope):
                             else:
                                 self.optical_tables[mode_key] = tables
                         logger.info(f"Loaded custom JEOL optical tables for: {list(custom.keys())}")
+
+    # =========================================================================
+    # VENDOR PAYLOAD MUTATION HOOKS (The Safety Firewall)
+    # =========================================================================
+
+    def _validate_vendor_beam(self, target: BeamSettings) -> None:
+        """Intercepts raw JEOL beam dicts, validates hardware limits, and strongly types them."""
+        if not target or not target.extra or not target.extra.vendor:
+            return
+
+        raw_payload = target.extra.vendor.get("JEOL")
+        if isinstance(raw_payload, dict):
+            # 1. Instantiate strictly typed vendor noun
+            typed_extras = JeolBeamExtras.from_dict(raw_payload, mode=target._mode)
+            # 2. Perform Dual-Duty logic + hardware safety checks
+            typed_extras.validate(mode=target._mode)
+            # 3. Mutate the universal payload IN PLACE
+            target.extra.vendor["JEOL"] = typed_extras
+
+    def _validate_vendor_projection(self, target: ProjectionSettings) -> None:
+        """Intercepts raw JEOL projection dicts, validates limits, and strongly types them."""
+        if not target or not target.extra or not target.extra.vendor:
+            return
+
+        raw_payload = target.extra.vendor.get("JEOL")
+        if isinstance(raw_payload, dict):
+            typed_extras = JeolProjectionExtras.from_dict(raw_payload, mode=target._mode)
+            typed_extras.validate(mode=target._mode)
+            target.extra.vendor["JEOL"] = typed_extras
+
+    def _validate_vendor_detector(self, target: DetectorSettings) -> None:
+        """Intercepts raw JEOL detector dicts, validates limits, and strongly types them."""
+        if not target or not target.extra or not target.extra.vendor:
+            return
+
+        raw_payload = target.extra.vendor.get("JEOL")
+        if isinstance(raw_payload, dict):
+            typed_extras = JeolDetectorExtras.from_dict(raw_payload, mode=target._mode)
+            typed_extras.validate(mode=target._mode)
+            target.extra.vendor["JEOL"] = typed_extras
 
     # ---------------------------------------------------------------------
     # Internal helpers
@@ -1539,95 +1586,92 @@ class JeolMicroscope(TemMicroscope):
     def get_beam_settings(self) -> BeamSettings:
         """
         Aggregates beam state.
-        Override: Adds all vendor extras (Alpha, Brightness, Alignments, Source Info).
+        Override: Instantiates a strictly typed JeolBeamExtras object.
         """
         # 1. Get Base Settings (Calls standard atomics)
         bs = super().get_beam_settings()
 
-        # 2. Get Vendor Extras (Atomics)
-        vendor_extras = {}
+        # 2. Instantiate Typed Vendor Extras in LENIENT mode (Read = Survive)
+        jeol_extras = JeolBeamExtras(_mode=ParseMode.LENIENT)
 
         # Optics
-        if (v := self.get_alpha_index()) is not None: vendor_extras["alpha_index"] = v
-        if (v := self.get_brightness_value()) is not None: vendor_extras["brightness_value"] = v
-        if (v := self.get_condenser_lens_1()) is not None: vendor_extras["condenser_lens_1"] = v
-        if (v := self.get_condenser_lens_2()) is not None: vendor_extras["condenser_lens_2"] = v
-        if (v := self.get_condenser_lens_3()) is not None: vendor_extras["condenser_lens_3"] = v
+        jeol_extras.alpha_index = self.get_alpha_index()
+        jeol_extras.brightness_value = self.get_brightness_value()
+        jeol_extras.condenser_lens_1 = self.get_condenser_lens_1()
+        jeol_extras.condenser_lens_2 = self.get_condenser_lens_2()
+        jeol_extras.condenser_lens_3 = self.get_condenser_lens_3()
 
-        # Alignments
-        if (v := self.get_spot_alignment()) != (None, None): vendor_extras["spot_alignment"] = v
-        if (v := self.get_condenser_alignment_1()) != (None, None): vendor_extras["condenser_alignment_1"] = v
-        if (v := self.get_condenser_alignment_2()) != (None, None): vendor_extras["condenser_alignment_2"] = v
-        if (v := self.get_gun_alignment_1()) != (None, None): vendor_extras["gun_alignment_1"] = v
-        if (v := self.get_gun_alignment_2()) != (None, None): vendor_extras["gun_alignment_2"] = v
+        # Alignments (Only set if valid tuple returned)
+        if (v := self.get_spot_alignment()) != (None, None): jeol_extras.spot_alignment = v
+        if (v := self.get_condenser_alignment_1()) != (None, None): jeol_extras.condenser_alignment_1 = v
+        if (v := self.get_condenser_alignment_2()) != (None, None): jeol_extras.condenser_alignment_2 = v
+        if (v := self.get_gun_alignment_1()) != (None, None): jeol_extras.gun_alignment_1 = v
+        if (v := self.get_gun_alignment_2()) != (None, None): jeol_extras.gun_alignment_2 = v
 
         # Source Diagnostics
-        if (v := self.get_gun_type_index()) is not None: vendor_extras["gun_type_index"] = v
-        if (v := self.get_feg_emission_state()) != "UNKNOWN": vendor_extras["feg_emission_state"] = v
-        if (v := self.get_gun_anode_1_voltage()) is not None: vendor_extras["gun_anode_1"] = v
-        if (v := self.get_gun_anode_2_voltage()) is not None: vendor_extras["gun_anode_2"] = v
-        if (v := self.get_gun_bias_current()) is not None: vendor_extras["gun_bias"] = v
-        if (v := self.get_gun_filament_current()) is not None: vendor_extras["gun_filament"] = v
+        jeol_extras.gun_type_index = self.get_gun_type_index()
+        feg_state = self.get_feg_emission_state()
+        if feg_state != "UNKNOWN":
+            jeol_extras.feg_emission_state = feg_state
 
-        # 3. Merge into extras
-        if vendor_extras:
-            current_extras = bs.extra.vendor if (bs.extra and bs.extra.vendor) else {}
-            current_extras.setdefault("JEOL", {}).update(vendor_extras)
+        jeol_extras.gun_anode_1 = self.get_gun_anode_1_voltage()
+        jeol_extras.gun_anode_2 = self.get_gun_anode_2_voltage()
+        jeol_extras.gun_bias = self.get_gun_bias_current()
+        jeol_extras.gun_filament = self.get_gun_filament_current()
 
-            if not bs.extra:
-                bs.extra = Extras(vendor=current_extras)
-            else:
-                bs.extra.vendor = current_extras
+        # 3. Attach to canonical object
+        if not bs.extra:
+            bs.extra = Extras()
+        bs.extra.vendor["JEOL"] = jeol_extras
 
         return bs
 
     def apply_beam_settings(self, settings: BeamSettings, **kwargs) -> None:
         """
         Override: Handles standard settings + Vendor Extras (Alpha, Brightness, Alignment, FEG).
+        Safely unpacks the strongly-typed JeolBeamExtras object.
         """
         # 1. Apply Standard Settings (Voltage, Spot, etc)
         super().apply_beam_settings(settings, **kwargs)
 
-        # 2. Handle JEOL Extras
-        vend = getattr(settings.extra, 'vendor', None)
-        jeol_v = vend.get('JEOL') if isinstance(vend, dict) else None
+        # 2. Handle JEOL Extras (Now a strongly-typed object)
+        vend = getattr(settings.extra, 'vendor', {})
+        jeol_v = vend.get('JEOL')
 
-        if isinstance(jeol_v, dict):
+        if isinstance(jeol_v, JeolBeamExtras):
             # A. Alpha Index (Convergence)
-            if 'alpha_index' in jeol_v:
-                try:
-                    idx = int(jeol_v['alpha_index'])
-                    if not (0 <= idx <= 8): raise ValueError("Alpha index out of range.")
-                    self.set_alpha_index(idx)
-                except Exception as e:
-                    logger.error(f"[BEAM] Failed to set alpha_index: {e}")
+            if jeol_v.alpha_index is not None:
+                self.set_alpha_index(jeol_v.alpha_index)
 
             # B. Brightness & Lens DACs
-            if 'brightness_value' in jeol_v: self.set_brightness_value(int(jeol_v['brightness_value']))
-            if 'condenser_lens_1' in jeol_v: self.set_condenser_lens_1(int(jeol_v['condenser_lens_1']))
-            if 'condenser_lens_2' in jeol_v: self.set_condenser_lens_2(int(jeol_v['condenser_lens_2']))
-            if 'condenser_lens_3' in jeol_v: self.set_condenser_lens_3(int(jeol_v['condenser_lens_3']))
+            if jeol_v.brightness_value is not None:
+                self.set_brightness_value(jeol_v.brightness_value)
+            if jeol_v.condenser_lens_1 is not None:
+                self.set_condenser_lens_1(jeol_v.condenser_lens_1)
+            if jeol_v.condenser_lens_2 is not None:
+                self.set_condenser_lens_2(jeol_v.condenser_lens_2)
+            if jeol_v.condenser_lens_3 is not None:
+                self.set_condenser_lens_3(jeol_v.condenser_lens_3)
 
             # C. FEG Control
-            if 'feg_emission_state' in jeol_v:
-                state = str(jeol_v['feg_emission_state']).upper()
+            if jeol_v.feg_emission_state is not None:
+                state = jeol_v.feg_emission_state.upper()
                 if state in ["ON", "TRUE"]:
                     self.set_feg_emission_state(True)
                 elif state in ["OFF", "FALSE"]:
                     self.set_feg_emission_state(False)
 
             # D. Fine Alignments
-            for key, setter in [
-                ("spot_alignment", self.set_spot_alignment),
-                ("condenser_alignment_1", self.set_condenser_alignment_1),
-                ("condenser_alignment_2", self.set_condenser_alignment_2),
-                ("gun_alignment_1", self.set_gun_alignment_1),
-                ("gun_alignment_2", self.set_gun_alignment_2)
-            ]:
-                if key in jeol_v:
-                    val = jeol_v[key]
-                    if isinstance(val, (list, tuple)) and len(val) >= 2:
-                        setter(int(val[0]), int(val[1]))
+            if jeol_v.spot_alignment is not None:
+                self.set_spot_alignment(jeol_v.spot_alignment[0], jeol_v.spot_alignment[1])
+            if jeol_v.condenser_alignment_1 is not None:
+                self.set_condenser_alignment_1(jeol_v.condenser_alignment_1[0], jeol_v.condenser_alignment_1[1])
+            if jeol_v.condenser_alignment_2 is not None:
+                self.set_condenser_alignment_2(jeol_v.condenser_alignment_2[0], jeol_v.condenser_alignment_2[1])
+            if jeol_v.gun_alignment_1 is not None:
+                self.set_gun_alignment_1(jeol_v.gun_alignment_1[0], jeol_v.gun_alignment_1[1])
+            if jeol_v.gun_alignment_2 is not None:
+                self.set_gun_alignment_2(jeol_v.gun_alignment_2[0], jeol_v.gun_alignment_2[1])
 
     def perform_beam_action(self, action: str, **kwargs) -> None:
         """
@@ -2132,31 +2176,38 @@ class JeolMicroscope(TemMicroscope):
     def get_projection_settings(self) -> ProjectionSettings:
         """
         Aggregates optical state.
-        Ensures raw DACs are ALWAYS stored in extras by calling atomic getters.
+        Override: Instantiates a strictly typed JeolProjectionExtras object.
         """
         # 1. Get Standard Physics
         ps = super().get_projection_settings()
 
-        # 2. Raw Hardware Registers (Source of Truth)
-        extras = ps.extra.vendor.setdefault("JEOL", {})
-        extras["objective_lens_coarse"] = self.get_objective_lens_coarse()
-        extras["objective_lens_fine"] = self.get_objective_lens_fine()
-        extras["objective_lens_superfine"] = self.get_objective_lens_superfine()
-        extras["objective_mini_lens_1"] = self.get_objective_mini_lens_1()
-        extras["objective_mini_lens_2"] = self.get_objective_mini_lens_2()
-        extras["focus_lens_coarse"] = self.get_focus_lens_coarse()
-        extras["focus_lens_fine"] = self.get_focus_lens_fine()
-        extras["intermediate_lens_1"] = self.get_intermediate_lens_1()
-        extras["intermediate_lens_2"] = self.get_intermediate_lens_2()
-        extras["intermediate_lens_3"] = self.get_intermediate_lens_3()
-        extras["intermediate_lens_4"] = self.get_intermediate_lens_4()
-        extras["projector_lens_1"] = self.get_projector_lens_1()
-        extras["projector_lens_2"] = self.get_projector_lens_2()
-        extras["projector_lens_3"] = self.get_projector_lens_3()
+        # 2. Instantiate Typed Vendor Extras in LENIENT mode
+        jeol_extras = JeolProjectionExtras(_mode=ParseMode.LENIENT)
 
-        # 3. Logical Properties
-        extras["diffraction_focus_index"] = self.get_diffraction_focus()
-        extras["image_shift_2"] = self.get_image_shift_2()
+        jeol_extras.objective_lens_coarse = self.get_objective_lens_coarse()
+        jeol_extras.objective_lens_fine = self.get_objective_lens_fine()
+        jeol_extras.objective_lens_superfine = self.get_objective_lens_superfine()
+        jeol_extras.objective_mini_lens_1 = self.get_objective_mini_lens_1()
+        jeol_extras.objective_mini_lens_2 = self.get_objective_mini_lens_2()
+        jeol_extras.focus_lens_coarse = self.get_focus_lens_coarse()
+        jeol_extras.focus_lens_fine = self.get_focus_lens_fine()
+        jeol_extras.intermediate_lens_1 = self.get_intermediate_lens_1()
+        jeol_extras.intermediate_lens_2 = self.get_intermediate_lens_2()
+        jeol_extras.intermediate_lens_3 = self.get_intermediate_lens_3()
+        jeol_extras.intermediate_lens_4 = self.get_intermediate_lens_4()
+        jeol_extras.projector_lens_1 = self.get_projector_lens_1()
+        jeol_extras.projector_lens_2 = self.get_projector_lens_2()
+        jeol_extras.projector_lens_3 = self.get_projector_lens_3()
+
+        jeol_extras.diffraction_focus_index = self.get_diffraction_focus()
+
+        if (v := self.get_image_shift_2()) != (None, None):
+            jeol_extras.image_shift_2 = v
+
+        # 3. Attach to canonical object
+        if not ps.extra:
+            ps.extra = Extras()
+        ps.extra.vendor["JEOL"] = jeol_extras
 
         return ps
 
@@ -2170,45 +2221,45 @@ class JeolMicroscope(TemMicroscope):
         # 1. Apply Standard Physics (Safe to call super)
         super().apply_projection_settings(settings, **kwargs)
 
-        # 2. Apply Register Overrides (Manual DAC Control)
+        # 2. Apply Register Overrides (Now a strongly-typed object)
         vend = getattr(settings.extra, "vendor", {})
-        jeol_v = vend.get("JEOL") if isinstance(vend, dict) else None
+        jeol_v = vend.get("JEOL")
 
-        if isinstance(jeol_v, dict):
-            if "objective_lens_coarse" in jeol_v:
-                self.set_objective_lens_coarse(jeol_v["objective_lens_coarse"])
-            if "objective_lens_fine" in jeol_v:
-                self.set_objective_lens_fine(jeol_v["objective_lens_fine"])
-            if "objective_lens_superfine" in jeol_v:
-                self.set_objective_lens_superfine(jeol_v["objective_lens_superfine"])
-            if "objective_mini_lens_1" in jeol_v:
-                self.set_objective_mini_lens_1(jeol_v["objective_mini_lens_1"])
-            if "objective_mini_lens_2" in jeol_v:
-                self.set_objective_mini_lens_2(jeol_v["objective_mini_lens_2"])
-            if "focus_lens_coarse" in jeol_v:
-                self.set_focus_lens_coarse(jeol_v["focus_lens_coarse"])
-            if "focus_lens_fine" in jeol_v:
-                self.set_focus_lens_fine(jeol_v["focus_lens_fine"])
-            if "intermediate_lens_1" in jeol_v:
-                self.set_intermediate_lens_1(jeol_v["intermediate_lens_1"])
-            if "intermediate_lens_2" in jeol_v:
-                self.set_intermediate_lens_2(jeol_v["intermediate_lens_2"])
-            if "intermediate_lens_3" in jeol_v:
-                self.set_intermediate_lens_3(jeol_v["intermediate_lens_3"])
-            if "intermediate_lens_4" in jeol_v:
-                self.set_intermediate_lens_4(jeol_v["intermediate_lens_4"])
-            if "projector_lens_1" in jeol_v:
-                self.set_projector_lens_1(jeol_v["projector_lens_1"])
-            if "projector_lens_2" in jeol_v:
-                self.set_projector_lens_2(jeol_v["projector_lens_2"])
-            if "projector_lens_3" in jeol_v:
-                self.set_projector_lens_3(jeol_v["projector_lens_3"])
-            if "image_shift_2" in jeol_v:
-                val = jeol_v["image_shift_2"]
-                if isinstance(val, (list, tuple)) and len(val) >= 2:
-                    self.set_image_shift_2(val[0], val[1])
-            if "diffraction_focus_index" in jeol_v:
-                self.set_diffraction_focus(jeol_v["diffraction_focus_index"])
+        if isinstance(jeol_v, JeolProjectionExtras):
+            if jeol_v.objective_lens_coarse is not None:
+                self.set_objective_lens_coarse(jeol_v.objective_lens_coarse)
+            if jeol_v.objective_lens_fine is not None:
+                self.set_objective_lens_fine(jeol_v.objective_lens_fine)
+            if jeol_v.objective_lens_superfine is not None:
+                self.set_objective_lens_superfine(jeol_v.objective_lens_superfine)
+            if jeol_v.objective_mini_lens_1 is not None:
+                self.set_objective_mini_lens_1(jeol_v.objective_mini_lens_1)
+            if jeol_v.objective_mini_lens_2 is not None:
+                self.set_objective_mini_lens_2(jeol_v.objective_mini_lens_2)
+            if jeol_v.focus_lens_coarse is not None:
+                self.set_focus_lens_coarse(jeol_v.focus_lens_coarse)
+            if jeol_v.focus_lens_fine is not None:
+                self.set_focus_lens_fine(jeol_v.focus_lens_fine)
+            if jeol_v.intermediate_lens_1 is not None:
+                self.set_intermediate_lens_1(jeol_v.intermediate_lens_1)
+            if jeol_v.intermediate_lens_2 is not None:
+                self.set_intermediate_lens_2(jeol_v.intermediate_lens_2)
+            if jeol_v.intermediate_lens_3 is not None:
+                self.set_intermediate_lens_3(jeol_v.intermediate_lens_3)
+            if jeol_v.intermediate_lens_4 is not None:
+                self.set_intermediate_lens_4(jeol_v.intermediate_lens_4)
+            if jeol_v.projector_lens_1 is not None:
+                self.set_projector_lens_1(jeol_v.projector_lens_1)
+            if jeol_v.projector_lens_2 is not None:
+                self.set_projector_lens_2(jeol_v.projector_lens_2)
+            if jeol_v.projector_lens_3 is not None:
+                self.set_projector_lens_3(jeol_v.projector_lens_3)
+
+            if jeol_v.diffraction_focus_index is not None:
+                self.set_diffraction_focus(jeol_v.diffraction_focus_index)
+
+            if jeol_v.image_shift_2 is not None:
+                self.set_image_shift_2(jeol_v.image_shift_2[0], jeol_v.image_shift_2[1])
 
     def perform_projection_action(self, action: str, **kwargs) -> None:
         act = action.upper().strip()
@@ -2704,9 +2755,8 @@ class JeolMicroscope(TemMicroscope):
 
     def get_detector_settings(self, detector_id: str) -> DetectorSettings:
         """
-        Override: Get full detector state including vendor extras (Gain, Offset, etc.).
-        Fetches the complete settings payload from hardware via `get_detectorsetting`
-        and uses the adapter to populate standard fields and extras.
+        Override: Get full detector state including vendor extras.
+        Converts the raw adapter dictionary into JeolDetectorExtras.
         """
         if self.det_mod is None:
             logger.debug("[DET] GetSettings failed: Hardware not connected.")
@@ -2714,13 +2764,20 @@ class JeolMicroscope(TemMicroscope):
 
         try:
             d = self._get_detector(detector_id)
-            # Fetch raw dict from PyJEM (contains GainIndex, ScanMode, etc.)
             raw = d.get_detectorsetting()
 
-            # Use adapter to parse standard fields AND pack unknown keys into extra.vendor['JEOL']
-            # Note: Expects adapter to return (DetectorSettings, DetectorCapabilities)
+            # The adapter puts raw keys into a dict at settings.extra.vendor["JEOL"]
             settings, _ = jeol_adapter.from_jeol_detector_response(raw, detector_id)
+
+            # UPGRADE: Convert the dict into our strongly-typed object
+            if settings.extra and "JEOL" in settings.extra.vendor:
+                raw_jeol = settings.extra.vendor["JEOL"]
+                if isinstance(raw_jeol, dict):
+                    typed_extras = JeolDetectorExtras.from_dict(raw_jeol, mode=ParseMode.LENIENT)
+                    settings.extra.vendor["JEOL"] = typed_extras
+
             return settings
+
         except Exception as e:
             logger.debug(f"[DET] GetSettings({detector_id}) failed: {e}")
             return DetectorSettings(detector_id=detector_id)
@@ -2728,9 +2785,6 @@ class JeolMicroscope(TemMicroscope):
     def apply_detector_settings(self, detector_id: str, settings: DetectorSettings, **kwargs) -> None:
         """
         Override: Apply settings using bulk setter to handle extras (Gain, Offset).
-        Standard atomic setters (e.g. set_detector_exposure) do not cover all vendor
-        capabilities. This method constructs a full configuration dictionary
-        (merging standard fields + extra.vendor['JEOL']) and sends it via `set_detectorsetting`.
         """
         if self.det_mod is None:
             logger.error("[DET] ApplySettings failed: Hardware not connected.")
@@ -2739,8 +2793,18 @@ class JeolMicroscope(TemMicroscope):
         try:
             d = self._get_detector(detector_id)
 
-            # Use adapter to convert standard fields + vendor extras back into a single JEOL dict
-            payload = jeol_adapter.to_jeol_detector_config(settings)
+            # Defensive Check: The adapter's `to_jeol_detector_config` likely expects
+            # a dictionary for vendor extras, not our new dataclass. We serialize
+            # it back to a dictionary specifically for the adapter to read.
+            settings_for_adapter = settings
+            vend = getattr(settings.extra, "vendor", {})
+            if isinstance(vend.get("JEOL"), JeolDetectorExtras):
+                import copy
+                settings_for_adapter = copy.deepcopy(settings)
+                settings_for_adapter.extra.vendor["JEOL"] = vend["JEOL"].to_dict()
+
+            # Use adapter to convert standard fields + vendor dict into JEOL payload
+            payload = jeol_adapter.to_jeol_detector_config(settings_for_adapter)
 
             if not payload:
                 logger.debug(f"[DET] ApplySettings({detector_id}): No changes in payload.")
