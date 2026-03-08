@@ -2,8 +2,8 @@
 
 import yaml
 import logging
-from supertem.config import SuperTEMContext, RegistryManager
-from supertem.utils import setup_session
+from supertem.registry import SuperTEMContext, RegistryManager
+from supertem.session import setup_session
 from supertem.routines.routine_factory import RoutineFactory
 from supertem.structures.base_structures import (
     StageMoveRequest, StageControlRequest, BeamControlRequest,

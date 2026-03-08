@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict
 
 from supertem.microscopes.base_microscope import TemMicroscope
-from supertem.config import SuperTEMContext
+from supertem.registry import SuperTEMContext
 
 class BaseRoutine(ABC):
     """The root class for all executable workflows."""

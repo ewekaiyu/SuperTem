@@ -87,7 +87,7 @@ from copy import deepcopy
 import yaml
 from PIL import Image
 
-from supertem.config import RegistryManager, SuperTEMContext
+from supertem.registry import RegistryManager, SuperTEMContext
 from supertem.microscopes.base_microscope import TemMicroscope
 from supertem.structures.base_structures import (
     MicroscopeImage,
@@ -233,7 +233,7 @@ def load_microscope(
 ) -> MicroscopeSettings:
     """Loads the microscope hardware configuration."""
     c_path = config_path or registry.get_active_config_path()
-    from supertem.config import DEFAULT_MICROSCOPE_CONFIGURATION_YAML
+    from supertem.registry import DEFAULT_MICROSCOPE_CONFIGURATION_YAML
 
     config_dict = load_yaml(Path(c_path), default=DEFAULT_MICROSCOPE_CONFIGURATION_YAML)
 

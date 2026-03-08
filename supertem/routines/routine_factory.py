@@ -5,7 +5,7 @@ The dynamic router that supplies vendor-specific routine implementations
 to the universal automation protocol.
 """
 import logging
-from supertem.config import SuperTEMContext
+from supertem.registry import SuperTEMContext
 from supertem.microscopes.base_microscope import TemMicroscope
 from supertem.routines.base_routines import BaseRoutine, AutoFocusRoutine, GunAlignmentRoutine
 
