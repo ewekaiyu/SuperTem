@@ -1,0 +1,203 @@
+"""
+supertem.structures.jeol_structures
+
+JEOL-specific hardware state and intent payloads.
+These strictly typed classes ride inside the extra.vendor["JEOL"] dictionaries
+of the canonical SuperTEM structures.
+
+They use ParserExtras to prevent infinite recursion during serialization.
+"""
+
+import dataclasses
+from dataclasses import dataclass, field
+from typing import Optional, Union, Any, Tuple
+
+# Import the core logic from the base file
+from supertem.structures.base_structures import (
+    ParseMode, FieldParser, Validator, ParserExtras, _auto_to_dict, _auto_from_dict, Quantity, Units
+)
+
+@dataclass
+class JeolBeamExtras:
+    """
+    JEOL-specific hardware state/intent for the Illumination system.
+    Rides inside BeamSettings.extra.vendor["JEOL"].
+    """
+    # Optics Controls
+    alpha_index: Optional[int] = None
+    brightness_value: Optional[int] = None
+    condenser_lens_1: Optional[int] = None
+    condenser_lens_2: Optional[int] = None
+    condenser_lens_3: Optional[int] = None
+
+    # Alignment Coils
+    spot_alignment: Optional[Tuple[int, int]] = None
+    condenser_alignment_1: Optional[Tuple[int, int]] = None
+    condenser_alignment_2: Optional[Tuple[int, int]] = None
+    gun_alignment_1: Optional[Tuple[int, int]] = None
+    gun_alignment_2: Optional[Tuple[int, int]] = None
+
+    # Source Control & Diagnostics
+    feg_emission_state: Optional[str] = None
+    gun_type_index: Optional[int] = None
+
+    # Quantities require _UNITS mapping for JSON serialization
+    gun_anode_1: Optional["Quantity"] = None
+    gun_anode_2: Optional["Quantity"] = None
+    gun_bias: Optional["Quantity"] = None
+    gun_filament: Optional["Quantity"] = None
+
+    # Recursion-Safe Data Plane Extra Bucket
+    extra: ParserExtras = field(default_factory=ParserExtras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    # --- SERIALIZATION CONFIGURATION ---
+    _UNITS = {
+        "gun_anode_1": Units.KV,
+        "gun_anode_2": Units.KV,
+        "gun_bias": Units.UA,
+        "gun_filament": "A"
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, self.__class__.__name__)
+        self.alpha_index = p.int(self.alpha_index, "alpha_index")
+        self.brightness_value = p.int(self.brightness_value, "brightness_value")
+        self.condenser_lens_1 = p.int(self.condenser_lens_1, "condenser_lens_1")
+        self.condenser_lens_2 = p.int(self.condenser_lens_2, "condenser_lens_2")
+        self.condenser_lens_3 = p.int(self.condenser_lens_3, "condenser_lens_3")
+
+        self.spot_alignment = p.pair_int(self.spot_alignment, "spot_alignment")
+        self.condenser_alignment_1 = p.pair_int(self.condenser_alignment_1, "condenser_alignment_1")
+        self.condenser_alignment_2 = p.pair_int(self.condenser_alignment_2, "condenser_alignment_2")
+        self.gun_alignment_1 = p.pair_int(self.gun_alignment_1, "gun_alignment_1")
+        self.gun_alignment_2 = p.pair_int(self.gun_alignment_2, "gun_alignment_2")
+
+        self.feg_emission_state = p.str(self.feg_emission_state, "feg_emission_state")
+        self.gun_type_index = p.int(self.gun_type_index, "gun_type_index")
+
+        self.gun_anode_1 = p.qty(self.gun_anode_1, "gun_anode_1", Units.KV)
+        self.gun_anode_2 = p.qty(self.gun_anode_2, "gun_anode_2", Units.KV)
+        self.gun_bias = p.qty(self.gun_bias, "gun_bias", Units.UA)
+        self.gun_filament = p.qty(self.gun_filament, "gun_filament", "A")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        # JEOL hardware limits checking
+        v.check(self.alpha_index is None or (0 <= self.alpha_index <= 8),
+                "alpha_index", "must be between 0 and 8",
+                heal=lambda: setattr(self, 'alpha_index', None))
+
+        v.check(self.brightness_value is None or (0 <= self.brightness_value <= 65535),
+                "brightness_value", "must be between 0 and 65535",
+                heal=lambda: setattr(self, 'brightness_value', None))
+
+        if self.feg_emission_state:
+             v.check(self.feg_emission_state.upper() in {"ON", "OFF", "TRUE", "FALSE"}, "feg_emission_state",
+                    "Must be ON or OFF", heal=lambda: setattr(self, 'feg_emission_state', None))
+
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self, unit_map=self._UNITS)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "JeolBeamExtras":
+        return _auto_from_dict(JeolBeamExtras, d, mode, alias_map={
+            "gun_anode_1": "gun_anode_1_kv",
+            "gun_anode_2": "gun_anode_2_kv",
+            "gun_bias": "gun_bias_ua",
+            "gun_filament": "gun_filament_a"
+        })
+
+
+@dataclass
+class JeolProjectionExtras:
+    """
+    JEOL-specific hardware state/intent for the Imaging system.
+    Rides inside ProjectionSettings.extra.vendor["JEOL"].
+    """
+    objective_lens_coarse: Optional[int] = None
+    objective_lens_fine: Optional[int] = None
+    objective_lens_superfine: Optional[int] = None
+    objective_mini_lens_1: Optional[int] = None
+    objective_mini_lens_2: Optional[int] = None
+    focus_lens_coarse: Optional[int] = None
+    focus_lens_fine: Optional[int] = None
+    intermediate_lens_1: Optional[int] = None
+    intermediate_lens_2: Optional[int] = None
+    intermediate_lens_3: Optional[int] = None
+    intermediate_lens_4: Optional[int] = None
+    projector_lens_1: Optional[int] = None
+    projector_lens_2: Optional[int] = None
+    projector_lens_3: Optional[int] = None
+
+    image_shift_2: Optional[Tuple[int, int]] = None
+    diffraction_focus_index: Optional[int] = None
+
+    extra: ParserExtras = field(default_factory=ParserExtras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, self.__class__.__name__)
+        # Simplified parsing for repetitive lens fields
+        for lens in [
+            "objective_lens_coarse", "objective_lens_fine", "objective_lens_superfine",
+            "objective_mini_lens_1", "objective_mini_lens_2",
+            "focus_lens_coarse", "focus_lens_fine",
+            "intermediate_lens_1", "intermediate_lens_2", "intermediate_lens_3", "intermediate_lens_4",
+            "projector_lens_1", "projector_lens_2", "projector_lens_3",
+            "diffraction_focus_index"
+        ]:
+            setattr(self, lens, p.int(getattr(self, lens), lens))
+
+        self.image_shift_2 = p.pair_int(self.image_shift_2, "image_shift_2")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        return v.valid
+
+    def to_dict(self) -> dict:
+        # No Quantities here, so no unit_map needed
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "JeolProjectionExtras":
+        return _auto_from_dict(JeolProjectionExtras, d, mode)
+
+
+@dataclass
+class JeolDetectorExtras:
+    """
+    JEOL-specific camera parameters.
+    Populated by jeol_adapter.from_jeol_detector_response.
+    Rides inside DetectorSettings.extra.vendor["JEOL"].
+    """
+    is_stem_detector: Optional[bool] = None
+
+    # Note: These are primitive floats defined by the adapter, not Pint Quantities.
+    # Therefore, they don't require _UNITS mapping.
+    dwell_time_us: Optional[float] = None
+    active_roi_source: Optional[str] = None
+    calculated_pixel_size_nm: Optional[float] = None
+
+    extra: ParserExtras = field(default_factory=ParserExtras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, self.__class__.__name__)
+        self.is_stem_detector = p.bool(self.is_stem_detector, "is_stem_detector")
+        self.dwell_time_us = p.float(self.dwell_time_us, "dwell_time_us")
+        self.active_roi_source = p.str(self.active_roi_source, "active_roi_source")
+        self.calculated_pixel_size_nm = p.float(self.calculated_pixel_size_nm, "calculated_pixel_size_nm")
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
+        v = Validator(self, mode)
+        return v.valid
+
+    def to_dict(self) -> dict:
+        return _auto_to_dict(self)
+
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "JeolDetectorExtras":
+        return _auto_from_dict(JeolDetectorExtras, d, mode)
