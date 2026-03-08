@@ -1,5 +1,5 @@
 """
-supertem.microscope
+supertem.microscopes.base_microscope
 
 The Hardware Abstraction Layer (HAL) and Control Plane Orchestrator.
 
@@ -148,6 +148,19 @@ logging rules:
               logger.error(f"[{TAG}] Write failed: {e}")
               raise
           ```
+
+===============================================================================
+VI. Payload Mutation Hooks
+===============================================================================
+
+To support strong typing for proprietary vendor parameters without breaking the
+universality of this base class, we use a Payload Mutation Pattern.
+
+Before executing a request, the Orchestrator calls a `_validate_vendor_...` hook.
+Vendor implementations (like JeolMicroscope) override these hooks to inspect
+`target.extra.vendor["VENDOR_NAME"]`, instantiate their specific strictly-typed
+dataclass (e.g., `JeolBeamExtras`), validate it, and replace the dictionary with
+the object IN PLACE.
 
 ===============================================================================
 Usage
@@ -301,6 +314,32 @@ class TemMicroscope(ABC):
         y = getattr(p, "y", None)
         if (x is None) ^ (y is None):
             raise ValueError(f"{name} requires both x and y when provided (got x={x}, y={y}).")
+
+    # =========================================================================
+    # VENDOR PAYLOAD MUTATION HOOKS
+    # =========================================================================
+    # Vendor subclasses override these to swap raw dicts with typed Extra Dataclasses.
+
+    def _validate_vendor_stage(self, target: StagePosition) -> None:
+        pass
+
+    def _validate_vendor_beam(self, target: BeamSettings) -> None:
+        pass
+
+    def _validate_vendor_projection(self, target: ProjectionSettings) -> None:
+        pass
+
+    def _validate_vendor_detector(self, target: DetectorSettings) -> None:
+        pass
+
+    def _validate_vendor_scan(self, target: ScanSettings) -> None:
+        pass
+
+    def _validate_vendor_vacuum(self, target: VacuumSettings) -> None:
+        pass
+
+    def _validate_vendor_aperture(self, target: ApertureSettings) -> None:
+        pass
 
     # =========================================================================
     # 1. Connection & Lifecycle
@@ -508,6 +547,9 @@ class TemMicroscope(ABC):
             if current is None:
                 raise RuntimeError("Relative move failed: Current stage position is unknown.")
             target_abs = current + request.target
+
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_stage(target_abs)
 
         # 2. Safety Check
         sys = self.system_settings.stage_system
@@ -809,6 +851,9 @@ class TemMicroscope(ABC):
         intent_str = " ".join(intent) if intent else "No Operation"
         logger.info(f"[BEAM] Control: {intent_str}")
 
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_beam(request.target)
+
         # Safety Check
         sys = self.system_settings.beam_system
         if sys and request.target:
@@ -1002,6 +1047,9 @@ class TemMicroscope(ABC):
 
         intent_str = " ".join(intent) if intent else "No Operation"
         logger.info(f"[PROJ] Control: {intent_str}")
+
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_projection(request.target)
 
         sys = self.system_settings.projection_system
         if sys and request.target:
@@ -1338,6 +1386,9 @@ class TemMicroscope(ABC):
         intent_str = " ".join(intent) if intent else "No Operation"
         logger.info(f"[DET] Executing Control on {request.detector_id}: {intent_str}")
 
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_detector(request.target)
+
         sys = self.system_settings.detector_system
         if sys and request.target:
             if not sys.is_supported(request.target):
@@ -1543,6 +1594,9 @@ class TemMicroscope(ABC):
 
         exec_opts = request.extra.options if request.extra else {}
 
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_scan(request.target)
+
         # 1. Settings
         if request.target:
             # (Safety checks...)
@@ -1659,6 +1713,8 @@ class TemMicroscope(ABC):
         logger.info(f"[VAC] Control: {' '.join(intent)}")
 
         exec_opts = request.extra.options if request.extra else {}
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_vacuum(request.target)
 
         if request.force is not None:
             exec_opts['force'] = request.force
@@ -1777,6 +1833,9 @@ class TemMicroscope(ABC):
             intent.append("(Relative)")
 
         logger.info(f"[APT] Control on '{request.aperture_id}': {' '.join(intent)}")
+
+        # PAYLOAD MUTATION HOOK
+        self._validate_vendor_aperture(request.target)
 
         sys = self.system_settings.aperture_system
         if sys:
