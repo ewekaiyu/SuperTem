@@ -25,52 +25,62 @@ enforces a strict separation of concerns via three distinct execution layers:
           *Rule:* Do NOT swallow hardware errors (IOError, Timeout) in this layer.
 
   2) The Helper Layer (The "Brain" - Vendor Overridden)
-     - Role: Bulk application, Unpacking, and **Vendor Validation**.
+     - Role: Bulk application, Unpacking, State Interlocks, and Action Execution.
      - Responsibility:
        a. Routes canonical physics (e.g. `voltage`) to atomic setters.
-       b. **Vendor Guard:** Extracts vendor-specific keys from `Extras` (e.g. registers,
-          indices), validates them against hardware limits, and RAISES error if invalid.
-       c. Prevents invalid vendor data from reaching the Atomic layer.
+       b. Action Safety: Enforces State Interlocks (e.g. "Is the stage safe to insert?").
      - Behavior:
-       - **Validation:** Enforces vendor-specific safety logic (raises ValueError).
+       - **Validation:** Enforces context-dependent safety logic.
        - **Pass-Through:** Does NOT catch hardware errors. If the Atomic layer explodes
          (e.g., IOError), the Helper layer MUST let the exception bubble up.
 
   3) The Orchestrator Layer (The "Gatekeeper" - Framework Provided)
-     - Role: The Control Plane Interface.
+     - Role: The Control Plane Interface (`execute_...` methods).
      - Responsibility:
        a. Validate the Intent (`request.validate()`).
-       b. Check Canonical Hardware Capabilities (`system.is_safe_...`).
-       c. Delegate to Helpers/Atomic methods for execution.
-     - Behavior:
-       - **Strict Safety:** Raises `RuntimeError` or `ValueError` to prevent unsafe moves.
-       - **Bubble Up:** Does NOT catch hardware errors. If the Atomic/Helper layers explode,
-         the Orchestrator lets the exception pass through to the user script.
+       b. Payload Mutation: Trigger vendor hooks to strongly-type Extra dictionaries.
+       c. Target Safety: Check Canonical Hardware Capabilities (`system.is_safe_...`).
+       d. Delegate to Helpers/Atomic methods for execution.
 
 ===============================================================================
-II. The Safety & Validation Contract
+II. Targets vs. Actions (The Safety Contract)
 ===============================================================================
 
-Safety is handled via a "Dual-Gatekeeper" model:
+Safety is handled via a "Dual-Gatekeeper" model based on the type of intent:
 
-  A. Canonical Safety (Handled by Orchestrator)
-     The base class Orchestrator validates standard physical properties against
-     `SystemSettings` limits (e.g., Voltage, Stage Limits).
-     *Result:* Safe canonical values reach the Helper layer.
+  A. Targets (Nouns) -> Bounds Checking (The Orchestrator)
+     When a request carries a `target` payload (e.g., 200kV, 10ms dwell time),
+     it undergoes mathematical Bounds Checking. The Orchestrator handles this
+     by running `sys.is_safe_...` against the canonical hardware limits before
+     any hardware command is issued.
 
-  B. Vendor Safety (Handled by Helper Overrides)
-     The Orchestrator CANNOT validate vendor-specific `Extras`. The Vendor Driver
-     MUST override Helper methods (e.g. `apply_beam_settings`) to validate these.
-     *Result:* The driver refuses to pass invalid indices to the Atomic layer.
+  B. Actions (Verbs) -> State Interlocks (The Helper Layer)
+     When a request carries an `action` (e.g., "INSERT", "START", "FLASH_FEG"),
+     it requires Contextual Safety. The Orchestrator cannot evaluate this mathematically.
+     Instead, the Vendor Helper layer handles it by checking the physical state
+     of the microscope (Interlocks) before executing the action.
 
 ===============================================================================
-III. Data Integrity & Parse Modes
+III. Payload Mutation Hooks (Vendor Data)
+===============================================================================
+
+To support strong typing for proprietary vendor parameters without breaking the
+universality of this base class, we use a Payload Mutation Pattern.
+
+Before executing a request, the Orchestrator calls a `_validate_vendor_...` hook.
+Vendor implementations (like JeolMicroscope) override these hooks to inspect
+`target.extra.vendor["VENDOR_NAME"]`, instantiate their specific strictly-typed
+dataclass (e.g., `JeolBeamExtras`), validate its hardware limits, and replace
+the untyped dictionary with the typed object IN PLACE.
+
+===============================================================================
+IV. Data Integrity & Parse Modes
 ===============================================================================
 
 Drivers must implement the "Ingress/Egress" policy using `base_structures.py` ParseModes:
 
   A. Egress (Control Plane / Writing to Hardware) -> ParseMode.STRICT
-     - Context: `apply_...` methods and `move_stage...`.
+     - Context: `apply_...` methods, orchestrators, and typed Extra hooks.
      - Rule: **Fail Fast.** If the input (canonical or vendor extra) is invalid
        or unsafe, raise an Exception immediately. Do not coerce. Do not guess.
 
@@ -78,13 +88,9 @@ Drivers must implement the "Ingress/Egress" policy using `base_structures.py` Pa
      - Context: `get_...` methods and `acquire_image`.
      - Rule: **Survive.** If hardware returns malformed data (e.g., NaN vacuum),
        coerce it to `None` or a safe default. Do not crash the logging loop.
-     - Implementation: Wrap Atomic Getters in try/except blocks that return `None`.
-
-  *Exception:* Critical navigation data (e.g., Stage Position) may use STRICT
-  mode on Ingress if corrupted data poses a physical collision risk.
 
 ===============================================================================
-IV. Type Safety & Return Policy
+V. Type Safety & Return Policy
 ===============================================================================
 
 To balance Safety (Control Logic) with Accuracy (Physics), this interface enforces
@@ -104,76 +110,49 @@ a strict return type policy for Atomic Getters:
      - Signature: `def get_x(self) -> str` (No Optional)
 
 ===============================================================================
-V. Logging Strategy (Intent vs. IO)
+VI. Logging Strategy (Intent vs. IO)
 ===============================================================================
 
 To maintain readability and traceability, drivers must strictly follow these
 logging rules:
 
 1. Layered Logging Levels
-   - **Orchestrator (INFO):** Logs high-level intent.
-     *Example:* `[STAGE] Executing Move: Target=(x=10um)...`
-   - **Helper (WARNING):** Logs safety interventions or clamps.
-     *Example:* `[BEAM] Spot Size 12 clamped to 5.`
+   - **Orchestrator (INFO):** Logs high-level intent (e.g. `[STAGE] Executing Move...`).
+   - **Helper (WARNING):** Logs safety interventions, interlocks, or clamps.
    - **Atomic (DEBUG):** Logs raw hardware I/O.
-     *Example:* `[PyJEM] Write: HT3.SetHtValue(200000)`
 
 2. Implementation Rules (Atomic Layer)
    Drivers must implement Atomic methods using this specific pattern:
 
-   A. **Consistent Logging (Setters):**
-      Always log the value *before* the hardware call.
-      *Pattern:* `logger.debug(f"[{TAG}] Setting {Name}: {Value}")`
+   A. **Consistent Error Handling (Getters):**
+      Catch Exception -> Log DEBUG -> Return None.
+      *Reason:* "Null means Unknown". Logging as ERROR causes spam during polling.
+        try:
+            return hardware.get_value()
+        except Exception as e:
+            logger.debug(f"[{TAG}] Read failed: {e}")
+            return None
 
-   B. **Consistent Error Handling:**
-      - **Getters (Read):** Catch Exception -> Log DEBUG -> Return None.
-        *Reason:* "Null means Unknown". Logging as ERROR causes log spam during
-        high-frequency polling.
-        *Code:*
-          ```python
-          try:
-              return hardware.get_value()
-          except Exception as e:
-              logger.debug(f"[{TAG}] Read failed: {e}")
-              return None
-          ```
-
-      - **Setters (Write):** Catch Exception -> Log ERROR -> Raise.
-        *Reason:* "Fail Loudly". Writes change state; silent failure is dangerous.
-        *Code:*
-          ```python
-          try:
-              hardware.set_value(val)
-          except Exception as e:
-              logger.error(f"[{TAG}] Write failed: {e}")
-              raise
-          ```
-
-===============================================================================
-VI. Payload Mutation Hooks
-===============================================================================
-
-To support strong typing for proprietary vendor parameters without breaking the
-universality of this base class, we use a Payload Mutation Pattern.
-
-Before executing a request, the Orchestrator calls a `_validate_vendor_...` hook.
-Vendor implementations (like JeolMicroscope) override these hooks to inspect
-`target.extra.vendor["VENDOR_NAME"]`, instantiate their specific strictly-typed
-dataclass (e.g., `JeolBeamExtras`), validate it, and replace the dictionary with
-the object IN PLACE.
+   B. **Consistent Error Handling (Setters):**
+      Catch Exception -> Log ERROR -> Raise.
+      *Reason:* "Fail Loudly". Writes change state; silent failure is dangerous.
+        logger.debug(f"[{TAG}] Setting Value: {val}")
+        try:
+            hardware.set_value(val)
+        except Exception as e:
+            logger.error(f"[{TAG}] Write failed: {e}")
+            raise
 
 ===============================================================================
 Usage
 ===============================================================================
 
-  # 1. Instantiate (usually via utils.setup_session)
+  # 1. Instantiate
   scope = JeolMicroscope(settings)
 
   # 2. Control (Use Orchestrators)
   req = StageMoveRequest(target=StagePosition(x=Q_(10, 'um')))
-  scope.execute_stage_move(req)  # -> Checks limits -> Delegates to safe_move_stage
-  -> Breaks into linear interpolations -> Calls apply_stage_position
-
+  scope.execute_stage_move(req)
 """
 
 from abc import ABC, abstractmethod
@@ -505,7 +484,8 @@ class TemMicroscope(ABC):
             r=self.get_stage_r(),
             tilt_x=self.get_stage_tilt_x(),
             tilt_y=self.get_stage_tilt_y(),
-            coordinate_system=self.get_stage_coordinate_system()
+            coordinate_system=self.get_stage_coordinate_system(),
+            _mode=ParseMode.LENIENT
         )
 
     def apply_stage_position(self, target: StagePosition, drive_type: str = "default", wait: bool = True,
@@ -758,15 +738,12 @@ class TemMicroscope(ABC):
 
     def get_beam_settings(self) -> BeamSettings:
         """Helper: Aggregates atomic beam state into a BeamSettings object."""
-        # Note: Point() construction handles the (None, None) case gracefully if needed,
-        # but we check explicit returns from atomics.
-
         bs, bt = self.get_beam_shift(), self.get_beam_tilt()
         cs = self.get_condenser_stigmation()
         gt = self.get_gun_tilt()
 
         return BeamSettings(
-            mode=self.get_mode(),  # Global mode usually lives here
+            mode=self.get_mode(),
             voltage=self.get_acceleration_voltage(),
             probe_mode=self.get_probe_mode(),
             beam_current=self.get_beam_current(),
@@ -774,12 +751,13 @@ class TemMicroscope(ABC):
             spot_size=self.get_spot_size(),
             convergence_angle=self.get_convergence_angle(),
             is_blanked=self.get_beam_blank(),
-
-            # Reconstruction of Points
-            beam_shift=Point(x=bs[0], y=bs[1]) if bs[0] is not None else None,
-            beam_tilt=Point(x=bt[0], y=bt[1]) if bt[0] is not None else None,
-            condenser_stigmation=Point(x=cs[0], y=cs[1]) if cs[0] is not None else None,
-            gun_tilt=Point(x=gt[0], y=gt[1]) if gt[0] is not None else None
+            # Note: Point() construction handles the (None, None) case gracefully if needed,
+            # but we check explicit returns from atomics.
+            beam_shift=Point(x=bs[0], y=bs[1], _mode=ParseMode.LENIENT) if bs[0] is not None else None,
+            beam_tilt=Point(x=bt[0], y=bt[1], _mode=ParseMode.LENIENT) if bt[0] is not None else None,
+            condenser_stigmation=Point(x=cs[0], y=cs[1], _mode=ParseMode.LENIENT) if cs[0] is not None else None,
+            gun_tilt=Point(x=gt[0], y=gt[1], _mode=ParseMode.LENIENT) if gt[0] is not None else None,
+            _mode=ParseMode.LENIENT  # <--- FIXED
         )
 
     def apply_beam_settings(self, settings: BeamSettings, **kwargs) -> None:
@@ -851,15 +829,16 @@ class TemMicroscope(ABC):
         intent_str = " ".join(intent) if intent else "No Operation"
         logger.info(f"[BEAM] Control: {intent_str}")
 
-        # PAYLOAD MUTATION HOOK
-        self._validate_vendor_beam(request.target)
+        if request.target:
+            # PAYLOAD MUTATION HOOK
+            self._validate_vendor_beam(request.target)
 
-        # Safety Check
-        sys = self.system_settings.beam_system
-        if sys and request.target:
-            check = sys.is_safe_beam(request.target)
-            if not check:
-                raise RuntimeError(f"Unsafe beam settings: {check.reasons}")
+            # Safety Check
+            sys = self.system_settings.beam_system
+            if sys:
+                check = sys.is_safe_beam(request.target)
+                if not check:
+                    raise RuntimeError(f"Unsafe beam settings: {check.reasons}")
 
         exec_opts = request.extra.options if request.extra else {}
 
@@ -984,11 +963,11 @@ class TemMicroscope(ABC):
             camera_length=self.get_camera_length(),
             defocus=self.get_defocus(),
             screen_position=self.get_screen_position(),
-
-            objective_stigmation=Point(x=obj_stig[0], y=obj_stig[1]) if obj_stig[0] is not None else None,
-            diffraction_stigmation=Point(x=diff_stig[0], y=diff_stig[1]) if diff_stig[0] is not None else None,
-            image_shift=Point(x=img_shift[0], y=img_shift[1]) if img_shift[0] is not None else None,
-            diffraction_shift=Point(x=diff_shift[0], y=diff_shift[1]) if diff_shift[0] is not None else None
+            objective_stigmation=Point(x=obj_stig[0], y=obj_stig[1], _mode=ParseMode.LENIENT) if obj_stig[0] is not None else None,
+            diffraction_stigmation=Point(x=diff_stig[0], y=diff_stig[1], _mode=ParseMode.LENIENT) if diff_stig[0] is not None else None,
+            image_shift=Point(x=img_shift[0], y=img_shift[1], _mode=ParseMode.LENIENT) if img_shift[0] is not None else None,
+            diffraction_shift=Point(x=diff_shift[0], y=diff_shift[1], _mode=ParseMode.LENIENT) if diff_shift[0] is not None else None,
+            _mode=ParseMode.LENIENT
         )
 
     def apply_projection_settings(self, settings: ProjectionSettings, **kwargs) -> None:
@@ -1048,14 +1027,15 @@ class TemMicroscope(ABC):
         intent_str = " ".join(intent) if intent else "No Operation"
         logger.info(f"[PROJ] Control: {intent_str}")
 
-        # PAYLOAD MUTATION HOOK
-        self._validate_vendor_projection(request.target)
+        if request.target:
+            # PAYLOAD MUTATION HOOK
+            self._validate_vendor_projection(request.target)
 
-        sys = self.system_settings.projection_system
-        if sys and request.target:
-            check = sys.is_safe_projection(request.target)
-            if not check:
-                raise RuntimeError(f"Unsafe projection settings: {check.reasons}")
+            sys = self.system_settings.projection_system
+            if sys:
+                check = sys.is_safe_projection(request.target)
+                if not check:
+                    raise RuntimeError(f"Unsafe projection settings: {check.reasons}")
 
         exec_opts = request.extra.options if request.extra else {}
 
@@ -1289,7 +1269,8 @@ class TemMicroscope(ABC):
             total_frames=self.get_detector_total_frames(detector_id),
             readout_mode=self.get_detector_readout_mode(detector_id),
             shutter_mode=self.get_detector_shutter_mode(detector_id),
-            save_frames=self.get_detector_save_frames(detector_id)
+            save_frames=self.get_detector_save_frames(detector_id),
+            _mode=ParseMode.LENIENT
         )
 
     def apply_detector_settings(self, detector_id: str, settings: DetectorSettings, **kwargs) -> None:
@@ -1386,13 +1367,14 @@ class TemMicroscope(ABC):
         intent_str = " ".join(intent) if intent else "No Operation"
         logger.info(f"[DET] Executing Control on {request.detector_id}: {intent_str}")
 
-        # PAYLOAD MUTATION HOOK
-        self._validate_vendor_detector(request.target)
+        if request.target:
+            # PAYLOAD MUTATION HOOK
+            self._validate_vendor_detector(request.target)
 
-        sys = self.system_settings.detector_system
-        if sys and request.target:
-            if not sys.is_supported(request.target):
-                raise RuntimeError("Detector settings not supported")
+            sys = self.system_settings.detector_system
+            if sys:
+                if not sys.is_supported(request.target):
+                    raise RuntimeError("Detector settings not supported")
 
         exec_opts = request.extra.options if request.extra else {}
 
@@ -1420,12 +1402,16 @@ class TemMicroscope(ABC):
         det_id = request.detector_id
         logger.info(f"[ACQ] Starting acquisition on '{det_id}'")
 
-        # 2. Check Hardware Capabilities
-        sys = self.system_settings.detector_system
-        if sys and request.detector:
-            check = sys.is_supported(request.detector)
-            if not check:
-                raise RuntimeError(f"Acquisition settings not supported: {check.reasons}")
+        if request.detector:
+            # PAYLOAD MUTATION HOOK
+            self._validate_vendor_detector(request.detector)
+
+            # 2. Check Hardware Capabilities
+            sys = self.system_settings.detector_system
+            if sys:
+                check = sys.is_supported(request.detector)
+                if not check:
+                    raise RuntimeError(f"Acquisition settings not supported: {check.reasons}")
 
         exec_opts = request.extra.options if request.extra else {}
 
@@ -1547,7 +1533,8 @@ class TemMicroscope(ABC):
             height_px=self.get_scan_height(),
             pixel_dwell_time=self.get_scan_pixel_dwell(),
             flyback_time=self.get_scan_flyback(),
-            scan_rotation=self.get_scan_rotation()
+            scan_rotation=self.get_scan_rotation(),
+            _mode=ParseMode.LENIENT
         )
 
     def apply_scan_settings(self, settings: ScanSettings, **kwargs) -> None:
@@ -1590,21 +1577,29 @@ class TemMicroscope(ABC):
         if request.target:
             intent.append(f"Target={self._summarize_patch(request.target)}")
 
-        logger.info(f"[SCAN] Control: {' '.join(intent)}")
+        intent_str = " ".join(intent) if intent else "No Operation"
+        logger.info(f"[SCAN] Control: {intent_str}")
+
+        if request.target:
+            # PAYLOAD MUTATION HOOK
+            self._validate_vendor_scan(request.target)
+
+            # CANONICAL SAFETY LIMITS (Fully Supported!)
+            sys = self.system_settings.scan_system
+            if sys:
+                check = sys.is_safe_scan(request.target)
+                if not check:
+                    raise RuntimeError(f"Unsafe scan settings: {check.reasons}")
 
         exec_opts = request.extra.options if request.extra else {}
 
-        # PAYLOAD MUTATION HOOK
-        self._validate_vendor_scan(request.target)
-
-        # 1. Settings
-        if request.target:
-            # (Safety checks...)
-            self.apply_scan_settings(request.target, **exec_opts)
-
-        # 2. Action (Delegated to Helper)
+        # 1. Action (State Interlocks via Helper)
         if request.action:
             self.perform_scan_action(request.action, **exec_opts)
+
+        # 2. Target (Apply bounds-checked settings)
+        if request.target:
+            self.apply_scan_settings(request.target, **exec_opts)
 
     # =========================================================================
     # 8. Vacuum Control
@@ -1678,7 +1673,8 @@ class TemMicroscope(ABC):
             turbo_pump_state=self.get_turbo_pump_state(),
             column_pressure=self.get_column_pressure(),
             gun_pressure=self.get_gun_pressure(),
-            buffer_tank_pressure=self.get_buffer_tank_pressure()
+            buffer_tank_pressure=self.get_buffer_tank_pressure(),
+            _mode=ParseMode.LENIENT
         )
 
     def apply_vacuum_settings(self, settings: VacuumSettings, **kwargs) -> None:
@@ -1712,10 +1708,11 @@ class TemMicroscope(ABC):
 
         logger.info(f"[VAC] Control: {' '.join(intent)}")
 
-        exec_opts = request.extra.options if request.extra else {}
-        # PAYLOAD MUTATION HOOK
-        self._validate_vendor_vacuum(request.target)
+        if request.target:
+            # PAYLOAD MUTATION HOOK
+            self._validate_vendor_vacuum(request.target)
 
+        exec_opts = request.extra.options if request.extra else {}
         if request.force is not None:
             exec_opts['force'] = request.force
 
@@ -1788,7 +1785,8 @@ class TemMicroscope(ABC):
             inserted=self.get_aperture_inserted(aperture_id),
             size_index=self.get_aperture_size_index(aperture_id),
             size_label=self.get_aperture_size_label(aperture_id),
-            position=self.get_aperture_position(aperture_id)
+            position=self.get_aperture_position(aperture_id),
+            _mode=ParseMode.LENIENT
         )
 
     def apply_aperture_settings(self, aperture_id: str, settings: ApertureSettings, **kwargs) -> None:
@@ -1834,34 +1832,31 @@ class TemMicroscope(ABC):
 
         logger.info(f"[APT] Control on '{request.aperture_id}': {' '.join(intent)}")
 
-        # PAYLOAD MUTATION HOOK
-        self._validate_vendor_aperture(request.target)
+        if request.target:
+            # PAYLOAD MUTATION HOOK
+            self._validate_vendor_aperture(request.target)
 
-        sys = self.system_settings.aperture_system
-        if sys:
-            check = sys.is_supported(request.target)
-            if not check:
-                raise RuntimeError(f"Aperture request rejected: {check.reasons}")
+            sys = self.system_settings.aperture_system
+            if sys:
+                check = sys.is_supported(request.target)
+                if not check:
+                    raise RuntimeError(f"Aperture request rejected: {check.reasons}")
 
         target = request.target
         a_id = request.aperture_id
 
-        # Handle Relative Position Logic
-        if request.relative and target.position:
-            # We need the current position to calculate the delta
+        # Handle Relative Position Logic (DEFENSIVE NULL CHECK ADDED)
+        if request.relative and target and target.position:
             current_pos = self.get_aperture_position(a_id)
             if current_pos is None:
                 raise RuntimeError(f"Relative move failed: Current position of '{a_id}' is unknown")
 
-            # Calculate new absolute position (manual vector addition)
             cur_x = current_pos.x if current_pos.x is not None else 0.0
             cur_y = current_pos.y if current_pos.y is not None else 0.0
 
             new_x = cur_x + (target.position.x if target.position.x is not None else 0.0)
             new_y = cur_y + (target.position.y if target.position.y is not None else 0.0)
 
-            # Update target with absolute position
-            # We use replace() to avoid mutating the original request object
             target = replace(target, position=replace(target.position, x=new_x, y=new_y))
 
         exec_opts = request.extra.options if request.extra else {}
@@ -1869,5 +1864,5 @@ class TemMicroscope(ABC):
         if request.action:
             self.perform_aperture_action(request.aperture_id, request.action, **exec_opts)
 
-        if request.target:
+        if target:
             self.apply_aperture_settings(request.aperture_id, target, **exec_opts)
