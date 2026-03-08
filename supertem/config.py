@@ -266,11 +266,41 @@ DEFAULT_MICROSCOPE_CONFIG_INDEX_YAML = {
     "default": "default-configuration",
 }
 
-DEFAULT_PROTOCOL_YAML = {"name": "demo", "description": "Default protocol", "steps": []}
+DEFAULT_PROTOCOL_YAML = {
+    "name": "Standard Grid Screening",
+    "version": "2.0",
+    "description": "High-level abstract workflow for finding and capturing samples.",
+    "steps": [
+        {
+            "routine": "initialize_microscope"
+        },
+        {
+            "routine": "align_beam",
+            "params": {
+                "mode": "high_res"
+            }
+        },
+        {
+            "routine": "search_sample",
+            "params": {
+                "grid_squares": 5
+            }
+        },
+        {
+            "routine": "capture_image",
+            "params": {
+                "exposure_time_ms": 250,
+                "output_dir": "./data/screening/"
+            }
+        }
+    ]
+}
+
 DEFAULT_PROTOCOL_INDEX_YAML = {
     "protocols": {"default-protocol": {"path": "protocol.yaml"}},
     "default": "default-protocol",
 }
+
 DEFAULT_POSITIONS_YAML = []
 
 

@@ -148,17 +148,17 @@ def save_yaml(path: Path, data: Any) -> None:
 # =============================================================================
 
 def setup_session(
-    context: SuperTEMContext,          # <--- REQUIRE CONTEXT
+    context: SuperTEMContext,
+    session_name: str = "manual_run",
     session_path: Optional[Path] = None,
     config_path: Optional[Path] = None,
-    protocol_path: Optional[Path] = None,
     setup_logging: bool = True,
     ip_address: Optional[str] = None,
     manufacturer: Optional[str] = None,
     debug: bool = False,
     profile_name: Optional[str] = None,
     offline: bool = False
-) -> Tuple[TemMicroscope, MicroscopeSettings]:
+) -> TemMicroscope:
     """Setup microscope session using registry-aware loading."""
 
     # 1. Instantiate Registry for this context
@@ -170,14 +170,14 @@ def setup_session(
         registry.active_config_name = profile_name
 
     # 2. Load settings (Uses base_structures.py STRICT mode for control-plane safety)
-    settings = load_microscope(registry, config_path, protocol_path, mode=ParseMode.STRICT)
+    settings = load_microscope(registry, config_path, mode=ParseMode.STRICT)
 
     # 3. Create session directories
-    session_name = f'{settings.protocol.get("name", "supertem")}_{current_timestamp()}'
+    folder_name = f'{session_name.replace(" ", "_")}_{current_timestamp()}'
 
     # Use context log_path if no override provided
     root_log = Path(session_path) if session_path else context.log_path
-    session_dir = root_log / session_name
+    session_dir = root_log / folder_name
     session_dir.mkdir(parents=True, exist_ok=True)
 
     if setup_logging:
@@ -191,15 +191,11 @@ def setup_session(
         settings.system.info.manufacturer = manufacturer
 
     if offline:
-        # We mark the model as offline. The JeolMicroscope driver looks for this string.
         current_model = settings.system.info.model or "Unknown"
         if "OFFLINE" not in current_model.upper():
             settings.system.info.model = f"{current_model} (Offline)"
-
-        # Optional: Set a safe dummy IP so connect() doesn't hang looking for real hardware
         if not ip_address:
             settings.system.info.ip_address = "127.0.0.1"
-
         logging.info(f"Session configured for EXPLICIT OFFLINE SIMULATION.")
 
     # Update dynamic output path
@@ -228,36 +224,18 @@ def setup_session(
 
     logging.info(f"Finished setup for session: {session_name}")
 
-    return microscope, settings
+    return microscope
 
 def load_microscope(
-    registry: RegistryManager,
-    config_path: Optional[Path] = None,
-    protocol_path: Optional[Path] = None,
-    mode: ParseMode = ParseMode.STRICT
+        registry: RegistryManager,
+        config_path: Optional[Path] = None,
+        mode: ParseMode = ParseMode.STRICT
 ) -> MicroscopeSettings:
-    """Orchestrates loading using the provided registry."""
-
-    # Use registry paths if not explicitly provided
+    """Loads the microscope hardware configuration."""
     c_path = config_path or registry.get_active_config_path()
-    p_path = protocol_path or registry.get_active_protocol_path()
-
-    # Default dicts are stateless, so importing from config is safe
-    from supertem.config import DEFAULT_MICROSCOPE_CONFIGURATION_YAML, DEFAULT_PROTOCOL_YAML
+    from supertem.config import DEFAULT_MICROSCOPE_CONFIGURATION_YAML
 
     config_dict = load_yaml(Path(c_path), default=DEFAULT_MICROSCOPE_CONFIGURATION_YAML)
-    protocol_dict = load_yaml(Path(p_path), default=DEFAULT_PROTOCOL_YAML)
-
-    # Ingest using base_structures.py logic
-    if isinstance(config_dict, dict):
-        embedded_protocol = config_dict.get("protocol")
-        if protocol_dict not in (None, {}, [], ""):
-            config_dict["protocol"] = protocol_dict
-        elif embedded_protocol not in (None, {}, [], ""):
-            # legacy: protocol embedded in microscope config
-            config_dict["protocol"] = embedded_protocol
-        else:
-            config_dict["protocol"] = protocol_dict
 
     return MicroscopeSettings.from_dict(config_dict, mode=mode)
 

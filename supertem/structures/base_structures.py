@@ -3744,11 +3744,9 @@ class MicroscopeSettings:
     Attributes:
         system (Optional[SystemSettings]): Hardware limits and registries.
         image (Optional[ImageOutputSettings]): Default output settings.
-        protocol (Optional[dict]): Automation scripts configuration.
     """
     system: Optional[SystemSettings] = None
     image: Optional[ImageOutputSettings] = None
-    protocol: Optional[dict] = None
     extra: Extras = field(default_factory=Extras)
     _mode: ParseMode = field(default=ParseMode.STRICT, repr=False, compare=False)
 
@@ -3756,7 +3754,6 @@ class MicroscopeSettings:
         p = FieldParser(self, self._mode, self.__class__.__name__)
         self.system = p.model(SystemSettings, self.system, "system", default=SystemSettings(_mode=p.mode))
         self.image = p.model(ImageOutputSettings, self.image, "image", default=ImageOutputSettings(_mode=p.mode))
-        self.protocol = p.dict(self.protocol, "protocol", default={"name": "demo"})
 
     def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool:
         v = Validator(self, mode)
