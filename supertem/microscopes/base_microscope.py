@@ -9,38 +9,33 @@ operational "Verb" layer corresponding to the "Noun" structures defined in
 `supertem.structures.base`.
 
 ===============================================================================
-I. The Three-Layer Architecture
+I. The SuperTEM Constitution (Execution Layers & Boundaries)
 ===============================================================================
 
-To ensure safety and consistency across different hardware vendors, this class
-enforces a strict separation of concerns via three distinct execution layers:
+To ensure safety and prevent thread collisions, this class enforces a strict
+separation of concerns. Vendor drivers must map their code to these three layers:
 
-  1) The Atomic Layer (The "Hands" - Abstract & Vendor Implemented)
-     - Role: Direct, unbuffered hardware I/O.
-     - Responsibility: Dumb I/O. If asked to set an unsafe value (e.g. index 99),
-       it attempts it without second-guessing.
-     - Behavior:
-        - READ (Getters): "Null means Unknown". Returns `None` on failure, never defaults.
-        - WRITE (Setters): "Fail Loudly". Raises exceptions if hardware rejects the command.
-          *Rule:* Do NOT swallow hardware errors (IOError, Timeout) in this layer.
+  1) The Orchestrator Layer (The "Gatekeeper" - Framework Provided)
+     - Role: The Control Plane Interface (`execute_...` methods).
+     - Responsibility: Validates Intent (`request.validate()`), runs mathematical
+       Bounds Checking (`system.is_safe_...`), and triggers payload mutation.
 
   2) The Helper Layer (The "Brain" - Vendor Overridden)
-     - Role: Bulk application, Unpacking, State Interlocks, and Action Execution.
-     - Responsibility:
-       a. Routes canonical physics (e.g. `voltage`) to atomic setters.
-       b. Action Safety: Enforces State Interlocks (e.g. "Is the stage safe to insert?").
-     - Behavior:
-       - **Validation:** Enforces context-dependent safety logic.
-       - **Pass-Through:** Does NOT catch hardware errors. If the Atomic layer explodes
-         (e.g., IOError), the Helper layer MUST let the exception bubble up.
+     - Role: Routes canonical physics to atomic setters and handles State Interlocks.
+     - The Boundary Rule (No Algorithms): This layer cannot analyze data or run
+       cognitive loops (e.g., "Is the image sharp yet?"). If a feature fails due to
+       a scientific limitation, it is a Routine and MUST NOT be in the driver.
+     - Allowed Exemptions:
+       a. Stateless Math: Reading state, calculating a delta, and executing a
+          single write (e.g., shifting focus by +50nm).
+       b. Hardware Stabilization: Bounded `while/sleep` loops used ONLY to mask
+          slow mechanics (motors) or vendor physical quirks (hysteresis). These
+          MUST implement strict timeouts.
 
-  3) The Orchestrator Layer (The "Gatekeeper" - Framework Provided)
-     - Role: The Control Plane Interface (`execute_...` methods).
-     - Responsibility:
-       a. Validate the Intent (`request.validate()`).
-       b. Payload Mutation: Trigger vendor hooks to strongly-type Extra dictionaries.
-       c. Target Safety: Check Canonical Hardware Capabilities (`system.is_safe_...`).
-       d. Delegate to Helpers/Atomic methods for execution.
+  3) The Atomic Layer (The "Hands" - Vendor Implemented)
+     - Role: Direct, unbuffered hardware I/O.
+     - Responsibility: Dumb I/O. Zero math, zero logic. If asked to set an unsafe
+       value, it attempts it without second-guessing.
 
 ===============================================================================
 II. Targets vs. Actions (The Safety Contract)

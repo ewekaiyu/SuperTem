@@ -1699,29 +1699,6 @@ class JeolMicroscope(TemMicroscope):
         elif act == "WOBBLE_A2":
             self.trigger_a2_wobbler_on() if kwargs.get("active", True) else self.trigger_a2_wobbler_off()
 
-        elif act == "WOBBLE_TILT":
-            amp_x = int(kwargs.get("amp_x", 200))
-            amp_y = int(kwargs.get("amp_y", 0))
-            cycles = int(kwargs.get("cycles", 5))
-            delay = float(kwargs.get("delay", 0.15))
-
-            cx_raw, cy_raw = self.get_beam_tilt()
-            if cx_raw is None or cy_raw is None:
-                raise RuntimeError("Cannot wobble: Current Beam Tilt unknown.")
-
-            cx, cy = float(cx_raw), float(cy_raw)
-            logger.info(f"[BEAM] Starting Tilt Wobbler (Center: {cx:.0f},{cy:.0f})")
-
-            try:
-                for _ in range(cycles):
-                    self.set_beam_tilt(cx + amp_x, cy + amp_y)
-                    time.sleep(delay)
-                    self.set_beam_tilt(cx - amp_x, cy - amp_y)
-                    time.sleep(delay)
-            finally:
-                self.set_beam_tilt(cx, cy)
-                logger.debug("[BEAM] Tilt Wobbler finished.")
-
         else:
             super().perform_beam_action(action, **kwargs)
 
