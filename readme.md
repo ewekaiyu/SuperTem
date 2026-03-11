@@ -1,136 +1,125 @@
 # SuperTEM
+
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-一个为透射电子显微镜设计的、语言无关的抽象控制接口。本项目旨在通过定义一套标准化的、最小粒度的“原子”操作，为不同厂商（如 Thermo Fisher, JEOL, Nion 等）的 TEM 设备提供统一的 Python 控制层，从而简化上层应用（如自动化实验、数据采集、AI 控制）的开发。
-## 核心目标
-- **统一性**: 为不同品牌的 TEM 提供一致的编程接口。
-- **原子化**: 将复杂的显微镜操作分解为最小、最基础的控制指令。
-- **可扩展性**: 轻松添加对新厂商或新功能的支持，而不影响现有代码。
-- **清晰性**: 基于抽象基类（ABC）强制实现，确保接口的完整性和一致性。
-## 安装
+
+SuperTEM is a strictly-typed, hardware-agnostic Hardware Abstraction Layer (HAL) and automation framework for Transmission Electron Microscopes (TEMs). 
+
+By enforcing strict boundaries between physical hardware I/O, mathematical state validation, and cognitive scientific algorithms, SuperTEM provides a universal, crash-resistant Python control layer for microscopes from different vendors (e.g., JEOL, Thermo Fisher, Nion).
+
+## 🏛️ The SuperTEM Architecture (The 4 Tiers)
+
+To prevent "spaghetti hardware state" and thread collisions, SuperTEM strictly classifies all operations into four execution tiers:
+
+1. **Protocols (The Scientist):** Declarative YAML configurations that string together complex sequences. They contain zero math, algorithms, or hardware logic.
+2. **Routines (The Algorithms):** Goal-oriented, closed-loop software processes (e.g., AutoFocus, Grid Mapping). This is the *only* layer allowed to use `time.sleep()`, run continuous `while` loops, or calculate relative math based on image feedback. Routines never talk to hardware directly.
+3. **The HAL / Orchestrator (The Reflexes):** The Control Plane gatekeeper (`base_microscope.py`). It validates intents, performs mathematical bounds checking (`sys.is_safe_...`), and manages state interlocks (e.g., ensuring the gun valve is open before unblanking the beam). 
+4. **The Atomic Drivers (The Nerve Endings):** Direct, unbuffered hardware I/O (e.g., `jeol_microscope.py` wrapping `PyJEM`). Pure execution with zero logic. 
+
+## 🛡️ Core Safety Philosophies
+
+SuperTEM is built for production-grade, safety-critical hardware automation. It enforces the following rules:
+
+* **The Dual-Gatekeeper:** Targets (Nouns) undergo mathematical Bounds Checking by the Orchestrator. Actions (Verbs) undergo Contextual State Interlock checking by the Vendor Helper layer.
+* **Ingress vs. Egress (Data Plane vs. Control Plane):** * *Ingress (Telemetry):* Uses `ParseMode.LENIENT`. Hardware is messy; if a sensor returns garbage, the system survives and logs the anomaly without crashing.
+  * *Egress (Commands):* Uses `ParseMode.STRICT`. If an untrusted payload attempts to move the stage with a string instead of a float, the system fails instantly before the command leaves Python.
+* **Null Means Unknown & Fail Loudly:** When querying hardware, a failed read returns `None` (Null means Unknown) to keep polling loops clean. When writing to hardware, a rejected command raises an exception immediately (Fail Loudly).
+* **Vendor Payload Mutation:** Proprietary hardware quirks (e.g., JEOL Alpha Selectors) are isolated inside `Extra` dataclasses, allowing the core structures to remain universally compatible without sacrificing vendor-specific power.
+
+## 📂 Project Structure
+
+```text
+supertem/
+├── structures/         # The Data Plane: Strongly-typed Nouns (Settings, Intents, States)
+│   ├── base_structures.py   # Universal canonical models
+│   └── jeol_structures.py   # Vendor-specific mutated payloads
+├── microscopes/        # The Control Plane: The HAL and Vendor Drivers (Verbs)
+│   ├── base_microscope.py   # The Orchestrator (Bounds checking & routing)
+│   └── jeol_microscope.py   # The Atomic Driver (PyJEM execution)
+├── routines/           # The Cognitive Plane: Algorithms and Math
+│   ├── base_routines.py     # Abstract blueprints (e.g., AutoFocusRoutine)
+│   ├── jeol_routines.py     # Vendor-optimized routine implementations
+│   └── routine_factory.py   # Dynamic router for dependency injection
+├── registry.py         # Configuration bootstrap & Dependency Injection context
+├── session.py          # Session orchestration and environment setup
+└── protocol.py         # The Automation Executor (YAML sequence runner)
+```
+
+## 🚀 Installation
+
 ```bash
 pip install SuperTEM
 ```
-> **注意**: 这是一个接口定义库。要实际控制显微镜，还需要安装对应厂商的具体实现包（例如 `PyJEM`）。
-## 快速开始
-### 1. 定义厂商实现
-首先，厂商或开发者需要创建一个继承自 `TemMicroscope` 的具体实现类。以下是一个连接到虚构 "SuperTem" 品牌显微镜的示例：
+> **Note:** SuperTEM is the abstraction framework. To actually drive hardware, you must install the corresponding vendor SDK in your environment (e.g., `PyJEM` for JEOL).
+
+## ⚡ Quickstart
+
+SuperTEM utilizes explicit Dependency Injection to manage hardware states and environments. 
+
+### 1. Executing a Full Protocol (The Scientist)
+Because the `ProtocolExecutor` manages the environment context, logging, and hardware initialization internally, running an entire automated YAML experiment only takes two lines of code.
+
 ```python
-from supertem.structures.base import SystemSettings, ImageSettings, TemStagePosition, TemImage
-from tem_microscope_interface import TemMicroscope
-class SuperTemMicroscope(TemMicroscope):
-    """SuperTem 品牌显微镜的具体实现"""
-    def __init__(self):
-        self._connection = None
-    def connect_to_microscope(self, ip_address: str, port: int, timeout_s: float = 10.0) -> None:
-        """使用 TCP Socket 连接到 SuperTem 控制器"""
-        print(f"正在连接到 {ip_address}:{port}...")
-        # 这里是实际的连接逻辑，例如使用 socket 库
-        self._connection = f"连接到 {ip_address}:{port}" # 模拟连接对象
-        print("连接成功！")
-    def disconnect(self) -> None:
-        """断开连接"""
-        if self._connection:
-            print("正在断开连接...")
-            self._connection = None
-            print("已断开连接。")
-    def is_connected(self) -> bool:
-        """检查连接状态"""
-        return self._connection is not None
-    def get_instrument_info(self) -> Dict[str, Any]:
-        """获取仪器信息"""
-        if not self.is_connected():
-            raise ConnectionError("未连接到显微镜")
-        return {
-            "vendor": "SuperTem Inc.",
-            "model": "ST-3000X",
-            "serial_number": "SN123456789",
-            "firmware_version": "2.1.5"
-        }
-    def get_status(self) -> Dict[str, Any]:
-        """获取当前仪器状态"""
-        if not self.is_connected():
-            raise ConnectionError("未连接到显微镜")
-        return {
-            "vacuum": "OK",
-            "high_voltage": "ON",
-            "column_valves": "OPEN",
-            "stage_position": TemStagePosition(x=0.0, y=0.0, z=0.0, a=0.0, b=0.0)
-        }
-    # ... 必须实现所有其他抽象方法 ...
+from supertem.protocol import ProtocolExecutor
+
+# 1. Instantiate the executor (automatically loads the active YAML and sets up logging)
+executor = ProtocolExecutor(profile_name="jeol_production")
+
+# 2. Run the entire automated experiment
+executor.execute()
 ```
-### 2. 使用统一接口进行控制
-上层应用程序现在可以使用这个统一接口，而无需关心底层是哪个品牌的显微镜。
+
+### 2. Executing a Scientific Workflow (Routine)
+If you are writing custom Python scripts and want to utilize a specific algorithm without a YAML file, you can call the Routine directly.
+
 ```python
-# 假设上面的 SuperTemMicroscope 类已定义
-def run_experiment(microscope: TemMicroscope):
-    """一个与厂商无关的实验流程"""
-    try:
-        # 1. 获取仪器信息
-        info = microscope.get_instrument_info()
-        print(f"当前仪器: {info['vendor']} {info['model']}")
-        # 2. 检查状态
-        status = microscope.get_status()
-        print(f"真空状态: {status['vacuum']}")
-        # 3. 执行其他控制操作...
-        # microscope.move_stage(...)
-        # microscope.acquire_image(...)
-    except Exception as e:
-        print(f"实验出错: {e}")
-    finally:
-        # 确保断开连接
-        microscope.disconnect()
-# --- 主程序 ---
-if __name__ == "__main__":
-    # 初始化具体的显微镜实例
-    my_tem = SuperTemMicroscope()
-    # 连接
-    my_tem.connect_to_microscope(ip_address="192.168.0.10", port=8000)
-    # 运行与厂商无关的实验
-    run_experiment(my_tem)
+from supertem.registry import SuperTEMContext
+from supertem.session import setup_session
+from supertem.routines.routine_factory import RoutineFactory
+
+context = SuperTEMContext.production()
+scope = setup_session(context=context, session_name="Routine_Test")
+
+# Ask the Factory for the correct Routine based on the connected hardware
+factory = RoutineFactory(scope, context, scope._settings)
+autofocus = factory.get_routine("autofocus")
+
+# Execute the time-blocking algorithm safely
+result = autofocus.execute(target_defocus_nm=0.0)
+print(result)
 ```
-## 核心组件
-### `TemMicroscope` 抽象基类
-这是项目的核心，位于 `tem_microscope_interface/tem_microscope.py`。它定义了所有 TEM 控制器必须实现的方法。
-#### 已定义的接口模块：
-1.  **连接与会话管理**
-    - `connect_to_microscope()`: 建立与仪器的连接。
-    - `disconnect()`: 断开连接并释放资源。
-    - `is_connected()`: 检查当前连接状态。
-2.  **仪器信息与状态**
-    - `get_instrument_info()`: 获取厂商、型号、固件版本等静态信息。
-    - `get_status()`: 获取真空、高压、样品台位置等动态状态。
-3.  **仪器控制** (规划中)
-    - 样品台控制
-    - 束流控制
-    - 透镜系统控制
-    - 图像采集
-    - ... 更多模块
-### `supertem.structures.base`
-定义了接口中使用的标准数据结构，确保了数据传递的一致性。
-- `SystemSettings`: 系统级设置。
-- `ImageSettings`: 图像采集相关设置。
-- `TemStagePosition`: 样品台位置信息。
-- `TemImage`: 采集到的图像数据。
-## 🛠️ 开发路线图
-- [x] **核心接口定义**: 完成连接、状态查询等基础接口。
-- [ ] **样品台控制**: 实现样品台移动、位置获取等原子操作。
-- [ ] **束流与透镜控制**: 实现束流对中、聚焦、消像散等控制。
-- [ ] **图像采集**: 实现相机参数设置、图像采集与获取。
-- [ ] **自动化与脚本**: 提供更高级别的组合操作接口。
-- [ ] **官方厂商驱动**: 推动或协助主流厂商提供官方实现。
-## 🤝 贡献
-我们欢迎社区贡献！如果您想为项目添砖加瓦，请遵循以下步骤：
-1.  Fork 本仓库。
-2.  创建您的特性分支 (`git checkout -b feature/AmazingFeature`)。
-3.  提交您的更改 (`git commit -m 'Add some AmazingFeature'`)。
-4.  推送到分支 (`git push origin feature/AmazingFeature`)。
-5.  开启一个 Pull Request。
-在贡献代码前，请确保：
-- 代码符合 PEP 8 规范。
-- 添加了必要的单元测试。
-- 更新了相关文档。
-## 📄 许可证
-本项目采用 MIT 许可证。详情请参阅 [LICENSE](LICENSE) 文件。
----
-**免责声明**: 本项目仅提供抽象接口定义，不包含任何特定厂商设备的实际驱动代码。用户需自行获取或开发对应的具体实现。
+
+### 3. Executing a Direct Command (Action)
+If you just want to move the hardware directly via the Orchestrator, bypassing all routines.
+
+```python
+from supertem.registry import SuperTEMContext
+from supertem.session import setup_session
+from supertem.structures.base_structures import StageMoveRequest, StagePosition, Q_, ParseMode
+
+context = SuperTEMContext.production()
+scope = setup_session(context=context, session_name="Manual_Run")
+
+# Create a mathematically safe, strictly-parsed request
+request = StageMoveRequest(
+    target=StagePosition(x=Q_(10, 'um')),
+    mode=ParseMode.STRICT
+)
+
+# Execute via the Orchestrator (handles bounds-checking and interlocks automatically)
+scope.execute_stage_move(request)
+```
+
+## 🤝 Contributing
+
+Contributions are welcome! If you are building a new vendor driver (e.g., Thermo Fisher) or adding new complex scientific routines, please follow these steps:
+
+1. Fork the repository.
+2. Create a new branch for your feature (`git checkout -b feature/my-new-driver`).
+3. **Important:** Ensure your code adheres to the "SuperTEM Constitution" outlined in the module docstrings (especially the Execution Tier rules in `base_microscope.py` and `base_routines.py`).
+4. Commit your changes and push to the branch.
+5. Open a Pull Request.
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
