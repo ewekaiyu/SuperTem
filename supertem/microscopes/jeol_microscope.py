@@ -1,131 +1,45 @@
 """
-supertem.jeol_microscope
+supertem.microscopes.jeol_microscope
 
 JEOL TEM driver implementation for the SuperTEM hardware abstraction layer.
 
-This module provides :class:`JeolMicroscope`, a concrete implementation of
-:class:`~supertem.microscope.TemMicroscope` wrapping the `PyJEM` (TEM3) interface.
+This module provides `JeolMicroscope`, a concrete implementation of
+`TemMicroscope` wrapping the `PyJEM` (TEM3/EOS3/Stage3) interface.
 
 ===============================================================================
-I. Implementation Specifics
+I. Module Responsibility
 ===============================================================================
-
-This driver adheres to the strict safety contract defined in `supertem.microscope`.
-It maps the standard layers to JEOL hardware as follows:
-
-  1) Atomic Layer: Wraps `PyJEM` calls (TEM3, EOS3, Stage3).
-     - **Error Handling:** Raises `PyJEM` exceptions directly in Setters (Fail Loudly).
-     - **Data Handling:** Returns `None` in Getters if `PyJEM` fails or returns
-       invalid data, strictly following "Null means Unknown".
-
-  2) Helper Layer:
-     - **Vendor Validation:** `apply_beam_settings` validates that `alpha_index`
-       is within the hardware limit (0-8) before execution.
-     - **Mapping:** Translates canonical `defocus` (nm) to `OLc` (DAC) *only if*
-       a calibration scale is provided.
+This file is strictly responsible for translating canonical SuperTEM control
+intents into proprietary JEOL hardware commands. It manages the raw PyJEM
+communications and enforces JEOL-specific physical safety limits.
 
 ===============================================================================
-II. Supported Vendor Extras
+II. Vendor-Specific Implementations
 ===============================================================================
+1) PyJEM I/O
+   - Getters: Catch `PyJEM` exceptions and return `None` to prevent telemetry crashes.
+   - Setters: Pass `PyJEM` exceptions directly up the stack to fail loudly on rejected writes.
 
-This driver utilizes the `Extras.vendor['JEOL']` dictionary to expose hardware
-capabilities that do not map to canonical physics.
-
-  - `alpha_index` (int):
-    The convergence angle selector (0-8). Used because JEOL does not report
-    physical convergence angles (mrad) without external calibration.
-
-  - `defocus_olc_dac` (int):
-    The raw Objective Lens Coarse DAC value. Populated in `ProjectionSettings`
-    when `defocus_scale` is not configured.
-
-  - `mag_selector` (int):
-    The raw magnification index. Used when `Magnification` (float) is ambiguous.
+2) Vendor Extras Validation
+   - Extracts and validates `target.extra.vendor['JEOL']`.
+   - Enforces hardware-specific bounds, such as ensuring `alpha_index` is
+     within the permitted 0-8 range before applying beam settings.
+   - Maps physical canonical units (e.g., defocus in nm) to JEOL DAC values (OLc)
+     when calibration profiles are present.
 
 ===============================================================================
-III. Hardware Quirks & Workarounds
+III. JEOL Hardware Quirks & Workarounds
 ===============================================================================
+This driver implements specific workarounds for known JEOL physical quirks:
 
-  - **Stage Hysteresis:** JEOL stages may report "Idle" (0) momentarily during
-    direction changes. This driver's `move_stage_absolute` implements a custom
-    retry loop that waits for *stable* idle status.
+  - Stage Hysteresis: JEOL motorized stages frequently report a momentary "Idle" (0)
+    status when changing mechanical direction. To counter this, `move_stage_absolute`
+    implements a bounded timeout/retry loop to verify the stage has stably settled
+    within tolerance before returning control.
 
-  - **Detector Sync:** If the active detector is offline, `set_scan_active` will
-    fall back to the internal scan generator to prevent beam damage (static beam).
-
-  - **Lazy Loading:** `PyJEM` is imported only upon instantiation. This allows
-    the class to be imported in simulation/offline environments without crashing.
-
-===============================================================================
-IV. Developer Guide (Atomic Method Boilerplate)
-===============================================================================
-
-When adding new hardware controls, strictly follow these patterns to maintain
-architectural compliance.
-
-**Pattern A: Atomic Getter (Null means Unknown)**
-    def get_hardware_value(self) -> Optional[Type]:
-        if not self.hardware:
-            # Log at DEBUG (not ERROR) to prevent spam during polling
-            logger.debug("[TAG] GetValue failed: Hardware disconnected.")
-            return None
-
-        try:
-            val = self.hardware.GetValue()
-            return _clean_or_convert(val)
-        except Exception as e:
-            logger.debug(f"[TAG] GetValue failed: {e}")
-            return None
-
-**Pattern B: Atomic Setter (Fail Loudly)**
-    def set_hardware_value(self, value: Type) -> None:
-        if not self.hardware:
-            # Setters MUST fail loudly if hardware is missing
-            logger.error("[TAG] SetValue failed: Hardware disconnected.")
-            raise RuntimeError("Hardware disconnected.")
-
-        logger.debug(f"[TAG] SetValue({value})")  # Log intent BEFORE action
-        try:
-            self.hardware.SetValue(value)
-        except Exception as e:
-            logger.error(f"[TAG] SetValue failed: {e}")  # ERROR log
-            raise  # Always re-raise
-
-===============================================================================
-V. Configuration Example
-===============================================================================
-
-The JEOL driver relies on specific `extra.vendor["JEOL"]` keys for features that
-do not map to standard physics (e.g. Alpha Selector, OLc DAC).
-
-    settings = MicroscopeSettings(
-        system=SystemSettings(
-            # ... standard limits ...
-        ),
-        # GLOBAL VENDOR EXTRAS
-        extra=Extras(vendor={"JEOL": {}})
-    )
-
-    # 1. BEAM SETTINGS (Alpha Selector)
-    # The driver reads 'alpha_index' from here to set the convergence angle.
-    beam_req = BeamSettings(
-        voltage=Q_(200, "kV"),
-        extra=Extras(vendor={"JEOL": {
-            "alpha_index": 3  # Sets CLA/Alpha selector to index 3
-        }})
-    )
-
-    # 2. PROJECTION SETTINGS (Raw DACs)
-    # If 'defocus_scale' is missing, the driver reads/writes 'defocus_olc_dac'.
-    proj_req = ProjectionSettings(
-        magnification_index=15,
-        extra=Extras(vendor={"JEOL": {
-            "defocus_olc_dac": 32768  # Direct hardware value
-        }})
-    )
-
-    scope = JeolMicroscope(settings)
-    scope.connect("localhost")
+  - Relative Focus Stepping: Implements `SHIFT_FOCUS_NM` by reading the current
+    absolute defocus state and calculating a relative delta natively within the
+    driver to support instantaneous UI knob clicks.
 """
 import time
 import logging

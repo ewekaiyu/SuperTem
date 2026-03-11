@@ -1,5 +1,22 @@
-# supertem/protocol.py
+"""
+supertem.protocol
 
+The Automation Executor (The "Scientist").
+
+===============================================================================
+The Protocol Philosophy
+===============================================================================
+Protocols represent the highest layer of the SuperTEM architecture. They execute
+high-level, long-running scientific workflows that define an entire experiment
+from start to finish.
+
+The Golden Rule:
+  Protocols do not contain algorithms, math, or hardware logic. They strictly:
+    1. Read declarative YAML configurations.
+    2. Manage session output, context, and file saving.
+    3. Coordinate sequence steps by delegating to Routines (for complex algorithms)
+       or directly to the Orchestrator (for primitive, instantaneous Actions).
+"""
 import yaml
 import logging
 from supertem.registry import SuperTEMContext, RegistryManager
