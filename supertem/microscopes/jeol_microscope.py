@@ -1110,11 +1110,11 @@ class JeolMicroscope(TemMicroscope):
             else:
                 logger.warning(f"[STAGE] Move finished but outside tolerance.")
 
-    def stop_stage(self, **kwargs) -> None:
+    def trigger_stage_stop(self, **kwargs) -> None:
         """ Stop all drives. """
         self._write_hw(self.stage, "Stop", "STAGE")
 
-    def home_stage(self, **kwargs) -> None:
+    def trigger_stage_home(self, **kwargs) -> None:
         """ SetOrg: Move to origin. """
         self._write_hw(self.stage, "SetOrg", "STAGE")
 
@@ -1238,10 +1238,10 @@ class JeolMicroscope(TemMicroscope):
         act = action.upper().strip()
 
         if act == "STOP":
-            self.stop_stage(**kwargs)
+            self.trigger_stage_stop(**kwargs)
 
         elif act == "HOME":
-            self.home_stage(**kwargs)
+            self.trigger_stage_home(**kwargs)
 
         elif act == "SET_SPEED":
             # Unpack options: defaults to 'normal', 'xy', Motor(0)
@@ -1461,10 +1461,11 @@ class JeolMicroscope(TemMicroscope):
         # Cannot set physical angle without calibration mapping.
         raise NotImplementedError("Use 'alpha_index' extra to set convergence on JEOL.")
 
-    def set_beam_blank(self, blank: bool, **kwargs) -> None:
-        # Def3.SetBeamBlank(1=ON/Blanked, 0=OFF/Unblanked)
-        val = 1 if blank else 0
-        self._write_hw(self.def_, "SetBeamBlank", "BEAM", val)
+    def trigger_beam_blank(self, **kwargs) -> None:
+        self._write_hw(self.def_, "SetBeamBlank", "BEAM", 1)
+
+    def trigger_beam_unblank(self, **kwargs) -> None:
+        self._write_hw(self.def_, "SetBeamBlank", "BEAM", 0)
 
     def set_beam_shift(self, x: float, y: float, **kwargs) -> None:
         # Def3.SetShifBal - User Beam Shift
@@ -1525,61 +1526,41 @@ class JeolMicroscope(TemMicroscope):
         """Atomic: Set CL3."""
         self._write_hw(self.lens, "SetCL3", "BEAM", int(dac))
 
-    def set_ht_wobbler(self, active: bool) -> None:
-        """Vendor: Control HT Wobbler (Voltage Center)."""
-        state = 1 if active else 0
-        self._write_hw(self.gun, "SetHtWobbler", "BEAM", state)
+    def trigger_ht_wobbler_on(self) -> None:
+        self._write_hw(self.gun, "SetHtWobbler", "BEAM", 1)
 
-    def set_a2_wobbler(self, active: bool) -> None:
-        """Vendor: Control A2 Wobbler (Gun Alignment)."""
-        state = 1 if active else 0
-        self._write_hw(self.gun, "SetA2Wobbler", "BEAM", state)
+    def trigger_ht_wobbler_off(self) -> None:
+        self._write_hw(self.gun, "SetHtWobbler", "BEAM", 0)
 
-    def set_feg_emission_state(self, active: bool) -> None:
-        """Turn FEG Emission ON or OFF. (FEG3 Only)"""
-        # 1. Hardware Module Check
-        if not self.feg:
-            logger.error("[BEAM] SetEmission failed: FEG3 module missing.")
-            raise RuntimeError("FEG hardware not connected.")
+    def trigger_a2_wobbler_on(self) -> None:
+        self._write_hw(self.gun, "SetA2Wobbler", "BEAM", 1)
 
-        # 2. Gun Type Safety Check
-        # 1=W, 2=LaB6, 3=FEG, 11=TFEG, 12=CFEG
-        gun_type = self.get_gun_type_index()
-        if gun_type not in (3, 11, 12):
-             logger.error(f"[BEAM] Aborting FEG command. Detected GunType={gun_type} (Not a FEG).")
-             raise RuntimeError(f"Cannot control FEG Emission: Instrument is not a FEG (Type {gun_type}).")
+    def trigger_a2_wobbler_off(self) -> None:
+        self._write_hw(self.gun, "SetA2Wobbler", "BEAM", 0)
 
-        # 3. Execution
-        if active:
-            logger.info("[BEAM] Executing FEG Emission ON...")
-            self._write_hw(self.feg, "ExecEmissionOn", "BEAM", 1)
-        else:
-            logger.info("[BEAM] Executing FEG Emission OFF...")
-            self._write_hw(self.feg, "SetFEGEmissionOff", "BEAM", 0)
+    def trigger_feg_emission_on(self) -> None:
+        self._feg_safety_check()
+        logger.info("[BEAM] Executing FEG Emission ON...")
+        self._write_hw(self.feg, "ExecEmissionOn", "BEAM", 1)
 
-    def set_feg_flashing_execution(self, active: bool) -> None:
-        """
-        Atomic: Execute FEG Auto-Flashing.
-        Source: PyJEM.TEM3.FEG3.ExecAutoFlashing
-        """
-        if not self.feg:
-            logger.error("[BEAM] Flash failed: FEG hardware not connected.")
-            raise RuntimeError("FEG hardware not connected.")
+    def trigger_feg_emission_off(self) -> None:
+        self._feg_safety_check()
+        logger.info("[BEAM] Executing FEG Emission OFF...")
+        self._write_hw(self.feg, "SetFEGEmissionOff", "BEAM", 0)
 
+    def trigger_feg_flash(self) -> None:
+        self._feg_safety_check()
         if not hasattr(self.feg, "ExecAutoFlashing"):
-            raise RuntimeError("FEG Flashing not supported (FEG3 module missing or incompatible).")
+            raise RuntimeError("FEG Flashing not supported.")
+        logger.info("[BEAM] Executing FEG Auto-Flash...")
+        self._write_hw(self.feg, "ExecAutoFlashing", "BEAM", 1)
 
-        # Gun Type Safety Check
+    def _feg_safety_check(self) -> None:
+        """Internal helper for FEG operations."""
+        if not self.feg: raise RuntimeError("FEG hardware not connected.")
         gun_type = self.get_gun_type_index()
         if gun_type not in (3, 11, 12):
-             logger.error(f"[BEAM] Aborting FEG Flash. Detected GunType={gun_type} (Not a FEG).")
-             raise RuntimeError(f"Cannot execute FEG Flashing: Instrument is not a FEG (Type {gun_type}).")
-
-        val = 1 if active else 0
-        tag = "Start" if active else "Stop"
-        logger.info(f"[BEAM] Executing FEG Auto-Flash ({tag})...")
-
-        self._write_hw(self.feg, "ExecAutoFlashing", "BEAM", val)
+            raise RuntimeError(f"Cannot control FEG: Instrument is Type {gun_type}.")
 
     def set_spot_alignment(self, x: int, y: int) -> None:
         """Set Spot Alignment (SpotA)."""
@@ -1683,9 +1664,9 @@ class JeolMicroscope(TemMicroscope):
             if jeol_v.feg_emission_state is not None:
                 state = jeol_v.feg_emission_state.upper()
                 if state in ["ON", "TRUE"]:
-                    self.set_feg_emission_state(True)
+                    self.trigger_feg_emission_on()
                 elif state in ["OFF", "FALSE"]:
-                    self.set_feg_emission_state(False)
+                    self.trigger_feg_emission_off()
 
             # D. Fine Alignments
             if jeol_v.spot_alignment is not None:
@@ -1706,36 +1687,17 @@ class JeolMicroscope(TemMicroscope):
         act = action.upper().strip()
 
         if act == "FLASH_FEG":
-            self.set_feg_flashing_execution(True)
-
+            self.trigger_feg_flash()
         elif act == "EMISSION_ON":
-            self.set_feg_emission_state(True)
-
+            self.trigger_feg_emission_on()
         elif act == "EMISSION_OFF":
-            self.set_feg_emission_state(False)
-
-        elif act in ["OPEN_VALVE", "OPEN_V1"]:
-            logger.info("[BEAM] Opening Gun Valve (V1)...")
-            self.set_gun_valve_state("OPEN")
-
-        elif act in ["CLOSE_VALVE", "CLOSE_V1"]:
-            logger.info("[BEAM] Closing Gun Valve (V1)...")
-            self.set_gun_valve_state("CLOSED")
-
+            self.trigger_feg_emission_off()
         elif act == "SET_MDS":
-            # kwargs: mode (str)
-            mode = kwargs.get("mode", "OFF")
-            self.set_mds_mode(mode)
-
+            self.set_mds_mode(kwargs.get("mode", "OFF"))
         elif act == "WOBBLE_HT":
-            active = bool(kwargs.get("active", True))
-            logger.info(f"[BEAM] HT Wobbler active={active}")
-            self.set_ht_wobbler(active)
-
+            self.trigger_ht_wobbler_on() if kwargs.get("active", True) else self.trigger_ht_wobbler_off()
         elif act == "WOBBLE_A2":
-            active = bool(kwargs.get("active", True))
-            logger.info(f"[BEAM] A2 (Gun) Wobbler active={active}")
-            self.set_a2_wobbler(active)
+            self.trigger_a2_wobbler_on() if kwargs.get("active", True) else self.trigger_a2_wobbler_off()
 
         elif act == "WOBBLE_TILT":
             amp_x = int(kwargs.get("amp_x", 200))
@@ -2165,8 +2127,8 @@ class JeolMicroscope(TemMicroscope):
         """Atomic: Set PL3."""
         self._write_hw(self.lens, "SetPL3", "LENS", int(dac))
 
-    def set_standard_focus(self) -> None:
-        """Atomic: Execute Standard Focus."""
+    def trigger_standard_focus(self) -> None:
+        """Atomic Action: Execute Standard Focus."""
         self._write_hw(self.lens, "SetStdFocus", "LENS")
 
     def set_image_shift_2(self, x: float, y: float) -> None:
@@ -2193,8 +2155,8 @@ class JeolMicroscope(TemMicroscope):
         else:
             logger.warning("[LENS] Absolute diffraction focus not supported for this model (Requires F200 IL1 logic).")
 
-    def set_relative_focus_steps(self, steps: int) -> None:
-        """Atomic: Adjust focus by relative hardware steps (Knob turn)."""
+    def trigger_relative_focus_step(self, steps: int) -> None:
+        """Atomic Action: Adjust focus by relative hardware steps (Knob turn)."""
         self._write_hw(self.eos, "SetObjFocus", "LENS", int(steps))
 
     # --- Helper Layer Overrides ---
@@ -2292,13 +2254,13 @@ class JeolMicroscope(TemMicroscope):
 
         if act == "STD_FOCUS":
             logger.info("[LENS] Executing Standard Focus...")
-            self.set_standard_focus()
+            self.trigger_standard_focus()
 
         # CASE 1: Relative Steps (Knob clicks) - Hardware Command
         elif act == "STEP_FOCUS":
             steps = int(kwargs.get("steps", 1))
             logger.debug(f"[LENS] Stepping focus by {steps} clicks")
-            self.set_relative_focus_steps(steps)  # The new Atomic setter we discussed
+            self.trigger_relative_focus_step(steps) # The new Atomic setter we discussed
 
         # CASE 2: Relative Nanometers (Physical Shift) - Software Calculation
         elif act == "SHIFT_FOCUS_NM":
@@ -2461,22 +2423,19 @@ class JeolMicroscope(TemMicroscope):
 
     # --- Atomic Setters ---
 
-    def set_detector_insertion(self, detector_id: str, inserted: bool, **kwargs) -> None:
-        """Insert or retract detector."""
+    def trigger_detector_insertion(self, detector_id: str, **kwargs) -> None:
         d = self._get_detector(detector_id)
-
-        # _write_hw handles the "Hardware disconnected" check and logging
-        if inserted:
-            if hasattr(d, "insert"):
-                self._write_hw(d, "insert", "DET")
-            else:
-                # Fallback/No-op log if method missing (unlikely for valid detector)
-                logger.warning(f"[DET] Detector {detector_id} does not support 'insert'.")
+        if hasattr(d, "insert"):
+            self._write_hw(d, "insert", "DET")
         else:
-            if hasattr(d, "retract"):
-                self._write_hw(d, "retract", "DET")
-            else:
-                logger.warning(f"[DET] Detector {detector_id} does not support 'retract'.")
+            logger.warning(f"[DET] Detector {detector_id} does not support 'insert'.")
+
+    def trigger_detector_retraction(self, detector_id: str, **kwargs) -> None:
+        d = self._get_detector(detector_id)
+        if hasattr(d, "retract"):
+            self._write_hw(d, "retract", "DET")
+        else:
+            logger.warning(f"[DET] Detector {detector_id} does not support 'retract'.")
 
     def set_detector_exposure(self, detector_id: str, exposure: Quantity, **kwargs) -> None:
         """Set detector physical exposure time (Cameras Only)."""
@@ -2736,46 +2695,45 @@ class JeolMicroscope(TemMicroscope):
 
         return MicroscopeImage(data=arr, metadata=metadata)
 
-    def execute_detector_auto_contrast(self, detector_id: str) -> None:
+    def trigger_detector_auto_contrast(self, detector_id: str) -> None:
         """Atomic: Execute Auto Contrast/Brightness (STEM)."""
         d = self._get_detector(detector_id)
         self._write_hw(d, "AutoContrastBrightness", "DET")
 
-    def execute_detector_auto_focus(self, detector_id: str) -> None:
+    def trigger_detector_auto_focus(self, detector_id: str) -> None:
         """Atomic: Execute Auto Focus (STEM)."""
         d = self._get_detector(detector_id)
         self._write_hw(d, "AutoFocus", "DET")
 
-    def execute_detector_auto_stigmator(self, detector_id: str) -> None:
+    def trigger_detector_auto_stigmator(self, detector_id: str) -> None:
         """Atomic: Execute Auto Stigmator (STEM)."""
         d = self._get_detector(detector_id)
         self._write_hw(d, "AutoStigmator", "DET")
 
-    def execute_detector_auto_z(self, detector_id: str) -> None:
+    def trigger_detector_auto_z(self, detector_id: str) -> None:
         """Atomic: Execute Auto Z (STEM)."""
         d = self._get_detector(detector_id)
         self._write_hw(d, "AutoZ", "DET")
 
-    def execute_detector_auto_orientation(self, detector_id: str) -> None:
+    def trigger_detector_auto_orientation(self, detector_id: str) -> None:
         """Atomic: Execute Auto Orientation (STEM)."""
         d = self._get_detector(detector_id)
         self._write_hw(d, "AutoOrientation", "DET")
 
-    def execute_snapshot_all(self) -> None:
+    def trigger_snapshot_all(self) -> None:
         """Atomic: Trigger simultaneous acquisition on all detectors (STEM)."""
         fn_mod = self._get_detector_function_module()
         if not fn_mod:
             raise RuntimeError("Detector module function interface missing.")
         self._write_hw(fn_mod, "snapshotall", "DET")
 
-    def set_detector_accumulation(self, active: bool) -> None:
-        """Atomic: Enable/Disable Live Image Accumulation/Averaging."""
+    def trigger_detector_accumulation_on(self) -> None:
         fn_mod = self._get_detector_function_module()
-        if not fn_mod:
-            raise RuntimeError("Detector module function interface missing.")
+        if fn_mod: self._write_hw(fn_mod, "start_accumulate_image_cache", "DET")
 
-        method = "start_accumulate_image_cache" if active else "stop_accumulate_image_cache"
-        self._write_hw(fn_mod, method, "DET")
+    def trigger_detector_accumulation_off(self) -> None:
+        fn_mod = self._get_detector_function_module()
+        if fn_mod: self._write_hw(fn_mod, "stop_accumulate_image_cache", "DET")
 
     # --- Helper Layer Overrides ---
 
@@ -2860,42 +2818,45 @@ class JeolMicroscope(TemMicroscope):
                 raise ValueError("Auto Contrast is only for STEM detectors. Use Auto Exposure for Cameras.")
             logger.info(f"[DET] Action: Auto Contrast/Brightness on {d_id}")
             # 2. Call Atomic Method (The "Hands")
-            self.execute_detector_auto_contrast(d_id)
+            self.trigger_detector_auto_contrast(d_id)
 
         elif act == "AUTO_FOCUS":
             if not is_stem:
                 raise ValueError("Hardware Auto Focus is only for STEM mode.")
             logger.info(f"[DET] Action: Auto Focus on {d_id}")
-            self.execute_detector_auto_focus(d_id)
+            self.trigger_detector_auto_focus(d_id)
 
         elif act == "AUTO_STIGMATOR":
             if not is_stem:
                 raise ValueError("Hardware Auto Stigmator is only for STEM mode.")
             logger.info(f"[DET] Action: Auto Stigmator on {d_id}")
-            self.execute_detector_auto_stigmator(d_id)
+            self.trigger_detector_auto_stigmator(d_id)
 
         elif act == "AUTO_Z":
             if not is_stem:
                 raise ValueError("Hardware Auto Z is only for STEM mode.")
             logger.info(f"[DET] Action: Auto Z on {d_id}")
-            self.execute_detector_auto_z(d_id)
+            self.trigger_detector_auto_z(d_id)
 
         elif act == "AUTO_ORIENTATION":
             if not is_stem:
                 raise ValueError("Hardware Auto Orientation is only for STEM mode.")
             logger.info(f"[DET] Action: Auto Orientation on {d_id}")
-            self.execute_detector_auto_orientation(d_id)
+            self.trigger_detector_auto_orientation(d_id)
 
         elif act == "SNAPSHOT_ALL":
             if self.get_mode() != "STEM":
                 raise RuntimeError("SnapshotAll is only available in STEM mode.")
             logger.info("[DET] Action: Snapshot All Detectors")
-            self.execute_snapshot_all()
+            self.trigger_snapshot_all()
 
         elif act == "SET_ACCUMULATION":
             active = bool(kwargs.get("active", True))
             logger.info(f"[DET] Action: Set Accumulation/Averaging = {active}")
-            self.set_detector_accumulation(active)
+            if active:
+                self.trigger_detector_accumulation_on()
+            else:
+                self.trigger_detector_accumulation_off()
 
         else:
             super().perform_detector_action(action, **kwargs)
@@ -3024,18 +2985,13 @@ class JeolMicroscope(TemMicroscope):
         else:
             raise RuntimeError("Scan detector hardware not connected.")
 
-    def set_scan_active(self, active: bool, **kwargs) -> None:
+    def trigger_scan_start(self, **kwargs) -> None:
         d = self._get_scan_controller_detector()
-        if d is None:
-            raise RuntimeError("Scan detector hardware not connected.")
+        if d and hasattr(d, "livestart"): self._write_hw(d, "livestart", "SCAN")
 
-        logger.debug(f"[SCAN] SetActive: {active}")
-        if active:
-            if hasattr(d, "livestart"):
-                self._write_hw(d, "livestart", "SCAN")
-        else:
-            if hasattr(d, "livestop"):
-                self._write_hw(d, "livestop", "SCAN")
+    def trigger_scan_stop(self, **kwargs) -> None:
+        d = self._get_scan_controller_detector()
+        if d and hasattr(d, "livestop"): self._write_hw(d, "livestop", "SCAN")
 
     def set_scan_width(self, width: int, **kwargs) -> None:
         self._set_imaging_area(width=int(width))
@@ -3217,28 +3173,32 @@ class JeolMicroscope(TemMicroscope):
 
     # --- Atomic Setters ---
 
-    def set_column_valve_state(self, state: str, **kwargs) -> None:
-        raise NotImplementedError("Column Valve control not supported.")
+    def trigger_column_valve_open(self, **kwargs) -> None:
+        pass  # Not implemented natively
 
-    def set_gun_valve_state(self, state: str, **kwargs) -> None:
-        is_open = 1 if state.upper() == "OPEN" else 0
+    def trigger_column_valve_close(self, **kwargs) -> None:
+        pass  # Not implemented natively
 
-        # FEG3 priority [cite: 1060]
+    def trigger_turbo_pump_on(self, **kwargs) -> None:
+        pass  # Not implemented natively
+
+    def trigger_turbo_pump_off(self, **kwargs) -> None:
+        pass  # Not implemented natively
+
+    def trigger_gun_valve_open(self, **kwargs) -> None:
+        self._set_gun_valve_internal(1)
+
+    def trigger_gun_valve_close(self, **kwargs) -> None:
+        self._set_gun_valve_internal(0)
+
+    def _set_gun_valve_internal(self, val: int) -> None:
         if hasattr(self.feg, "SetBeamValve"):
             gun_type = self.get_gun_type_index()
-            # FEG/CFEG/TFEG Types: 3, 11-16, 19-22 [cite: 1259]
             if gun_type in (3, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22):
-                self._write_hw(self.feg, "SetBeamValve", "VAC", is_open)
+                self._write_hw(self.feg, "SetBeamValve", "VAC", val)
                 return
-
-        # GUN3 fallback [cite: 1321]
         if hasattr(self.gun, "SetBeamSw"):
-            self._write_hw(self.gun, "SetBeamSw", "VAC", is_open)
-        else:
-            logger.warning("[VAC] No gun valve control found.")
-
-    def set_turbo_pump_state(self, state: str, **kwargs) -> None:
-        raise NotImplementedError("Turbo Pump control not supported.")
+            self._write_hw(self.gun, "SetBeamSw", "VAC", val)
 
     # --- Helper Layer Overrides ---
 
@@ -3318,11 +3278,11 @@ class JeolMicroscope(TemMicroscope):
 
     # --- Atomic Setters ---
 
-    def set_aperture_inserted(self, aperture_id: str, inserted: bool, **kwargs) -> None:
-        if not inserted:
-            self.set_aperture_size_index(aperture_id, 0)
-        else:
-             raise ValueError("Cannot set inserted=True without specifying size_index.")
+    def trigger_aperture_insertion(self, aperture_id: str, **kwargs) -> None:
+        raise ValueError("Cannot insert aperture without specifying size_index. Use Target payload.")
+
+    def trigger_aperture_retraction(self, aperture_id: str, **kwargs) -> None:
+        self.set_aperture_size_index(aperture_id, 0)
 
     def set_aperture_size_index(self, aperture_id: str, index: int, **kwargs) -> None:
         kind = self._APERTURE_MAP.get(aperture_id)
