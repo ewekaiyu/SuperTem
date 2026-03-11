@@ -1,71 +1,53 @@
 """
-supertem.config
+supertem.registry
 
-Configuration Bootstrap, Registry Management, and Default Factory.
+Configuration Bootstrap, Environment Context, and Registry Management.
 
-This module serves as the central entry point for the application's state.
-It has been architected to use **Dependency Injection (DI)**, replacing global
-singletons with explicit Context objects.
-
-===============================================================================
-I. The Bootstrap Lifecycle
-===============================================================================
-
-On instantiation, the RegistryManager executes a self-healing initialization sequence:
-
-  1) Environment Validation
-     - Ensures all required directory trees exist (log/, data/, db/, etc.).
-     - Prevents "FileNotFound" crashes in downstream modules.
-
-  2) Default Generation (The "Safe Mode")
-     - Checks for existence of critical YAML definitions.
-     - If missing, atomically writes internal DEFAULT_ dictionaries to disk.
-     - GOAL: The system remains runnable even on a fresh install.
-
-  3) Registry Loading
-     - Loads Index files (microscope-config-index.yaml & protocol-index.yaml).
-     - Resolves the "Active" paths to feed the base_structures.py ingestion lifecycle.
+This module operates within the Orchestration Plane of the SuperTEM architecture.
+It serves as the central entry point for the application's environment state
+and strictly enforces **Dependency Injection (DI)**, completely replacing
+global singletons with explicit Context objects.
 
 ===============================================================================
-II. Registry Management (Hardware vs. Protocols)
+I. Module Responsibility (The Orchestration Plane)
 ===============================================================================
-
-The module manages two parallel registries to support different operational needs:
-  1) Microscope Configurations (The "Hardware Profile") - Tracks machine profiles.
-  2) Automation Protocols (The "Workflows") - Manages executable routines.
-
-===============================================================================
-III. Safety & Atomic I/O
-===============================================================================
-
-- Atomic Writes: Updates use a write-to-tmp -> OS-replace sequence.
-- Separation of Concerns: This module handles *storage* (The Registry),
-  while base_structures.py handles *structure* (The Typing).
+This module does not communicate with hardware or run scientific algorithms.
+Its strict responsibilities are:
+  1. Managing the physical execution environment (folder structures, paths).
+  2. Tracking and resolving the active YAML configurations (Hardware Profiles
+     and Automation Protocols).
+  3. Providing a self-healing bootstrap sequence for fresh installations.
 
 ===============================================================================
-IV. Usage Patterns (The Context Architecture)
+II. The Context Architecture (Dependency Injection)
 ===============================================================================
+This module does not expose a global `registry` object. Instead, execution
+scripts must instantiate a `SuperTEMContext` (e.g., Production vs. Testing)
+and pass it downstream to the Factory and Session handlers.
 
-This module does not expose a global `registry` object. Instead, you must
-create a `SuperTEMContext` and pass it downstream.
+This enables the entire framework to instantly swap between a live microscope
+environment (e.g., `/opt/supertem/...`) and a temporary isolated test folder
+without changing a single line of control-plane logic.
 
-**Pattern A: Running in Production (Normal Operation)**
-    from supertem.config import SuperTEMContext
-    from supertem.utils import setup_session
+===============================================================================
+III. The Bootstrap Lifecycle
+===============================================================================
+On instantiation, the `RegistryManager` executes a self-healing sequence:
+  1) Environment Validation: Ensures all required directory trees exist
+     (log/, data/, db/, etc.) to prevent downstream I/O crashes.
+  2) Default Generation (Safe Mode): If critical YAML definitions are missing,
+     it atomically writes internal `DEFAULT_` dictionaries to disk, ensuring
+     the system remains runnable.
+  3) Registry Loading: Resolves the "Active" paths to feed the Data Plane
+     (`base_structures.py`) ingestion lifecycle.
 
-    # 1. Create the Production Context (Points to /opt/supertem/...)
-    ctx = SuperTEMContext.production()
-
-    # 2. Initialize the Session
-    scope, settings = setup_session(context=ctx, manufacturer="JEOL")
-
-**Pattern B: Running Unit Tests (Isolated Environment)**
-    # 1. Create a Test Context (Points to a temporary folder)
-    ctx = SuperTEMContext.testing(tmp_path)
-
-    # 2. Verify behavior without touching real config files
-    registry = RegistryManager(ctx)
-    assert registry.active_config_name == "default-configuration"
+===============================================================================
+IV. Safety & Atomic I/O
+===============================================================================
+- Atomic Writes: All configuration updates use a write-to-tmp -> OS-replace
+  sequence to prevent file corruption if the system crashes mid-write.
+- Separation of Concerns: This module handles *storage location* (The Registry),
+  while `base_structures.py` handles *data integrity* (The Typing).
 """
 
 from __future__ import annotations

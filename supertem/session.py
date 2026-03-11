@@ -1,80 +1,56 @@
 """
-supertem.utils
+supertem.session
 
-Operational Utilities, Session Lifecycle Management, and Unit-Aware I/O.
+Session Lifecycle Management, Hardware Factory, and State Persistence.
 
-This module acts as the "Glue Layer" between the abstract data structures defined
-in base_structures.py and the physical microscope hardware. It provides the high-level
-orchestration required to initialize sessions, manage persistent storage, and
-handle media generation.
+This module operates within the Orchestration Plane. It acts as the "Glue Layer"
+that transitions the system from static configurations (managed by `registry.py`)
+to live hardware execution (managed by `base_microscope.py`).
 
 ===============================================================================
 I. Session Orchestration (The Setup Lifecycle)
 ===============================================================================
+The primary entry point for establishing hardware control is `setup_session()`.
+This function manages the transition from offline state to live execution:
 
-The primary entry point for any automation routine is `setup_session()`.
-This function manages the transition from static configuration to live execution:
-
-  1) Configuration Resolution
-     - Instantiates a `RegistryManager` tied to the provided `SuperTEMContext`.
-     - Queries the registry to locate the active hardware profile.
-     - **Profile Override:** Optionally accepts a specific `profile_name` to
-       bypass the system default (e.g., for temporary testing of new settings).
-     - Ingests YAML data into `MicroscopeSettings` using STRICT mode to ensure
-       control-plane safety before hardware handoff.
-
-  2) Environment Preparation
-     - Generates unique, timestamped session directories.
-     - Bootstraps the logging subsystem (File + Console).
-
-  3) Hardware Initialization (The Factory Pattern)
-     - Maps the `manufacturer` identity to specific driver implementations
-       (e.g., JEOL vs. DEMO).
-     - Instantiates the `TemMicroscope` controller.
+  1) Configuration Resolution: Queries the `RegistryManager` to locate the active
+     hardware profile, optionally allowing overrides for testing.
+  2) Environment Preparation: Dynamically generates timestamped session directories
+     and bootstraps the logging subsystem (File + Console) for the run.
+  3) Control-Plane Safety: Ingests the YAML data into `MicroscopeSettings` using
+     `ParseMode.STRICT`. If the saved configuration is mathematically invalid, it
+     crashes here *before* hardware handoff.
+  4) Hardware Factory: Maps the `manufacturer` identity to the specific Atomic
+     Driver implementation (e.g., JEOL vs. DEMO) and instantiates the HAL.
 
 ===============================================================================
-II. State Persistence (The Snapshot Lifecycle)
+II. State Persistence (The "Clone & Patch" Pattern)
 ===============================================================================
+This module provides `save_live_config()` to allow operators to use the physical
+microscope as a GUI editor for the YAML configuration files:
 
-This module enables the "Clone & Patch" pattern for configuration management
-via `save_live_config()`. This allows operators to use the microscope as a
-GUI editor for the configuration files:
-
-  1) Tune: Adjust microscope parameters (Voltage, Spotsize, etc.) interactively.
-  2) Clone: The system deep-copies the active static limits (Validation Layer).
-  3) Patch: The system queries the hardware for current values (Hardware Layer)
-     and writes them into the `default_` fields of the settings object.
-  4) Save: The result is serialized to a new YAML profile, ready for immediate
-     use via `setup_session(..., profile_name="new_profile")`.
+  1) Clone: Deep-copies the active settings to preserve safety limits.
+  2) Patch: Queries the hardware for live telemetry values (e.g., current focus,
+     active aperture) and writes them into the `default_` fields.
+  3) Save: Serializes the result to a new YAML profile and registers it in the
+     index for immediate use.
 
 ===============================================================================
-III. Unit-Aware Persistence & Serialization
+III. Unit-Aware I/O & Serialization
 ===============================================================================
-
-The utility layer provides specialized I/O handlers that respect the
-"Normalization vs. Serialization" contract defined in the base structures:
-- `save_positions`: Strips Pint units -> Floats (for YAML compatibility).
-- `get_saved_positions`: Re-hydrates Floats -> Pint units (for Safety).
-
-===============================================================================
-IV. Media & Diagnostic Helpers
-===============================================================================
-
-- MicroscopeImage Integration: Media helpers (like `create_gif`) utilize the
-  `MicroscopeImage` loading logic.
-- Logging: Standardized formatting for cross-module traceability.
+This module provides specialized I/O handlers that enforce the normalization
+contract defined in the Data Plane (`base_structures.py`):
+- Egress (`save_positions`): Strips Pint units to raw Floats for YAML compatibility.
+- Ingress (`get_saved_positions`): Re-hydrates Floats into Pint units using
+  `ParseMode.LENIENT` to ensure survival against malformed storage data.
 
 ===============================================================================
-V. The Wiring Contract (Dependency Injection)
+IV. The Wiring Contract (Dependency Injection)
 ===============================================================================
-
-All functions in this module are **Context-Dependent**. They do not assume
-global state.
-
-- **Rule:** If a function touches the disk (logging, loading YAML), it MUST
-  accept `context: SuperTEMContext` as an argument.
-- **Why?** This ensures that `setup_session()` is the *only* place where
-  decisions about the environment (Prod vs Test) are made.
+All I/O operations in this module are **Context-Dependent**. They strictly require
+a `SuperTEMContext` object. This guarantees that `setup_session()` is the *only*
+place where decisions about the environment (Production vs. Isolated Testing)
+are made, preserving total testability.
 """
 import datetime
 import glob

@@ -1,26 +1,40 @@
 """
 supertem.routines.base_routines
 
-Abstract blueprints for complex, multi-step hardware workflows.
-Universal scripts will type-hint against these classes.
+Abstract blueprints for complex, multi-step hardware workflows (Tier 2).
+
+This module operates entirely within the Cognitive Plane of the SuperTEM architecture.
+It defines the universal contracts that all vendor-specific algorithms must follow.
 
 ===============================================================================
-The Routine Philosophy (The "Smart Algorithms" / The "Puppeteers")
+I. Module Responsibility (Tier 2: The Algorithms)
 ===============================================================================
-Unlike the Hardware Abstraction Layer (HAL) which must remain stateless and
+Unlike the Hardware Abstraction Layer (Tier 3) which must remain stateless and
 instantaneous, Routines represent Goal-Oriented, Cognitive Tasks.
 
-Routines ARE explicitly allowed to:
-  - Block the main thread.
-  - Use `time.sleep()` and `while` loops for time-series operations (e.g., Wobblers).
+Routines ARE explicitly allowed (and expected) to:
+  - Block the main execution thread.
+  - Use `time.sleep()` and bounded `while` loops for time-series sequences.
   - Analyze images, calculate FFTs, and perform closed-loop feedback logic.
-  - Calculate relative math to achieve a scientific goal.
+  - Calculate relative math to achieve a scientific target.
 
-The Golden Rule:
-  Routines MUST NOT communicate with the hardware drivers directly (no PyJEM calls).
-  They must accomplish their goals by constructing mathematically safe,
-  strictly-parsed Request payloads (e.g., BeamControlRequest) and sending them
-  to the `TemMicroscope` Orchestrator.
+===============================================================================
+II. The Golden Rule (No Direct Hardware I/O)
+===============================================================================
+Routines MUST NOT communicate with the hardware drivers directly (e.g., zero
+PyJEM imports or atomic hardware calls).
+
+They must accomplish their goals by constructing mathematically safe,
+strictly-parsed Request payloads (e.g., `BeamControlRequest`) and delegating
+them back down to the Control Plane Orchestrator (`base_microscope`) for execution.
+
+===============================================================================
+III. Error Handling & Aborts
+===============================================================================
+If a Routine fails to achieve its scientific goal (e.g., "Image too dark for
+cross-correlation" or "Sample drifted out of bounds"), it must cleanly abort,
+attempt to leave the hardware in a baseline safe state (e.g., blanking the beam),
+and raise an exception to inform the Tier 1 Protocol.
 """
 from abc import ABC, abstractmethod
 from typing import Any, Dict

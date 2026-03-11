@@ -1,21 +1,47 @@
 """
 supertem.protocol
 
-The Automation Executor (The "Scientist").
+The Automation Executor (Tier 1: The "Scientist").
+
+This module operates at the absolute peak of the SuperTEM Orchestration Plane.
+It serves as the main execution entry point for automated scientific workflows.
 
 ===============================================================================
-The Protocol Philosophy
+I. Module Responsibility
 ===============================================================================
-Protocols represent the highest layer of the SuperTEM architecture. They execute
-high-level, long-running scientific workflows that define an entire experiment
-from start to finish.
+The ProtocolExecutor is responsible for translating declarative, human-readable
+YAML experiments into hardware actions.
 
-The Golden Rule:
-  Protocols do not contain algorithms, math, or hardware logic. They strictly:
-    1. Read declarative YAML configurations.
-    2. Manage session output, context, and file saving.
-    3. Coordinate sequence steps by delegating to Routines (for complex algorithms)
-       or directly to the Orchestrator (for primitive, instantaneous Actions).
+The Golden Rule (No Math, No Logic):
+  This module contains ZERO computer vision algorithms, mathematical calculations,
+  or hardware I/O. It is strictly a coordinator. It reads instructions from a
+  file and delegates the work downstream.
+
+===============================================================================
+II. The Execution Pipeline
+===============================================================================
+When `executor.execute()` is called, it triggers the entire SuperTEM lifecycle
+in a strict dependency-injected sequence:
+
+  1) Context & Registry: Utilizes `RegistryManager` to load the active protocol
+     YAML file from the configured environment.
+  2) Session Orchestration: Passes the context to `setup_session()` to initialize
+     logging, create run directories, and boot the hardware (HAL).
+  3) Factory Injection: Injects the active hardware session into the
+     `RoutineFactory` to gain access to vendor-specific scientific algorithms.
+  4) Step Delegation: Iterates through the YAML sequence:
+       - Complex steps (e.g., "autofocus") are delegated to the Cognitive Plane
+         via the `RoutineFactory`.
+       - Primitive steps (e.g., "stage") are parsed into STRICT requests and
+         sent directly to the Control Plane Orchestrator (`base_microscope`).
+
+===============================================================================
+III. Error Handling & Safety
+===============================================================================
+If any step in the sequence fails (whether from a mathematical bounds check in
+the Orchestrator or an algorithmic failure in a Routine), the Protocol catches
+the exception, logs the abort sequence, and cleanly terminates the experiment
+to prevent runaway hardware states.
 """
 import yaml
 import logging
