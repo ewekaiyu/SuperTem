@@ -462,13 +462,13 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def stop_stage(self, **kwargs) -> None:
-        """Atomic: Immediately halt all stage motion axes."""
+    def trigger_stage_stop(self, **kwargs) -> None:
+        """Atomic Action: Immediately halt all stage motion axes."""
         pass
 
     @abstractmethod
-    def home_stage(self, **kwargs) -> None:
-        """Atomic: Return stage to its mechanical origin/zero position."""
+    def trigger_stage_home(self, **kwargs) -> None:
+        """Atomic Action: Return stage to its mechanical origin/zero position."""
         pass
 
     # --- Helper Layer ---
@@ -497,14 +497,11 @@ class TemMicroscope(ABC):
         self.move_stage_absolute(target, drive_type=drive_type, wait=wait, **kwargs)
 
     def perform_stage_action(self, action: str, **kwargs) -> None:
-        """
-        Helper: Routes high-level control actions to atomic commands.
-        Vendor Override: Useful if 'STOP' requires complex deceleration logic.
-        """
+        """Helper: Routes high-level control actions to atomic commands."""
         if action == "STOP":
-            self.stop_stage(**kwargs)
+            self.trigger_stage_stop(**kwargs)
         elif action == "HOME":
-            self.home_stage(**kwargs)
+            self.trigger_stage_home(**kwargs)
         elif action == "ZERO_ENCODERS":
             # Example of an action that might not be standard, handled gracefully
             logger.warning("[STAGE] ZERO_ENCODERS requested but not implemented in base.")
@@ -710,8 +707,13 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def set_beam_blank(self, blank: bool, **kwargs) -> None:
-        """Set Beam Blanker. True = Blank (Block)."""
+    def trigger_beam_blank(self, **kwargs) -> None:
+        """Atomic Action: Mechanically insert the beam blanker to block the beam."""
+        pass
+
+    @abstractmethod
+    def trigger_beam_unblank(self, **kwargs) -> None:
+        """Atomic Action: Mechanically retract the beam blanker to unblock the beam."""
         pass
 
     @abstractmethod
@@ -779,7 +781,10 @@ class TemMicroscope(ABC):
         if settings.probe_mode is not None:
             self.set_probe_mode(settings.probe_mode, **kwargs)
         if settings.is_blanked is not None:
-            self.set_beam_blank(settings.is_blanked, **kwargs)
+            if settings.is_blanked:
+                self.trigger_beam_blank(**kwargs)
+            else:
+                self.trigger_beam_unblank(**kwargs)
 
         if settings.beam_shift:
             self._require_point_complete(settings.beam_shift, 'beam_shift')
@@ -804,13 +809,14 @@ class TemMicroscope(ABC):
 
     def perform_beam_action(self, action: str, **kwargs) -> None:
         """Helper: Handles procedural beam commands."""
-        # Vendors override this to implement logic
-        if action == "DEGAUSS":
+        if action == "BLANK":
+            self.trigger_beam_blank(**kwargs)
+        elif action == "UNBLANK":
+            self.trigger_beam_unblank(**kwargs)
+        elif action == "DEGAUSS":
             logger.warning("[BEAM] Degauss requested but not implemented.")
         elif action == "NORMALIZE":
             logger.warning("[BEAM] Normalize requested but not implemented.")
-        elif action == "ALIGN_GUN":
-            logger.warning("[BEAM] Gun Align requested but not implemented.")
         else:
             logger.warning(f"[BEAM] Unknown action '{action}'")
 
@@ -1139,10 +1145,13 @@ class TemMicroscope(ABC):
     # --- Atomic Setters ---
 
     @abstractmethod
-    def set_detector_insertion(self, detector_id: str, inserted: bool, **kwargs) -> None:
-        """
-        Atomic: Insert (True) or Retract (False) the detector.
-        """
+    def trigger_detector_insertion(self, detector_id: str, **kwargs) -> None:
+        """Atomic Action: Mechanically insert the detector into the beam path."""
+        pass
+
+    @abstractmethod
+    def trigger_detector_retraction(self, detector_id: str, **kwargs) -> None:
+        """Atomic Action: Mechanically retract the detector from the beam path."""
         pass
 
     @abstractmethod
@@ -1278,7 +1287,10 @@ class TemMicroscope(ABC):
         Helper: Applies a partial detector configuration.
         """
         if settings.inserted is not None:
-            self.set_detector_insertion(detector_id, settings.inserted, **kwargs)
+            if settings.inserted:
+                self.trigger_detector_insertion(detector_id, **kwargs)
+            else:
+                self.trigger_detector_retraction(detector_id, **kwargs)
         if settings.exposure is not None:
             self.set_detector_exposure(detector_id, settings.exposure, **kwargs)
         if settings.binning_index is not None:
@@ -1309,9 +1321,9 @@ class TemMicroscope(ABC):
     def perform_detector_action(self, detector_id: str, action: str, **kwargs) -> None:
         """Helper: Handles detector maintenance (Cooldown, etc)."""
         if action == "INSERT":
-            self.set_detector_insertion(detector_id, True, **kwargs)
+            self.trigger_detector_insertion(detector_id, **kwargs)
         elif action == "RETRACT":
-            self.set_detector_insertion(detector_id, False, **kwargs)
+            self.trigger_detector_retraction(detector_id, **kwargs)
         elif action == "COOLDOWN":
             logger.warning(f"[{detector_id}] Cooldown requested but not implemented.")
         elif action == "WARMUP":
@@ -1484,8 +1496,13 @@ class TemMicroscope(ABC):
         pass
 
     @abstractmethod
-    def set_scan_active(self, active: bool, **kwargs) -> None:
-        """Atomic: Start (True) or Stop (False) the scan engine."""
+    def trigger_scan_start(self, **kwargs) -> None:
+        """Atomic Action: Fire the active scan sequence."""
+        pass
+
+    @abstractmethod
+    def trigger_scan_stop(self, **kwargs) -> None:
+        """Atomic Action: Halt the active scan sequence."""
         pass
 
     @abstractmethod
@@ -1542,7 +1559,10 @@ class TemMicroscope(ABC):
         if settings.scan_mode is not None:
             self.set_scan_mode(settings.scan_mode, **kwargs)
         if settings.active is not None:
-            self.set_scan_active(settings.active, **kwargs)
+            if settings.active:
+                self.trigger_scan_start(**kwargs)
+            else:
+                self.trigger_scan_stop(**kwargs)
         if settings.width_px is not None:
             self.set_scan_width(settings.width_px, **kwargs)
         if settings.height_px is not None:
@@ -1557,13 +1577,13 @@ class TemMicroscope(ABC):
     def perform_scan_action(self, action: str, **kwargs) -> None:
         """Helper: Handles Start/Stop logic."""
         if action == "START":
-            self.set_scan_active(True, **kwargs)
+            self.trigger_scan_start(**kwargs)
         elif action == "STOP":
-            self.set_scan_active(False, **kwargs)
+            self.trigger_scan_stop(**kwargs)
         elif action == "SINGLE_FRAME":
             # Vendor override point for single-shot logic
             logger.warning("[SCAN] SINGLE_FRAME generic fallback: Starting continuous scan.")
-            self.set_scan_active(True, **kwargs)
+            self.trigger_scan_start(**kwargs)
 
     # --- Orchestrator Layer ---
 
@@ -1640,27 +1660,27 @@ class TemMicroscope(ABC):
     # --- Atomic Setters ---
 
     @abstractmethod
-    def set_column_valve_state(self, state: str, **kwargs) -> None:
-        """
-        Atomic: Set Column Valve state.
-        Values: 'OPEN', 'CLOSED'
-        """
+    def trigger_column_valve_open(self, **kwargs) -> None:
         pass
 
     @abstractmethod
-    def set_gun_valve_state(self, state: str, **kwargs) -> None:
-        """
-        Atomic: Set Gun Valve state.
-        Values: 'OPEN', 'CLOSED'
-        """
+    def trigger_column_valve_close(self, **kwargs) -> None:
         pass
 
     @abstractmethod
-    def set_turbo_pump_state(self, state: str, **kwargs) -> None:
-        """
-        Atomic: Set Turbo Pump state.
-        Values: 'ON', 'OFF'
-        """
+    def trigger_gun_valve_open(self, **kwargs) -> None:
+        pass
+
+    @abstractmethod
+    def trigger_gun_valve_close(self, **kwargs) -> None:
+        pass
+
+    @abstractmethod
+    def trigger_turbo_pump_on(self, **kwargs) -> None:
+        pass
+
+    @abstractmethod
+    def trigger_turbo_pump_off(self, **kwargs) -> None:
         pass
 
     # --- Helper Layer ---
@@ -1678,19 +1698,44 @@ class TemMicroscope(ABC):
         )
 
     def apply_vacuum_settings(self, settings: VacuumSettings, **kwargs) -> None:
-        """Helper: Applies partial vacuum configuration."""
+        """Helper: Reconciles desired vacuum states into mechanical triggers."""
         if settings.column_valve_state is not None:
-            self.set_column_valve_state(settings.column_valve_state, **kwargs)
+            if settings.column_valve_state.upper() == "OPEN":
+                self.trigger_column_valve_open(**kwargs)
+            else:
+                self.trigger_column_valve_close(**kwargs)
+
         if settings.gun_valve_state is not None:
-            self.set_gun_valve_state(settings.gun_valve_state, **kwargs)
+            if settings.gun_valve_state.upper() == "OPEN":
+                self.trigger_gun_valve_open(**kwargs)
+            else:
+                self.trigger_gun_valve_close(**kwargs)
+
         if settings.turbo_pump_state is not None:
-            self.set_turbo_pump_state(settings.turbo_pump_state, **kwargs)
+            if settings.turbo_pump_state.upper() == "ON":
+                self.trigger_turbo_pump_on(**kwargs)
+            else:
+                self.trigger_turbo_pump_off(**kwargs)
 
     def perform_vacuum_action(self, action: str, **kwargs) -> None:
-        if action == "VENT":
+        if action == "OPEN_COLUMN_VALVE":
+            self.trigger_column_valve_open(**kwargs)
+        elif action == "CLOSE_COLUMN_VALVE":
+            self.trigger_column_valve_close(**kwargs)
+        elif action == "OPEN_GUN_VALVE":
+            self.trigger_gun_valve_open(**kwargs)
+        elif action == "CLOSE_GUN_VALVE":
+            self.trigger_gun_valve_close(**kwargs)
+        elif action == "TURBO_ON":
+            self.trigger_turbo_pump_on(**kwargs)
+        elif action == "TURBO_OFF":
+            self.trigger_turbo_pump_off(**kwargs)
+        elif action == "VENT":
             logger.warning("[VAC] Vent requested but not implemented.")
         elif action == "CYCLE":
             logger.warning("[VAC] Cycle requested but not implemented.")
+        else:
+            logger.warning(f"[VAC] Unknown action '{action}'")
 
     # --- Orchestrator Layer ---
 
@@ -1756,10 +1801,13 @@ class TemMicroscope(ABC):
     # --- Atomic Setters ---
 
     @abstractmethod
-    def set_aperture_inserted(self, aperture_id: str, inserted: bool, **kwargs) -> None:
-        """
-        Atomic: Insert or Retract the mechanism.
-        """
+    def trigger_aperture_insertion(self, aperture_id: str, **kwargs) -> None:
+        """Atomic Action: Mechanically insert the aperture."""
+        pass
+
+    @abstractmethod
+    def trigger_aperture_retraction(self, aperture_id: str, **kwargs) -> None:
+        """Atomic Action: Mechanically retract the aperture."""
         pass
 
     @abstractmethod
@@ -1794,7 +1842,10 @@ class TemMicroscope(ABC):
         Helper: Applies a fully resolved aperture configuration.
         """
         if settings.inserted is not None:
-            self.set_aperture_inserted(aperture_id, settings.inserted, **kwargs)
+            if settings.inserted:
+                self.trigger_aperture_insertion(aperture_id, **kwargs)
+            else:
+                self.trigger_aperture_retraction(aperture_id, **kwargs)
 
         if settings.size_index is not None:
             self.set_aperture_size_index(aperture_id, settings.size_index, **kwargs)
@@ -1807,10 +1858,14 @@ class TemMicroscope(ABC):
             self.set_aperture_position(aperture_id, x_val, y_val, **kwargs)
 
     def perform_aperture_action(self, aperture_id: str, action: str, **kwargs) -> None:
-        if action == "RESET":
+        if action == "INSERT":
+            self.trigger_aperture_insertion(aperture_id, **kwargs)
+        elif action == "RETRACT":
+            self.trigger_aperture_retraction(aperture_id, **kwargs)
+        elif action == "RESET":
             logger.warning(f"[{aperture_id}] Reset requested but not implemented.")
-        elif action == "CALIBRATE":
-            logger.warning(f"[{aperture_id}] Calibrate requested but not implemented.")
+        else:
+            logger.warning(f"[{aperture_id}] Unknown action '{action}'")
 
     # --- Orchestrator Layer ---
 
