@@ -40,6 +40,7 @@ class JeolBeamExtras:
     # Source Control & Diagnostics
     feg_emission_state: Optional[str] = None
     gun_type_index: Optional[int] = None
+    mds_mode: Optional[str] = None
 
     # Quantities require _UNITS mapping for JSON serialization
     gun_anode_1: Optional[Quantity] = None
@@ -76,6 +77,7 @@ class JeolBeamExtras:
 
         self.feg_emission_state = p.str(self.feg_emission_state, "feg_emission_state")
         self.gun_type_index = p.int(self.gun_type_index, "gun_type_index")
+        self.mds_mode = p.str(self.mds_mode, "mds_mode")
 
         self.gun_anode_1 = p.qty(self.gun_anode_1, "gun_anode_1", Units.KV)
         self.gun_anode_2 = p.qty(self.gun_anode_2, "gun_anode_2", Units.KV)
@@ -200,3 +202,80 @@ class JeolDetectorExtras:
     @staticmethod
     def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "JeolDetectorExtras":
         return _auto_from_dict(JeolDetectorExtras, d, mode)
+
+# --- NEW: Stage Extras ---
+@dataclass
+class JeolStageExtras:
+    holder_status: Optional[str] = None
+    piezo_offset_x: Optional[Quantity] = None
+    piezo_offset_y: Optional[Quantity] = None
+    axis_status: Optional[dict] = None
+    speed_mode: Optional[dict] = None
+
+    extra: ParserExtras = field(default_factory=ParserExtras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "piezo_offset_x": Units.NM,
+        "piezo_offset_y": Units.NM
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, self.__class__.__name__)
+        self.holder_status = p.str(self.holder_status, "holder_status")
+        self.piezo_offset_x = p.qty(self.piezo_offset_x, "piezo_offset_x", Units.NM)
+        self.piezo_offset_y = p.qty(self.piezo_offset_y, "piezo_offset_y", Units.NM)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool: return Validator(self, mode).valid
+    def to_dict(self) -> dict: return _auto_to_dict(self, unit_map=self._UNITS)
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "JeolStageExtras":
+        return _auto_from_dict(JeolStageExtras, d, mode, alias_map={
+            "piezo_offset_x": "piezo_offset_x_nm", "piezo_offset_y": "piezo_offset_y_nm"
+        })
+
+# --- NEW: Vacuum Extras ---
+@dataclass
+class JeolVacuumExtras:
+    column_ready_state: Optional[str] = None
+    camera_ready_state: Optional[str] = None
+    specimen_ready_state: Optional[str] = None
+    column_air_state: Optional[str] = None
+    camera_air_state: Optional[str] = None
+    specimen_air_state: Optional[str] = None
+    specimen_pre_evac_state: Optional[str] = None
+    column_rough_pressure: Optional[Quantity] = None
+    specimen_chamber_pressure: Optional[Quantity] = None
+    detector_chamber_pressure: Optional[Quantity] = None
+
+    extra: ParserExtras = field(default_factory=ParserExtras)
+    _mode: ParseMode = field(default=ParseMode.STRICT, repr=False)
+
+    _UNITS = {
+        "column_rough_pressure": Units.UA,
+        "specimen_chamber_pressure": Units.UA,
+        "detector_chamber_pressure": Units.UA
+    }
+
+    def __post_init__(self):
+        p = FieldParser(self, self._mode, self.__class__.__name__)
+        self.column_ready_state = p.str(self.column_ready_state, "column_ready_state")
+        self.camera_ready_state = p.str(self.camera_ready_state, "camera_ready_state")
+        self.specimen_ready_state = p.str(self.specimen_ready_state, "specimen_ready_state")
+        self.column_air_state = p.str(self.column_air_state, "column_air_state")
+        self.camera_air_state = p.str(self.camera_air_state, "camera_air_state")
+        self.specimen_air_state = p.str(self.specimen_air_state, "specimen_air_state")
+        self.specimen_pre_evac_state = p.str(self.specimen_pre_evac_state, "specimen_pre_evac_state")
+        self.column_rough_pressure = p.qty(self.column_rough_pressure, "column_rough_pressure", Units.UA)
+        self.specimen_chamber_pressure = p.qty(self.specimen_chamber_pressure, "specimen_chamber_pressure", Units.UA)
+        self.detector_chamber_pressure = p.qty(self.detector_chamber_pressure, "detector_chamber_pressure", Units.UA)
+
+    def validate(self, *, mode: Union[ParseMode, str, None] = None) -> bool: return Validator(self, mode).valid
+    def to_dict(self) -> dict: return _auto_to_dict(self)
+    @staticmethod
+    def from_dict(d: Any, *, mode: Union[ParseMode, str, None] = ParseMode.STRICT) -> "JeolVacuumExtras":
+        return _auto_from_dict(JeolVacuumExtras, d, mode, alias_map={
+            "column_rough_pressure": "column_rough_pressure_ua",
+            "specimen_chamber_pressure": "specimen_chamber_pressure_ua",
+            "detector_chamber_pressure": "detector_chamber_pressure_ua"
+        })

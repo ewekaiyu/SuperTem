@@ -152,14 +152,16 @@ from supertem.structures.base_structures import (
     Extras,
     Point,
     ROI, DetectorCapabilities,
-    ParseMode
+    ParseMode, VacuumSettings
 )
 
 # Import Vendor Structures (Add this near the top)
 from supertem.structures.jeol_structures import (
     JeolBeamExtras,
     JeolProjectionExtras,
-    JeolDetectorExtras
+    JeolDetectorExtras,
+    JeolStageExtras,
+    JeolVacuumExtras
 )
 
 # Import Vendor Adapters
@@ -289,6 +291,14 @@ class JeolMicroscope(TemMicroscope):
     # VENDOR PAYLOAD MUTATION HOOKS (The Safety Firewall)
     # =========================================================================
 
+    def _validate_vendor_stage(self, target: StagePosition) -> None:
+        if not target or not target.extra or not target.extra.vendor: return
+        raw_payload = target.extra.vendor.get("JEOL")
+        if isinstance(raw_payload, dict):
+            typed_extras = JeolStageExtras.from_dict(raw_payload, mode=target._mode)
+            typed_extras.validate(mode=target._mode)
+            target.extra.vendor["JEOL"] = typed_extras
+
     def _validate_vendor_beam(self, target: BeamSettings) -> None:
         """Intercepts raw JEOL beam dicts, validates hardware limits, and strongly types them."""
         if not target or not target.extra or not target.extra.vendor:
@@ -322,6 +332,14 @@ class JeolMicroscope(TemMicroscope):
         raw_payload = target.extra.vendor.get("JEOL")
         if isinstance(raw_payload, dict):
             typed_extras = JeolDetectorExtras.from_dict(raw_payload, mode=target._mode)
+            typed_extras.validate(mode=target._mode)
+            target.extra.vendor["JEOL"] = typed_extras
+
+    def _validate_vendor_vacuum(self, target: VacuumSettings) -> None:
+        if not target or not target.extra or not target.extra.vendor: return
+        raw_payload = target.extra.vendor.get("JEOL")
+        if isinstance(raw_payload, dict):
+            typed_extras = JeolVacuumExtras.from_dict(raw_payload, mode=target._mode)
             typed_extras.validate(mode=target._mode)
             target.extra.vendor["JEOL"] = typed_extras
 
@@ -1190,23 +1208,25 @@ class JeolMicroscope(TemMicroscope):
                 pass
 
         # 3. Add Status, Piezo & Holder Info to Extras
-        extras = {}
+        # --- WIRE ORPHANED ATOMICS ---
+        jeol_extras = JeolStageExtras(_mode=ParseMode.LENIENT)
 
-        piezo = self.get_stage_piezo_position()
-        if piezo:
-            extras["piezo_offset_nm"] = piezo
+        if (piezo := self.get_stage_piezo_position()):
+            jeol_extras.piezo_offset_x = Q_(float(piezo[0]), Units.NM)
+            jeol_extras.piezo_offset_y = Q_(float(piezo[1]), Units.NM)
 
-        holder = self.get_stage_holder_inserted()
-        if holder != "UNKNOWN":
-            extras["holder_status"] = holder
+        if (holder := self.get_stage_holder_inserted()) != "UNKNOWN":
+            jeol_extras.holder_status = holder
 
-        # Add detailed limit switch info if any errors exist
         status = self.get_stage_axis_status()
         if any(s == "LIMIT_ERROR" for s in status.values()):
-            extras["axis_status"] = status
+            jeol_extras.axis_status = status
 
-        if extras:
-            pos.extra.vendor["JEOL"] = extras
+        if (speed := self.get_stage_speed_mode()):
+            jeol_extras.speed_mode = speed
+
+        if not pos.extra: pos.extra = Extras()
+        pos.extra.vendor["JEOL"] = jeol_extras
 
         return pos
 
@@ -1618,6 +1638,12 @@ class JeolMicroscope(TemMicroscope):
         jeol_extras.gun_anode_2 = self.get_gun_anode_2_voltage()
         jeol_extras.gun_bias = self.get_gun_bias_current()
         jeol_extras.gun_filament = self.get_gun_filament_current()
+
+        if (fil := self.get_gun_filament_current()) is not None:
+            jeol_extras.gun_filament = Q_(float(fil), "A")
+
+        if (mds := self.get_mds_mode()) != "UNKNOWN":
+            jeol_extras.mds_mode = mds
 
         # 3. Attach to canonical object
         if not bs.extra:
@@ -3211,6 +3237,34 @@ class JeolMicroscope(TemMicroscope):
 
     def set_turbo_pump_state(self, state: str, **kwargs) -> None:
         raise NotImplementedError("Turbo Pump control not supported.")
+
+    # --- Helper Layer Overrides ---
+
+    def get_vacuum_settings(self) -> VacuumSettings:
+        """Override: Includes all JEOL specific vacuum ready/air states."""
+        # 1. Grab canonical physics from the base class getters
+        vs = super().get_vacuum_settings()
+
+        # 2. Grab vendor-specific telemetry
+        jeol_extras = JeolVacuumExtras(_mode=ParseMode.LENIENT)
+
+        if (v := self.get_column_ready_state()) != "UNKNOWN": jeol_extras.column_ready_state = v
+        if (v := self.get_camera_ready_state()) != "UNKNOWN": jeol_extras.camera_ready_state = v
+        if (v := self.get_specimen_ready_state()) != "UNKNOWN": jeol_extras.specimen_ready_state = v
+
+        if (v := self.get_column_air_state()) != "UNKNOWN": jeol_extras.column_air_state = v
+        if (v := self.get_camera_air_state()) != "UNKNOWN": jeol_extras.camera_air_state = v
+        if (v := self.get_specimen_air_state()) != "UNKNOWN": jeol_extras.specimen_air_state = v
+        if (v := self.get_specimen_pre_evac_state()) != "UNKNOWN": jeol_extras.specimen_pre_evac_state = v
+
+        if (p := self.get_column_rough_pressure()) is not None: jeol_extras.column_rough_pressure = p
+        if (p := self.get_specimen_chamber_pressure()) is not None: jeol_extras.specimen_chamber_pressure = p
+        if (p := self.get_detector_chamber_pressure()) is not None: jeol_extras.detector_chamber_pressure = p
+
+        if not vs.extra: vs.extra = Extras()
+        vs.extra.vendor["JEOL"] = jeol_extras
+
+        return vs
 
     # =========================================================================
     # 9. Aperture Control
