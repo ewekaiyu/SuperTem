@@ -2810,34 +2810,36 @@ class JeolMicroscope(TemMicroscope):
 
     def apply_detector_settings(self, detector_id: str, settings: DetectorSettings, **kwargs) -> None:
         """
-        Override: Apply settings using bulk setter to handle extras (Gain, Offset).
+        Override: Uses canonical atomic setters for standard fields,
+        and handles specific JEOL extras via atomic updates.
         """
         if self.det_mod is None:
             logger.error("[DET] ApplySettings failed: Hardware not connected.")
             raise RuntimeError("Detector hardware not connected.")
 
         try:
-            d = self._get_detector(detector_id)
+            # 1. Let the base class call all the atomic setters!
+            # This automatically calls set_detector_roi, set_detector_insertion,
+            # set_detector_exposure, set_detector_gain_index, etc.
+            super().apply_detector_settings(detector_id, settings, **kwargs)
 
-            # Defensive Check: The adapter's `to_jeol_detector_config` likely expects
-            # a dictionary for vendor extras, not our new dataclass. We serialize
-            # it back to a dictionary specifically for the adapter to read.
-            settings_for_adapter = settings
+            # 2. Handle any remaining Vendor Extras explicitly
             vend = getattr(settings.extra, "vendor", {})
-            if isinstance(vend.get("JEOL"), JeolDetectorExtras):
-                import copy
-                settings_for_adapter = copy.deepcopy(settings)
-                settings_for_adapter.extra.vendor["JEOL"] = vend["JEOL"].to_dict()
+            jeol_v = vend.get("JEOL")
 
-            # Use adapter to convert standard fields + vendor dict into JEOL payload
-            payload = jeol_adapter.to_jeol_detector_config(settings_for_adapter)
+            if isinstance(jeol_v, JeolDetectorExtras):
+                d = self._get_detector(detector_id)
+                payload = {}
 
-            if not payload:
-                logger.debug(f"[DET] ApplySettings({detector_id}): No changes in payload.")
-                return
+                # Apply the specific JEOL extra properties
+                if jeol_v.dwell_time_us is not None:
+                    payload["ExposureTimeValue"] = float(jeol_v.dwell_time_us)
+                if jeol_v.active_roi_source is not None:
+                    payload["ActiveROISource"] = jeol_v.active_roi_source
 
-            logger.debug(f"[DET] set_detectorsetting({list(payload.keys())})")
-            d.set_detectorsetting(payload)
+                if payload:
+                    logger.debug(f"[DET] Applying vendor extras: {list(payload.keys())}")
+                    d.set_detectorsetting(payload)
 
         except Exception as e:
             logger.error(f"[DET] ApplySettings({detector_id}) failed: {e}")
