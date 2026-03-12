@@ -1,0 +1,70 @@
+# =============================================================================
+# SuperTEM Protocol: F200 Standard STEM Operation
+# =============================================================================
+name: "F200_Standard_STEM"
+version: "1.0"
+description: >
+  Standard manual workflow translated into automated routines for the JEOL F200.
+  Prepares the column, aligns the beam and detector, tunes STEM astigmatism 
+  via Ronchigram, and acquires a final image.
+
+steps:
+  # ---------------------------------------------------------------------------
+  # Phase 1: Preparation
+  # ---------------------------------------------------------------------------
+  - routine: "initialize_microscope"
+    params:
+      target_aperture: "CL_100"       # 插入第二个CL光阑-100
+      auto_emission: true             # emission打开电子束-Auto emission-on
+
+  - routine: "search_sample"
+    params:
+      max_mag: 40000                  # 40k以下找样品
+
+  # ---------------------------------------------------------------------------
+  # Phase 2: Optical Adjustment
+  # ---------------------------------------------------------------------------
+  - routine: "center_beam"
+    params:
+      iterations: 3                   # 重复两到三次
+
+  - routine: "eucentric_height"
+    params:
+      wobble_angle_mrad: 10.0         # 模拟 image wobble
+      slight_defocus: true            # 可以稍微欠焦一点，能看的更清楚
+
+  # ---------------------------------------------------------------------------
+  # Phase 3: STEM Transition & Ronchigram Tuning
+  # ---------------------------------------------------------------------------
+  - routine: "transition_to_stem"
+    params:
+      camera_length_mm: 800           # camera length调到800或1000
+      insert_gatan_camera: true       # 插入gatan相机
+      lift_screen: true               # 抬起荧光屏
+
+  - routine: "ronchi_astigmatism"
+    params:
+      target_feature: "carbon_film"   # 在碳膜上调节ronchi
+      stig_tolerance: 0.95            # 目标：把中间调圆 (Isotropy threshold)
+
+  # ---------------------------------------------------------------------------
+  # Phase 4: Coma-Free Axis & Detector Alignment
+  # ---------------------------------------------------------------------------
+  - routine: "coma_free_alignment"
+    params:
+      wobble_element: "ANDO"          # wobble-ando
+      compensate_with: "PLA"          # 调pla让缩放晃动最小
+
+  - routine: "align_detector"
+    params:
+      camera_length_mm: 250           # camera length调到250
+      target_detector: "ADF"          # 把圆圈中心移到adf探头中心
+
+  # ---------------------------------------------------------------------------
+  # Phase 5: Final Acquisition
+  # ---------------------------------------------------------------------------
+  - routine: "stem_acquisition"
+    params:
+      target_aperture: "CL_40"        # 插入cl40光阑
+      retract_cameras: true           # 退相机，退ronchigram
+      output_dir: "{session_path}/stem_images/"
