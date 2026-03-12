@@ -1452,6 +1452,24 @@ class JeolMicroscope(TemMicroscope):
     def trigger_a2_wobbler_off(self) -> None:
         self._write_hw(self.gun, "SetA2Wobbler", "BEAM", 0)
 
+    def trigger_image_wobbler_on(self) -> None:
+        """Used for adjusting Z-height (Eucentric Height)."""
+        pass
+        #TODO: Implement image wobbler toggling using simulated clicking
+
+    def trigger_image_wobbler_off(self) -> None:
+        pass
+        #TODO: Implement image wobbler toggling using simulated clicking
+
+    def trigger_tilt_wobbler_on(self) -> None:
+        """Used for Coma-Free Axis alignment (wobble ANDO)."""
+        pass
+        #TODO: Implement image wobbler toggling using simulated clicking
+
+    def trigger_tilt_wobbler_off(self) -> None:
+        pass
+        #TODO: Implement image wobbler toggling using simulated clicking
+
     def trigger_feg_emission_on(self) -> None:
         self._feg_safety_check()
         logger.info("[BEAM] Executing FEG Emission ON...")
@@ -1612,6 +1630,10 @@ class JeolMicroscope(TemMicroscope):
             self.trigger_ht_wobbler_on() if kwargs.get("active", True) else self.trigger_ht_wobbler_off()
         elif act == "WOBBLE_A2":
             self.trigger_a2_wobbler_on() if kwargs.get("active", True) else self.trigger_a2_wobbler_off()
+        elif act == "WOBBLE_IMAGE":
+            self.trigger_image_wobbler_on() if kwargs.get("active", True) else self.trigger_image_wobbler_off()
+        elif act == "WOBBLE_TILT":
+            self.trigger_tilt_wobbler_on() if kwargs.get("active", True) else self.trigger_tilt_wobbler_off()
 
         else:
             super().perform_beam_action(action, **kwargs)
@@ -2315,6 +2337,23 @@ class JeolMicroscope(TemMicroscope):
     # --- Atomic Setters ---
 
     def trigger_detector_insertion(self, detector_id: str, **kwargs) -> None:
+        d_id = detector_id.upper()
+        # 1. Screen
+        if d_id == "SCREEN" or d_id == "TVCAM:L":
+            logger.info("[DET] Intercepted SCREEN insert: Lowering Fluorescent Screen.")
+            self.set_screen_position("DOWN")
+            return
+
+        # 2. EDS
+        if d_id == "EDS":
+            #TODO: hook up with PyJEM.eds
+            return
+
+        # 3. Gatan Camera bypass
+        if "GATAN" in d_id or "ONEVIEW" in d_id:
+            #TODO: hook up with Gatan camera control
+            return
+
         d = self._get_detector(detector_id)
         if hasattr(d, "insert"):
             self._write_hw(d, "insert", "DET")
@@ -2322,6 +2361,23 @@ class JeolMicroscope(TemMicroscope):
             logger.warning(f"[DET] Detector {detector_id} does not support 'insert'.")
 
     def trigger_detector_retraction(self, detector_id: str, **kwargs) -> None:
+        d_id = detector_id.upper()
+        # 1. Screen
+        if d_id == "SCREEN" or d_id == "TVCAM:L":
+            logger.info("[DET] Intercepted SCREEN insert: Lowering Fluorescent Screen.")
+            self.set_screen_position("UP")
+            return
+
+        # 2. EDS
+        if d_id == "EDS":
+            # TODO: hook up with PyJEM.eds
+            return
+
+        # 3. Gatan Camera bypass
+        if "GATAN" in d_id or "ONEVIEW" in d_id:
+            # TODO: hook up with Gatan camera control
+            return
+
         d = self._get_detector(detector_id)
         if hasattr(d, "retract"):
             self._write_hw(d, "retract", "DET")
@@ -2458,11 +2514,20 @@ class JeolMicroscope(TemMicroscope):
         if not det_id:
             raise RuntimeError("No detector_id provided and no primary detector available.")
 
+        if "GATAN" in det_id or "ONEVIEW" in det_id:
+            return self._acquire_gatan_image(request, det_id)
+
         d = self._get_detector(det_id)
 
         # 3. Apply Settings
         # REMOVED: Handled by Base Class (TemMicroscope.perform_capture)
         # to prevent double-programming the hardware.
+
+        is_stem = self._is_stem_detector(det_id)
+        if is_stem:
+            pass
+            # TODO: double check how stem image capturing works
+
 
         # 4. Trigger Capture (Snapshot)
         raw = None
@@ -2584,6 +2649,23 @@ class JeolMicroscope(TemMicroscope):
             _mode=ParseMode.LENIENT
         )
 
+        return MicroscopeImage(data=arr, metadata=metadata)
+
+    def _acquire_gatan_image(self, request: AcquisitionRequest, det_id: str) -> MicroscopeImage:
+        """Simulates a Gatan DigitalMicrograph Socket connection."""
+        import numpy as np
+
+        logger.warning(f"[GATAN] Socket not implemented. Returning dummy noise for {det_id}.")
+        # TODO: Implement actual DigitalMicrograph socket client here
+
+        # Return a safe dummy object so the Routine doesn't crash downstream
+        arr = np.zeros((1024, 1024), dtype=np.uint16)
+        metadata = MicroscopeImageMetadata(
+            created_at=datetime.now(timezone.utc).isoformat(),
+            image_size_px=(1024, 1024),
+            extra=Extras(vendor={"JEOL": {"detector_id": det_id, "simulated": True}}),
+            _mode=ParseMode.LENIENT
+        )
         return MicroscopeImage(data=arr, metadata=metadata)
 
     def trigger_detector_auto_contrast(self, detector_id: str) -> None:

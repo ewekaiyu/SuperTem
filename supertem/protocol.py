@@ -93,8 +93,7 @@ class ProtocolExecutor:
         )
 
         # 3. INITIALIZE ROUTINES
-        # We pass scope._settings because the routines need access to the dynamic image save path
-        self.factory = RoutineFactory(self.scope, self.context, self.scope._settings)
+        self.factory = RoutineFactory(self.scope, self.context)
 
         # 4. EXECUTE STEPS
         for i, step in enumerate(steps):
